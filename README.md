@@ -37,8 +37,28 @@ distinguishes a *consistent offset* (calibration difference) from a *scattered* 
 (noise), and needs at least five overlapping windows before calling anything a
 disagreement.
 
+The pairwise analysis screen keeps the evidence behind that summary inspectable. It shows
+the two aggregated timelines, a Bland–Altman difference-versus-mean plot, the number and
+percentage of overlapping windows, the samples contributed by each source, and explicit
+"collecting" or "no overlap" states when there is not enough evidence. A green agreement
+result is never shown until at least five paired windows exist.
+
+Each pair and time range can be exported from that screen as two local files: a CSV of the
+paired, normalized windows and a plain-text methodology/statistics summary. Exports use UTC
+timestamps, contain no Oura token or unrelated readings, and are handed to the standard iOS
+share sheet.
+
 Tolerances are per metric and reflect real measurement error: 5 bpm for heart rate, 2% for
 SpO₂ (consumer oximeters are specified to roughly ±2% ARMS), 15 ms for HRV.
+
+The "Flag disagreements at" setting controls how much detail Compare lists, never whether a
+result is green. Raising it to "Major only" stops a notable pair from being written out in
+full, but the pair is still counted as outside tolerance — choosing not to be told about a
+gap is not the same as the devices agreeing.
+
+Charts on the pair screen draw at most a few hundred points, always including the widest
+differences, and say so when they are showing a subset. Statistics and exports always use
+every paired window.
 
 ## Honest limitations
 
@@ -117,10 +137,13 @@ no Health data.
 
 ## Tests
 
-69 tests cover the parts where a silent error would corrupt every comparison downstream:
+The test suite covers the parts where a silent error would corrupt every comparison downstream:
 GATT frame parsing against hand-built spec vectors (IEEE-11073 SFLOAT special values,
 R–R interval unit conversion, optional-field skip order), HRV artefact rejection, window
-alignment, bias-versus-noise classification, estimator clamping, and Oura mapping.
+alignment, overlap/evidence states, sample-variance limits of agreement, RFC 4180 export
+escaping, the rule that neither insufficient evidence nor the alert threshold can produce
+an agreement claim, chart thinning that keeps outliers, bias-versus-noise classification,
+estimator clamping, and Oura mapping.
 
 ```bash
 xcodebuild test -project HeartSyncChecker.xcodeproj -scheme HeartSyncChecker \
@@ -135,7 +158,12 @@ Sources/
   Bluetooth/   GATT UUIDs, BinaryReader, measurement parsers, BluetoothManager
   Health/      HealthKitManager — Apple Watch and anything else writing to Health
   Oura/        OAuth, Cloud API v2 models/client, dashboard cache, document→reading mapping
-  Analysis/    ComparisonEngine, HRVCalculator, Estimators
+  Analysis/    ComparisonEngine, pair export, HRVCalculator, Estimators
   Store/       In-memory store, atomic file persistence, keychain, settings
-  Views/       Dashboard, Oura explorer, Compare, Devices, Settings
+  Views/       Dashboard, Oura explorer, Compare, pair analysis, Devices, Settings
 ```
+
+For UI development without physical wearables, launch a Debug build with
+`--pairwise-demo`. It uses an in-memory fixture containing agreeing, biased, noisy,
+collecting, no-overlap, and outlier examples; it does not load or save the normal archive
+and does not start any transport.

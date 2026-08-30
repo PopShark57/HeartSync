@@ -50,16 +50,25 @@ struct MetricDetailView: View {
                 }
             }
 
-            let pairs = model.discrepancies(in: range.interval).filter { $0.kind == kind }
+            let pairs = pairwiseAnalyses
             if !pairs.isEmpty {
                 Section {
-                    ForEach(pairs) { discrepancy in
-                        AgreementDetailRow(discrepancy: discrepancy)
+                    ForEach(pairs) { analysis in
+                        NavigationLink {
+                            PairwiseAnalysisView(
+                                kind: kind,
+                                sourceAID: analysis.sourceA,
+                                sourceBID: analysis.sourceB,
+                                initialRange: range
+                            )
+                        } label: {
+                            PairwiseAnalysisRow(analysis: analysis)
+                        }
                     }
                 } header: {
-                    Text("Agreement between devices")
+                    Text("Device pairs")
                 } footer: {
-                    Text("Limits of agreement are the range within which 95% of the differences fall. If that range is wider than you'd accept clinically, the two devices are not interchangeable for this metric.")
+                    Text("Every eligible pair is listed, including pairs with no overlap or too few paired windows. Open a pair for its timeline, difference plot, evidence, and export.")
                 }
             }
 
@@ -247,6 +256,17 @@ struct MetricDetailView: View {
         }
         .sorted { $0.source.displayName < $1.source.displayName }
     }
+
+    /// Alert preferences do not filter analytical detail: agreeing and
+    /// insufficient-evidence pairs remain inspectable here.
+    private var pairwiseAnalyses: [PairwiseAnalysis] {
+        let interval = range.interval
+        return ComparisonEngine.allPairwiseAnalyses(
+            from: model.store.readings(kind: kind, in: interval),
+            kind: kind,
+            range: interval
+        )
+    }
 }
 
 private struct PerSourceStatsRow: View {
@@ -284,49 +304,73 @@ private struct PerSourceStatsRow: View {
     }
 }
 
-/// Expanded Bland\u{2013}Altman summary for one pair of devices.
-private struct AgreementDetailRow: View {
+/// One navigable pair, with an evidence state that cannot be mistaken for agreement.
+private struct PairwiseAnalysisRow: View {
     @Environment(AppModel.self) private var model
-    var discrepancy: Discrepancy
+    var analysis: PairwiseAnalysis
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                SourceDot(color: model.store.source(id: discrepancy.sourceA)?.color ?? .gray, size: 8)
-                Text(model.store.displayName(forSource: discrepancy.sourceA))
+                SourceDot(color: model.store.source(id: analysis.sourceA)?.color ?? .gray, size: 8)
+                Text("A  \(model.store.displayName(forSource: analysis.sourceA))")
                     .font(.caption.weight(.medium))
                 Text("vs")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-                SourceDot(color: model.store.source(id: discrepancy.sourceB)?.color ?? .gray, size: 8)
-                Text(model.store.displayName(forSource: discrepancy.sourceB))
+                SourceDot(color: model.store.source(id: analysis.sourceB)?.color ?? .gray, size: 8)
+                Text("B  \(model.store.displayName(forSource: analysis.sourceB))")
                     .font(.caption.weight(.medium))
                 Spacer()
             }
 
-            HStack(spacing: 18) {
-                metric("Mean bias", signed(discrepancy.meanBias))
-                metric("Typical gap", discrepancy.kind.format(discrepancy.meanAbsoluteDifference))
-                metric(
-                    "95% limits",
-                    "\(signed(discrepancy.limitsOfAgreement.lowerBound)) to \(signed(discrepancy.limitsOfAgreement.upperBound))"
-                )
-            }
-
-            Label(
-                discrepancy.isSystematicBias
-                    ? "Consistent offset \u{2014} a calibration difference"
-                    : "Scattered \u{2014} looks like noise, not bias",
-                systemImage: discrepancy.isSystematicBias ? "arrow.up.arrow.down" : "waveform"
-            )
-            .font(.caption2)
-            .foregroundStyle(discrepancy.severity.tint)
+            stateDetail
         }
         .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private var stateDetail: some View {
+        switch analysis.state {
+        case .noOverlap:
+            Label("No overlapping windows · no conclusion", systemImage: "rectangle.on.rectangle.slash")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+
+        case let .collecting(pairedWindowCount, requiredWindowCount):
+            Label(
+                "\(pairedWindowCount) of \(requiredWindowCount) paired windows · collecting evidence",
+                systemImage: "hourglass"
+            )
+            .foregroundStyle(.orange)
+            .font(.caption)
+
+        case let .ready(statistics):
+            VStack(alignment: .leading, spacing: 5) {
+                Label("Ready · \(statistics.severity.title)", systemImage: statistics.severity.systemImage)
+                    .foregroundStyle(statistics.severity.tint)
+                    .font(.caption.weight(.semibold))
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 18) { readyMetrics(statistics) }
+                    VStack(alignment: .leading, spacing: 5) { readyMetrics(statistics) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func readyMetrics(_ statistics: PairwiseSummaryStatistics) -> some View {
+        metric("Mean bias A − B", signed(statistics.meanBias))
+        metric("Mean absolute gap", analysis.kind.format(statistics.meanAbsoluteDifference))
+        metric(
+            "95% limits",
+            "\(signed(statistics.limitsOfAgreement.lowerBound)) to \(signed(statistics.limitsOfAgreement.upperBound))"
+        )
     }
 
     private func signed(_ value: Double) -> String {
-        let formatted = discrepancy.kind.format(abs(value))
+        let formatted = analysis.kind.format(abs(value))
         return value >= 0 ? "+\(formatted)" : "\u{2212}\(formatted)"
     }
 

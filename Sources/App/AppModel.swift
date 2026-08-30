@@ -11,7 +11,7 @@ final class AppModel {
 
     private let logger = Logger(subsystem: "com.heartsync.HeartSyncChecker", category: "App")
 
-    let store = HealthStore()
+    let store = HealthStore(persistenceEnabled: !AppModel.pairwiseDemoEnabled)
     let settings = AppSettings()
     let bluetooth = BluetoothManager()
     let healthKit = HealthKitManager()
@@ -30,6 +30,14 @@ final class AppModel {
     func start() async {
         guard !hasStarted else { return }
         hasStarted = true
+
+        #if DEBUG
+        if Self.pairwiseDemoEnabled {
+            DebugAnalysisFixtures.populate(store: store)
+            dataVersion &+= 1
+            return
+        }
+        #endif
 
         await settings.loadIfNeeded()
         await store.loadIfNeeded()
@@ -56,6 +64,9 @@ final class AppModel {
 
     /// Called when the app returns to the foreground.
     func refresh() async {
+        #if DEBUG
+        guard !Self.pairwiseDemoEnabled else { return }
+        #endif
         bluetooth.reconnectKnownDevices()
         if healthKit.availability == .authorized {
             await healthKit.syncAll()
@@ -67,6 +78,9 @@ final class AppModel {
     }
 
     func enterBackground() async {
+        #if DEBUG
+        guard !Self.pairwiseDemoEnabled else { return }
+        #endif
         bluetooth.stopScan()
         await store.saveNow()
         await settings.saveNow()
@@ -212,6 +226,14 @@ final class AppModel {
     /// device, so they are never mistaken for a measurement in the source list.
     static let estimateSourceID = "heartsync.estimate"
 
+    #if DEBUG
+    /// Launch with `--pairwise-demo` to exercise every analysis state without touching
+    /// the user's archive or starting HealthKit, Bluetooth, or Oura transports.
+    static let pairwiseDemoEnabled = ProcessInfo.processInfo.arguments.contains("--pairwise-demo")
+    #else
+    static let pairwiseDemoEnabled = false
+    #endif
+
     func ensureEstimateSourceExists() {
         guard store.source(id: Self.estimateSourceID) == nil else { return }
         store.upsert(DataSource(
@@ -263,15 +285,6 @@ final class AppModel {
     }
 
     // MARK: - Queries for views
-
-    func windows(kind: MetricKind, in range: DateInterval) -> [ComparisonWindow] {
-        ComparisonEngine.windows(from: store.readings(kind: kind, in: range), kind: kind, range: range)
-    }
-
-    func discrepancies(in range: DateInterval) -> [Discrepancy] {
-        ComparisonEngine.allDiscrepancies(from: store.readings(in: range), range: range)
-            .filter { $0.severity >= settings.snapshot.discrepancyThreshold }
-    }
 
     func liveValues(kind: MetricKind) -> [String: Reading] {
         ComparisonEngine.latestBySource(from: store.readings(kind: kind), kind: kind)

@@ -100,6 +100,101 @@ enum ComparisonEngine {
         )
     }
 
+    // MARK: - Pairwise analysis
+
+    /// Builds a complete comparison for one metric and two selected sources.
+    ///
+    /// Source ordering is canonical regardless of argument order, so the sign of every
+    /// difference is stable. Candidate windows are the union of windows reported by either
+    /// selected source; paired observations are their intersection. Estimated values remain
+    /// excluded because this API deliberately uses the default measurement-only windowing.
+    static func pairwiseAnalysis(
+        from readings: [Reading],
+        kind: MetricKind,
+        sourceA: String,
+        sourceB: String,
+        range: DateInterval,
+        windowSize: TimeInterval? = nil,
+        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows
+    ) -> PairwiseAnalysis {
+        let size = windowSize ?? kind.comparisonWindow
+        let pair = canonicalPair(sourceA, sourceB)
+        let comparisonWindows = windows(
+            from: readings,
+            kind: kind,
+            windowSize: size,
+            range: range
+        )
+        return pairwiseAnalysis(
+            fromWindows: comparisonWindows,
+            kind: kind,
+            pair: pair,
+            range: range,
+            windowSize: size,
+            minimumPairedWindows: minimumPairedWindows
+        )
+    }
+
+    /// Builds every source pair for one metric, including pairs with no overlapping windows.
+    ///
+    /// A source only needs one eligible reading in the requested range to participate, so a
+    /// pair whose timestamps never overlap remains discoverable as `.noOverlap`.
+    static func allPairwiseAnalyses(
+        from readings: [Reading],
+        kind: MetricKind,
+        range: DateInterval,
+        windowSize: TimeInterval? = nil,
+        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows
+    ) -> [PairwiseAnalysis] {
+        let size = windowSize ?? kind.comparisonWindow
+        let comparisonWindows = windows(
+            from: readings,
+            kind: kind,
+            windowSize: size,
+            range: range
+        )
+        let sourceIDs = Set(comparisonWindows.flatMap { $0.values.map(\.sourceID) }).sorted()
+        guard sourceIDs.count >= 2 else { return [] }
+
+        var analyses: [PairwiseAnalysis] = []
+        for indexA in sourceIDs.indices {
+            for indexB in sourceIDs.index(after: indexA)..<sourceIDs.endIndex {
+                analyses.append(pairwiseAnalysis(
+                    fromWindows: comparisonWindows,
+                    kind: kind,
+                    pair: PairKey(a: sourceIDs[indexA], b: sourceIDs[indexB]),
+                    range: range,
+                    windowSize: size,
+                    minimumPairedWindows: minimumPairedWindows
+                ))
+            }
+        }
+        return analyses
+    }
+
+    /// Builds every eligible pair for every metric. Ordering follows `MetricKind.allCases`,
+    /// then canonical source order, so exports and UI refreshes are deterministic.
+    ///
+    /// Readings are bucketed by metric once up front. Passing the whole array to each
+    /// per-metric call instead would rescan every reading ten times, which is the
+    /// difference between one and ten full passes over a month of 1 Hz strap data.
+    static func allPairwiseAnalyses(
+        from readings: [Reading],
+        range: DateInterval,
+        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows
+    ) -> [PairwiseAnalysis] {
+        let byKind = Dictionary(grouping: readings, by: \.kind)
+        return MetricKind.allCases.flatMap { kind -> [PairwiseAnalysis] in
+            guard let forKind = byKind[kind] else { return [] }
+            return allPairwiseAnalyses(
+                from: forKind,
+                kind: kind,
+                range: range,
+                minimumPairedWindows: minimumPairedWindows
+            )
+        }
+    }
+
     // MARK: - Discrepancies
 
     /// Summarises how each pair of sources compares for one metric, using the
@@ -154,7 +249,11 @@ enum ComparisonEngine {
             let n = Double(diffs.count)
             let bias = diffs.reduce(0, +) / n
             let meanAbs = diffs.reduce(0) { $0 + abs($1) } / n
-            let variance = diffs.reduce(0) { $0 + ($1 - bias) * ($1 - bias) } / n
+            // The observed windows are a sample of the devices' possible differences, so
+            // Bland–Altman uses sample variance rather than population variance here.
+            let variance = diffs.count > 1
+                ? diffs.reduce(0) { $0 + ($1 - bias) * ($1 - bias) } / Double(diffs.count - 1)
+                : 0
             return Discrepancy(
                 kind: kind,
                 sourceA: key.a,
@@ -211,6 +310,117 @@ enum ComparisonEngine {
     private struct PairKey: Hashable {
         let a: String
         let b: String
+    }
+
+    private static func canonicalPair(_ first: String, _ second: String) -> PairKey {
+        first <= second
+            ? PairKey(a: first, b: second)
+            : PairKey(a: second, b: first)
+    }
+
+    private static func pairwiseAnalysis(
+        fromWindows windows: [ComparisonWindow],
+        kind: MetricKind,
+        pair: PairKey,
+        range: DateInterval,
+        windowSize: TimeInterval,
+        minimumPairedWindows: Int
+    ) -> PairwiseAnalysis {
+        let candidates = windows.filter { window in
+            window.value(for: pair.a) != nil || window.value(for: pair.b) != nil
+        }
+
+        // A self-pair is not a device comparison. Return an evidence-free result rather
+        // than manufacturing perfect agreement or trapping a caller at runtime.
+        let observations: [PairwiseObservation] = pair.a == pair.b ? [] : candidates.compactMap { window in
+            guard let sourceA = window.value(for: pair.a),
+                  let sourceB = window.value(for: pair.b)
+            else { return nil }
+            return PairwiseObservation(
+                start: window.start,
+                duration: window.duration,
+                sourceA: sourceA,
+                sourceB: sourceB,
+                severity: kind.agreement.severity(forDelta: sourceA.value - sourceB.value)
+            )
+        }
+
+        let pairedWindowCount = observations.count
+        let candidateWindowCount = candidates.count
+        let overlapPercentage = candidateWindowCount > 0
+            ? min(100, max(0, Double(pairedWindowCount) / Double(candidateWindowCount) * 100))
+            : 0
+        let analyzedSpan: DateInterval? = if let first = observations.first,
+                                             let last = observations.last {
+            DateInterval(start: first.start, end: max(first.start, last.end))
+        } else {
+            nil
+        }
+        let requiredWindowCount = max(1, minimumPairedWindows)
+        let statistics = pairedWindowCount >= requiredWindowCount
+            ? summaryStatistics(from: observations, kind: kind)
+            : nil
+        let state: PairwiseAnalysisState
+        if pairedWindowCount == 0 {
+            state = .noOverlap
+        } else if let statistics {
+            state = .ready(statistics)
+        } else {
+            state = .collecting(
+                pairedWindowCount: pairedWindowCount,
+                requiredWindowCount: requiredWindowCount
+            )
+        }
+
+        return PairwiseAnalysis(
+            kind: kind,
+            sourceA: pair.a,
+            sourceB: pair.b,
+            range: range,
+            windowSize: windowSize,
+            observations: observations,
+            candidateWindowCount: candidateWindowCount,
+            pairedWindowCount: pairedWindowCount,
+            overlapPercentage: overlapPercentage,
+            analyzedSpan: analyzedSpan,
+            rawSampleCountA: observations.reduce(0) { $0 + $1.sourceA.sampleCount },
+            rawSampleCountB: observations.reduce(0) { $0 + $1.sourceB.sampleCount },
+            state: state
+        )
+    }
+
+    private static func summaryStatistics(
+        from observations: [PairwiseObservation],
+        kind: MetricKind
+    ) -> PairwiseSummaryStatistics? {
+        guard !observations.isEmpty else { return nil }
+        let differences = observations.map(\.signedDifference)
+        let count = Double(differences.count)
+        let meanBias = differences.reduce(0, +) / count
+        let meanAbsoluteDifference = differences.reduce(0) { $0 + abs($1) } / count
+        let variance = differences.count > 1
+            ? differences.reduce(0) { $0 + ($1 - meanBias) * ($1 - meanBias) }
+                / Double(differences.count - 1)
+            : 0
+        let differenceSD = variance.squareRoot()
+        let limits = (meanBias - 1.96 * differenceSD)...(meanBias + 1.96 * differenceSD)
+        let classification: PairwiseDifferenceClassification
+        if meanAbsoluteDifference == 0 {
+            classification = .noApparentDifference
+        } else if differenceSD == 0 || abs(meanBias) > differenceSD {
+            classification = .systematicBias
+        } else {
+            classification = .measurementNoise
+        }
+
+        return PairwiseSummaryStatistics(
+            meanBias: meanBias,
+            meanAbsoluteDifference: meanAbsoluteDifference,
+            differenceSD: differenceSD,
+            limitsOfAgreement: limits,
+            severity: kind.agreement.severity(forDelta: meanAbsoluteDifference),
+            classification: classification
+        )
     }
 
     static func median(_ values: [Double]) -> Double {

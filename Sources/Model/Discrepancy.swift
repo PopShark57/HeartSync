@@ -90,6 +90,177 @@ struct ComparisonWindow: Identifiable, Hashable, Sendable {
     }
 }
 
+/// One epoch-aligned window in which exactly two selected sources both reported a metric.
+///
+/// `sourceA` and `sourceB` use the containing analysis's canonical source order. That makes
+/// `signedDifference` stable even when callers request the devices in the opposite order.
+struct PairwiseObservation: Identifiable, Hashable, Sendable {
+    var start: Date
+    var duration: TimeInterval
+    var sourceA: SourceValue
+    var sourceB: SourceValue
+    var severity: DiscrepancySeverity
+
+    var id: String {
+        "\(sourceA.sourceID)\u{001F}\(sourceB.sourceID)\u{001F}\(start.timeIntervalSinceReferenceDate.bitPattern)"
+    }
+
+    var end: Date { start.addingTimeInterval(duration) }
+    var pairedMean: Double { (sourceA.value + sourceB.value) / 2 }
+    /// Signed device difference in the canonical direction, A minus B.
+    var signedDifference: Double { sourceA.value - sourceB.value }
+    var absoluteDifference: Double { abs(signedDifference) }
+}
+
+/// A descriptive reading of the difference pattern. This is deliberately not an
+/// inferential claim and does not identify either source as medically correct.
+enum PairwiseDifferenceClassification: String, Hashable, Sendable {
+    case noApparentDifference
+    case systematicBias
+    case measurementNoise
+}
+
+/// Bland–Altman statistics exposed only after the evidence threshold is met.
+struct PairwiseSummaryStatistics: Hashable, Sendable {
+    var meanBias: Double
+    var meanAbsoluteDifference: Double
+    /// Sample standard deviation of paired differences (denominator `n - 1`).
+    var differenceSD: Double
+    var limitsOfAgreement: ClosedRange<Double>
+    var severity: DiscrepancySeverity
+    var classification: PairwiseDifferenceClassification
+}
+
+/// Evidence state for a selected metric and device pair.
+enum PairwiseAnalysisState: Hashable, Sendable {
+    /// Neither selected source shares an eligible epoch-aligned window with the other.
+    case noOverlap
+    /// Some overlap exists, but not enough to make an agreement claim.
+    case collecting(pairedWindowCount: Int, requiredWindowCount: Int)
+    /// Enough paired windows exist to expose descriptive summary statistics.
+    case ready(PairwiseSummaryStatistics)
+}
+
+/// Complete, on-demand comparison of one metric from exactly two selected sources.
+///
+/// Candidate windows are the union of eligible windows from A and B; paired windows are
+/// the intersection. `overlapPercentage` is therefore `paired / candidate * 100` and is
+/// always in `0...100`. Estimated readings are excluded by the comparison engine.
+struct PairwiseAnalysis: Identifiable, Hashable, Sendable {
+    var kind: MetricKind
+    /// Canonically ordered source identifier (lexicographically first).
+    var sourceA: String
+    /// Canonically ordered source identifier (lexicographically second).
+    var sourceB: String
+    /// Requested analysis range, even when the pair has no overlapping observations.
+    var range: DateInterval
+    var windowSize: TimeInterval
+    var observations: [PairwiseObservation]
+    var candidateWindowCount: Int
+    var pairedWindowCount: Int
+    /// Percentage in `0...100`, not a fractional ratio.
+    var overlapPercentage: Double
+    /// First paired-window start through last paired-window end; nil without overlap.
+    var analyzedSpan: DateInterval?
+    /// Raw samples from A and B that contributed to paired observations.
+    var rawSampleCountA: Int
+    var rawSampleCountB: Int
+    var state: PairwiseAnalysisState
+
+    var id: String {
+        "\(kind.rawValue)\u{001F}\(sourceA)\u{001F}\(sourceB)\u{001F}\(range.start.timeIntervalSinceReferenceDate.bitPattern)\u{001F}\(range.end.timeIntervalSinceReferenceDate.bitPattern)\u{001F}\(windowSize.bitPattern)"
+    }
+
+    /// Convenience access to the ready-state statistics. Nil means the evidence threshold
+    /// has not been met, not that the devices agree.
+    var statistics: PairwiseSummaryStatistics? {
+        guard case let .ready(statistics) = state else { return nil }
+        return statistics
+    }
+}
+
+extension PairwiseAnalysis {
+    /// A drawable subset of `observations`, in chronological order.
+    ///
+    /// Swift Charts emits one mark per observation per series, and a 30-day range of a
+    /// 60-second metric can pair tens of thousands of windows. Statistics, the evidence
+    /// card, and the export always use every paired window — only the plotted set is
+    /// thinned, and the widest differences are always kept, so thinning can never hide
+    /// the outliers a Bland–Altman plot exists to show.
+    ///
+    /// - Parameters:
+    ///   - limit: how many evenly spaced observations to sample. Non-positive returns none.
+    ///   - extremes: how many of the observations furthest from the mean bias to keep on
+    ///     top of the even sample.
+    func plotSample(limit: Int, extremes: Int) -> [PairwiseObservation] {
+        guard limit > 0 else { return [] }
+        guard observations.count > limit else { return observations }
+
+        let step = Double(observations.count) / Double(limit)
+        var keep = Set((0..<limit).map { Int(Double($0) * step) })
+        keep.insert(observations.count - 1)
+
+        if extremes > 0 {
+            let bias = statistics?.meanBias ?? 0
+            keep.formUnion(
+                observations.indices
+                    .sorted {
+                        abs(observations[$0].signedDifference - bias)
+                            > abs(observations[$1].signedDifference - bias)
+                    }
+                    .prefix(extremes)
+            )
+        }
+
+        return keep.sorted().map { observations[$0] }
+    }
+}
+
+/// The evidence-level decision used by the Compare overview.
+///
+/// Keeping this rule outside the view makes the important negative guarantee testable:
+/// collecting or no-overlap pairs can never be translated into a green agreement state.
+enum PairwiseEvidenceOverviewStatus: Hashable, Sendable {
+    case insufficientEvidence
+    case allReadyPairsWithinTolerance
+    case readyPairOutsideTolerance
+}
+
+struct PairwiseEvidenceOverview: Hashable, Sendable {
+    var status: PairwiseEvidenceOverviewStatus
+    var readyCount: Int
+    var incompleteCount: Int
+    /// Ready pairs whose mean absolute difference exceeds the metric's fixed tolerance.
+    var outsideToleranceCount: Int
+    /// Of those, the ones at or above the user's alert threshold — the pairs shown in full.
+    var flaggedCount: Int
+
+    /// Real gaps the user's alert threshold keeps out of the detail list. They still block
+    /// a green claim: choosing not to be told about a gap is not the same as agreement.
+    var suppressedCount: Int { outsideToleranceCount - flaggedCount }
+
+    /// - Parameter alertThreshold: the user's "flag disagreements at" preference. It
+    ///   controls how much detail the overview lists, never `status`, so lowering the
+    ///   alert level can hide a row but can never turn a real gap green.
+    init(analyses: [PairwiseAnalysis], alertThreshold: DiscrepancySeverity = .agreeing) {
+        let readyStatistics = analyses.compactMap(\.statistics)
+        let outsideTolerance = readyStatistics.filter { $0.severity != .agreeing }
+
+        self.readyCount = readyStatistics.count
+        self.incompleteCount = analyses.count - readyStatistics.count
+        self.outsideToleranceCount = outsideTolerance.count
+        self.flaggedCount = outsideTolerance.count { $0.severity >= alertThreshold }
+
+        if readyStatistics.isEmpty {
+            status = .insufficientEvidence
+        } else if outsideTolerance.isEmpty {
+            status = .allReadyPairsWithinTolerance
+        } else {
+            status = .readyPairOutsideTolerance
+        }
+    }
+}
+
 /// A persistent disagreement between exactly two sources, summarised over a longer span.
 ///
 /// Distinct from `ComparisonWindow`: a single window disagreeing is usually motion

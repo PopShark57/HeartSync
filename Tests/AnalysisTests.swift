@@ -226,6 +226,482 @@ struct ComparisonEngineTests {
         #expect(found[0].sourceB == "zulu")
     }
 
+    @Test("Pairwise analysis reports no overlap without calling it agreement")
+    func pairwiseNoOverlap() {
+        let readings = [
+            reading("alpha", 70, offset: 0),
+            reading("alpha", 71, offset: 60),
+            reading("bravo", 72, offset: 120),
+            reading("bravo", 73, offset: 180),
+        ]
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(300)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+
+        #expect(analysis.state == .noOverlap)
+        #expect(analysis.candidateWindowCount == 4)
+        #expect(analysis.pairedWindowCount == 0)
+        #expect(analysis.overlapPercentage == 0)
+        #expect(analysis.analyzedSpan == nil)
+        #expect(analysis.statistics == nil)
+    }
+
+    @Test("Overlap is paired windows divided by the union of candidate windows")
+    func pairwisePartialOverlap() {
+        var readings: [Reading] = []
+        for index in 0..<3 {
+            readings.append(reading("alpha", 70, offset: Double(index) * 60))
+        }
+        for index in 1..<4 {
+            readings.append(reading("bravo", 72, offset: Double(index) * 60))
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(300)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+
+        #expect(analysis.candidateWindowCount == 4)
+        #expect(analysis.pairedWindowCount == 2)
+        #expect(abs(analysis.overlapPercentage - 50) < 1e-9)
+        #expect(analysis.state == .collecting(pairedWindowCount: 2, requiredWindowCount: 5))
+        #expect(analysis.rawSampleCountA == 2)
+        #expect(analysis.rawSampleCountB == 2)
+    }
+
+    @Test("Five paired windows unlock ready Bland-Altman statistics")
+    func pairwiseReadiness() throws {
+        var readings: [Reading] = []
+        for index in 0..<5 {
+            let offset = Double(index) * 60
+            readings.append(reading("alpha", 70, offset: offset))
+            readings.append(reading("bravo", 78, offset: offset + 5))
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(360)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+        let statistics = try #require(analysis.statistics)
+
+        #expect(analysis.pairedWindowCount == 5)
+        #expect(abs(analysis.overlapPercentage - 100) < 1e-9)
+        #expect(statistics.meanBias == -8)
+        #expect(statistics.meanAbsoluteDifference == 8)
+        #expect(statistics.differenceSD == 0)
+        #expect(statistics.limitsOfAgreement == -8 ... -8)
+        #expect(statistics.severity == .notable)
+        #expect(statistics.classification == .systematicBias)
+        if case .ready = analysis.state {
+            // Expected.
+        } else {
+            Issue.record("Five paired windows must produce the ready state")
+        }
+    }
+
+    @Test("Canonical source ordering also fixes the sign of each observation")
+    func pairwiseCanonicalSign() throws {
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(120)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: [reading("zulu", 80, offset: 0), reading("alpha", 70, offset: 5)],
+            kind: .heartRate,
+            sourceA: "zulu",
+            sourceB: "alpha",
+            range: range,
+            minimumPairedWindows: 1
+        )
+        let observation = try #require(analysis.observations.first)
+
+        #expect(analysis.sourceA == "alpha")
+        #expect(analysis.sourceB == "zulu")
+        #expect(observation.sourceA.sourceID == "alpha")
+        #expect(observation.sourceB.sourceID == "zulu")
+        #expect(observation.signedDifference == -10)
+        #expect(observation.absoluteDifference == 10)
+        #expect(observation.pairedMean == 75)
+    }
+
+    @Test("Estimated readings cannot create pairwise evidence")
+    func pairwiseExcludesEstimates() {
+        var readings: [Reading] = []
+        for index in 0..<5 {
+            let offset = Double(index) * 60
+            readings.append(reading("alpha", 70, offset: offset))
+            let provenance: Provenance = index < 2 ? .measured : .estimated
+            readings.append(reading("bravo", 72, offset: offset + 5, provenance: provenance))
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(360)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+
+        #expect(analysis.candidateWindowCount == 5)
+        #expect(analysis.pairedWindowCount == 2)
+        #expect(analysis.state == .collecting(pairedWindowCount: 2, requiredWindowCount: 5))
+        #expect(analysis.observations.allSatisfy {
+            $0.sourceA.provenance != .estimated && $0.sourceB.provenance != .estimated
+        })
+    }
+
+    @Test("Pair observations retain median aggregates, unequal counts, and within-window spread")
+    func pairwiseObservationEvidence() throws {
+        let readings = [
+            reading("alpha", 60, offset: 0),
+            reading("alpha", 70, offset: 5),
+            reading("alpha", 80, offset: 10),
+            reading("bravo", 73, offset: 1),
+            reading("bravo", 73, offset: 6),
+            reading("bravo", 73, offset: 11),
+            reading("bravo", 200, offset: 16),
+        ]
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(60)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range,
+            minimumPairedWindows: 1
+        )
+        let observation = try #require(analysis.observations.first)
+
+        #expect(observation.sourceA.value == 70)
+        #expect(observation.sourceA.sampleCount == 3)
+        #expect(abs(observation.sourceA.standardDeviation - sqrt(200.0 / 3.0)) < 1e-9)
+        #expect(observation.sourceB.value == 73)
+        #expect(observation.sourceB.sampleCount == 4)
+        #expect(observation.sourceB.standardDeviation > 0)
+        #expect(analysis.rawSampleCountA == 3)
+        #expect(analysis.rawSampleCountB == 4)
+        #expect(observation.signedDifference == -3)
+    }
+
+    @Test("Difference spread and limits of agreement use sample variance")
+    func pairwiseUsesSampleVariance() throws {
+        var readings: [Reading] = []
+        for index in 0..<5 {
+            let offset = Double(index) * 60
+            readings.append(reading("alpha", 71 + Double(index), offset: offset))
+            readings.append(reading("bravo", 70, offset: offset + 5))
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(360)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+        let statistics = try #require(analysis.statistics)
+        let expectedSD = sqrt(2.5) // sample variance of 1, 2, 3, 4, 5
+
+        #expect(abs(statistics.meanBias - 3) < 1e-9)
+        #expect(abs(statistics.differenceSD - expectedSD) < 1e-9)
+        #expect(abs(statistics.limitsOfAgreement.lowerBound - (3 - 1.96 * expectedSD)) < 1e-9)
+        #expect(abs(statistics.limitsOfAgreement.upperBound - (3 + 1.96 * expectedSD)) < 1e-9)
+    }
+
+    @Test("All-pair queries enumerate every canonical pair, including no-overlap pairs")
+    func allPairwiseEnumeration() {
+        let readings = [
+            reading("charlie", 72, offset: 0),
+            reading("alpha", 70, offset: 0),
+            reading("bravo", 71, offset: 60),
+        ]
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(180)
+        )
+        let analyses = ComparisonEngine.allPairwiseAnalyses(
+            from: readings,
+            kind: .heartRate,
+            range: range
+        )
+
+        #expect(analyses.map { [$0.sourceA, $0.sourceB] } == [
+            ["alpha", "bravo"],
+            ["alpha", "charlie"],
+            ["bravo", "charlie"],
+        ])
+        #expect(analyses.count == 3)
+        #expect(analyses.filter { $0.state == .noOverlap }.count == 2)
+    }
+
+    @Test("Compare overview never translates insufficient evidence into agreement")
+    func compareOverviewRequiresReadyEvidence() {
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(360)
+        )
+        let noOverlap = ComparisonEngine.pairwiseAnalysis(
+            from: [
+                reading("alpha", 70, offset: 0),
+                reading("bravo", 70, offset: 120),
+            ],
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+        let collecting = ComparisonEngine.pairwiseAnalysis(
+            from: [
+                reading("charlie", 70, offset: 0),
+                reading("delta", 70, offset: 5),
+            ],
+            kind: .heartRate,
+            sourceA: "charlie",
+            sourceB: "delta",
+            range: range
+        )
+
+        let overview = PairwiseEvidenceOverview(analyses: [noOverlap, collecting])
+
+        #expect(overview.status == .insufficientEvidence)
+        #expect(overview.readyCount == 0)
+        #expect(overview.incompleteCount == 2)
+        #expect(overview.outsideToleranceCount == 0)
+    }
+
+    @Test("Compare overview turns green only after a ready pair is within tolerance")
+    func compareOverviewGreenGate() {
+        var agreeingReadings: [Reading] = []
+        var notableReadings: [Reading] = []
+        for index in 0..<5 {
+            let offset = Double(index) * 60
+            agreeingReadings += [
+                reading("alpha", 70, offset: offset),
+                reading("bravo", 71, offset: offset + 5),
+            ]
+            notableReadings += [
+                reading("charlie", 70, offset: offset),
+                reading("delta", 78, offset: offset + 5),
+            ]
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(360)
+        )
+        let agreeing = ComparisonEngine.pairwiseAnalysis(
+            from: agreeingReadings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+        let notable = ComparisonEngine.pairwiseAnalysis(
+            from: notableReadings,
+            kind: .heartRate,
+            sourceA: "charlie",
+            sourceB: "delta",
+            range: range
+        )
+
+        #expect(PairwiseEvidenceOverview(analyses: [agreeing]).status == .allReadyPairsWithinTolerance)
+        #expect(PairwiseEvidenceOverview(analyses: [agreeing, notable]).status == .readyPairOutsideTolerance)
+    }
+
+    @Test("The alert threshold hides detail rows but can never produce a green result")
+    func compareOverviewThresholdCannotManufactureAgreement() {
+        var notableReadings: [Reading] = []
+        var majorReadings: [Reading] = []
+        for index in 0..<5 {
+            let offset = Double(index) * 60
+            notableReadings += [
+                reading("alpha", 70, offset: offset),
+                reading("bravo", 78, offset: offset + 5),   // 8 bpm: notable, below alert 12
+            ]
+            majorReadings += [
+                reading("charlie", 70, offset: offset),
+                reading("delta", 90, offset: offset + 5),   // 20 bpm: major
+            ]
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(360)
+        )
+        let notable = ComparisonEngine.pairwiseAnalysis(
+            from: notableReadings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+        let major = ComparisonEngine.pairwiseAnalysis(
+            from: majorReadings,
+            kind: .heartRate,
+            sourceA: "charlie",
+            sourceB: "delta",
+            range: range
+        )
+
+        // "Major only" must not turn the notable pair into agreement — it may only stop
+        // listing it, and the pair still has to be accounted for.
+        let majorOnly = PairwiseEvidenceOverview(analyses: [notable], alertThreshold: .major)
+        #expect(majorOnly.status == .readyPairOutsideTolerance)
+        #expect(majorOnly.outsideToleranceCount == 1)
+        #expect(majorOnly.flaggedCount == 0)
+        #expect(majorOnly.suppressedCount == 1)
+
+        let everything = PairwiseEvidenceOverview(analyses: [notable], alertThreshold: .agreeing)
+        #expect(everything.flaggedCount == 1)
+        #expect(everything.suppressedCount == 0)
+
+        let mixed = PairwiseEvidenceOverview(analyses: [notable, major], alertThreshold: .major)
+        #expect(mixed.status == .readyPairOutsideTolerance)
+        #expect(mixed.flaggedCount == 1)
+        #expect(mixed.suppressedCount == 1)
+    }
+
+    @Test("A threshold cannot suppress a pair that is within tolerance")
+    func compareOverviewAgreeingPairIsNeverSuppressed() {
+        var readings: [Reading] = []
+        for index in 0..<5 {
+            let offset = Double(index) * 60
+            readings += [
+                reading("alpha", 70, offset: offset),
+                reading("bravo", 71, offset: offset + 5),
+            ]
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(360)
+        )
+        let agreeing = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+        let overview = PairwiseEvidenceOverview(analyses: [agreeing], alertThreshold: .major)
+
+        #expect(overview.status == .allReadyPairsWithinTolerance)
+        #expect(overview.outsideToleranceCount == 0)
+        #expect(overview.flaggedCount == 0)
+        #expect(overview.suppressedCount == 0)
+    }
+
+    @Test("Bucketing by metric does not change the all-metric pair enumeration")
+    func allMetricPairwiseMatchesPerMetricQueries() {
+        var readings: [Reading] = []
+        for index in 0..<6 {
+            let offset = Double(index) * 60
+            readings += [
+                reading("alpha", 70, offset: offset),
+                reading("bravo", 76, offset: offset + 5),
+                reading("alpha", 97, offset: offset, kind: .spo2),
+                reading("bravo", 95, offset: offset + 5, kind: .spo2),
+                reading("charlie", 36.9, offset: offset, kind: .bodyTemperature),
+            ]
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(600)
+        )
+        let all = ComparisonEngine.allPairwiseAnalyses(from: readings, range: range)
+        let perMetric = MetricKind.allCases.flatMap {
+            ComparisonEngine.allPairwiseAnalyses(from: readings, kind: $0, range: range)
+        }
+
+        #expect(all == perMetric)
+        // Body temperature has a single source, so it contributes no pair at all.
+        #expect(all.map(\.kind) == [.heartRate, .spo2])
+    }
+
+    @Test("Chart thinning bounds the plotted set without hiding the widest differences")
+    func plotSampleKeepsOutliers() throws {
+        var readings: [Reading] = []
+        for index in 0..<400 {
+            let offset = Double(index) * 60
+            readings.append(reading("alpha", 70, offset: offset))
+            // One window disagrees far more than the rest; it must survive thinning.
+            readings.append(reading("bravo", index == 137 ? 110 : 71, offset: offset + 5))
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(400 * 60)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+        #expect(analysis.observations.count == 400)
+
+        let sampled = analysis.plotSample(limit: 50, extremes: 5)
+        let widest = try #require(analysis.observations.max { abs($0.signedDifference) < abs($1.signedDifference) })
+
+        #expect(sampled.count <= 50 + 5 + 1)
+        #expect(sampled.count < analysis.observations.count)
+        #expect(sampled.contains(widest))
+        #expect(sampled.first == analysis.observations.first)
+        #expect(sampled.last == analysis.observations.last)
+        #expect(sampled == sampled.sorted { $0.start < $1.start })
+        #expect(Set(sampled.map(\.id)).count == sampled.count)
+    }
+
+    @Test("A set small enough to draw is never thinned")
+    func plotSamplePassesSmallSetsThrough() {
+        var readings: [Reading] = []
+        for index in 0..<6 {
+            let offset = Double(index) * 60
+            readings.append(reading("alpha", 70, offset: offset))
+            readings.append(reading("bravo", 71, offset: offset + 5))
+        }
+        let range = DateInterval(
+            start: epoch.addingTimeInterval(-1),
+            end: epoch.addingTimeInterval(600)
+        )
+        let analysis = ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: "alpha",
+            sourceB: "bravo",
+            range: range
+        )
+
+        #expect(analysis.plotSample(limit: 500, extremes: 60) == analysis.observations)
+        #expect(analysis.plotSample(limit: 0, extremes: 60).isEmpty)
+    }
+
     @Test("Stale readings are not presented as current")
     func latestBySourceDropsStale() {
         let now = epoch.addingTimeInterval(3600)
@@ -381,6 +857,104 @@ struct OuraMappingTests {
         #expect(OuraClient.parseTimestamp("not a date") == nil)
     }
 }
+
+#if DEBUG
+/// The demo archive exists so the pair screen's states can be reviewed without wearing two
+/// devices. If it silently stopped producing one of them, the visual QA it is meant to
+/// support would quietly stop covering that state.
+@Suite("Debug analysis fixtures")
+@MainActor
+struct DebugAnalysisFixtureTests {
+
+    private let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+    private func fixtureAnalysis(_ kind: MetricKind) -> PairwiseAnalysis {
+        let store = HealthStore(persistenceEnabled: false)
+        DebugAnalysisFixtures.populate(store: store, now: now)
+        let range = DateInterval(
+            start: now.addingTimeInterval(-86_400),
+            end: now.addingTimeInterval(60)
+        )
+        return ComparisonEngine.pairwiseAnalysis(
+            from: store.readings(kind: kind, in: range),
+            kind: kind,
+            sourceA: DebugAnalysisFixtures.sourceAID,
+            sourceB: DebugAnalysisFixtures.sourceBID,
+            range: range
+        )
+    }
+
+    @Test("The two demo devices are distinguishable in charts")
+    func demoSourcesAreDistinct() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        DebugAnalysisFixtures.populate(store: store, now: now)
+
+        let a = try #require(store.source(id: DebugAnalysisFixtures.sourceAID))
+        let b = try #require(store.source(id: DebugAnalysisFixtures.sourceBID))
+        #expect(a.colorIndex != b.colorIndex)
+
+        // Populating twice must not double every reading.
+        let before = store.readings(kind: .heartRate).count
+        DebugAnalysisFixtures.populate(store: store, now: now)
+        #expect(store.readings(kind: .heartRate).count == before)
+    }
+
+    @Test("Heart rate demonstrates a ready pair inside tolerance")
+    func agreeingState() throws {
+        let statistics = try #require(fixtureAnalysis(.heartRate).statistics)
+        #expect(statistics.severity == .agreeing)
+    }
+
+    @Test("Blood oxygen demonstrates bias plus a point outside the limits of agreement")
+    func biasedWithOutlierState() throws {
+        let analysis = fixtureAnalysis(.spo2)
+        let statistics = try #require(analysis.statistics)
+
+        #expect(statistics.severity != .agreeing)
+        #expect(statistics.classification == .systematicBias)
+        #expect(analysis.observations.contains { !statistics.limitsOfAgreement.contains($0.signedDifference) })
+    }
+
+    @Test("Body temperature demonstrates scatter rather than a stable offset")
+    func noisyState() throws {
+        let statistics = try #require(fixtureAnalysis(.bodyTemperature).statistics)
+        #expect(statistics.classification == .measurementNoise)
+    }
+
+    @Test("HRV demonstrates the collecting state below the five-window minimum")
+    func collectingState() {
+        let analysis = fixtureAnalysis(.hrvRMSSD)
+        #expect(analysis.state == .collecting(pairedWindowCount: 3, requiredWindowCount: 5))
+        #expect(analysis.statistics == nil)
+    }
+
+    @Test("Respiratory rate demonstrates two sources that never share a window")
+    func noOverlapState() {
+        let analysis = fixtureAnalysis(.respiratoryRate)
+        #expect(analysis.state == .noOverlap)
+        #expect(analysis.candidateWindowCount > 0)
+        #expect(analysis.overlapPercentage == 0)
+    }
+
+    @Test("The demo archive never lets Compare claim overall agreement")
+    func demoOverviewIsNotGreen() {
+        let store = HealthStore(persistenceEnabled: false)
+        DebugAnalysisFixtures.populate(store: store, now: now)
+        let range = DateInterval(
+            start: now.addingTimeInterval(-86_400),
+            end: now.addingTimeInterval(60)
+        )
+        let overview = PairwiseEvidenceOverview(
+            analyses: ComparisonEngine.allPairwiseAnalyses(from: store.readings(in: range), range: range),
+            alertThreshold: .notable
+        )
+
+        #expect(overview.status == .readyPairOutsideTolerance)
+        #expect(overview.incompleteCount >= 2)   // collecting and no-overlap are both present
+        #expect(overview.flaggedCount >= 1)
+    }
+}
+#endif
 
 @Suite("Stable identifiers")
 struct StableIDTests {

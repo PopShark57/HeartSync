@@ -27,6 +27,11 @@ final class HealthStore {
     private var knownReadingIDs: Set<UUID> = []
     private var saveTask: Task<Void, Never>?
     private var isLoaded = false
+    private let persistenceEnabled: Bool
+
+    init(persistenceEnabled: Bool = true) {
+        self.persistenceEnabled = persistenceEnabled
+    }
 
     // MARK: - Sources
 
@@ -203,6 +208,7 @@ final class HealthStore {
     func loadIfNeeded() async {
         guard !isLoaded else { return }
         isLoaded = true
+        guard persistenceEnabled else { return }
 
         let loadedSources = await ReadingArchive.shared.read([DataSource].self, from: ReadingArchive.File.sources) ?? []
         let loadedReadings = await ReadingArchive.shared.read([Reading].self, from: ReadingArchive.File.readings) ?? []
@@ -232,6 +238,7 @@ final class HealthStore {
 
     /// Coalesces saves so a 1 Hz stream does not trigger a file write every second.
     private func scheduleSave() {
+        guard persistenceEnabled else { return }
         saveTask?.cancel()
         saveTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(3))
@@ -241,6 +248,7 @@ final class HealthStore {
     }
 
     func saveNow() async {
+        guard persistenceEnabled else { return }
         prune()
         let readingsSnapshot = readings
         let sourcesSnapshot = sources
