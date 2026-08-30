@@ -1,0 +1,15 @@
+# Build products and per-run DerivedData trees
+build/
+DerivedData/
+*.xcresult
+
+# XcodeGen output — regenerate with `xcodegen generate`
+HeartSyncChecker.xcodeproj/
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# macOS
+.DS_Store
