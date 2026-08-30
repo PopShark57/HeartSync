@@ -288,16 +288,12 @@ final class OuraManager {
         credential: OuraOAuthCredential,
         operation: () async throws -> T
     ) async throws -> T? {
-        guard endpoint.requiredScope.map({ credential.mayAttemptAccess(requiring: $0) }) != false else {
-            endpointStates[endpoint] = .permissionMissing
-            endpointIssues.append(OuraEndpointIssue(
-                endpoint: endpoint,
-                message: "\(endpoint.title): permission not granted",
-                isPermissionIssue: true
-            ))
-            return nil
-        }
-
+        // Deliberately no pre-emptive scope check. The callback's scope list is
+        // corroborating evidence, never grounds to skip a request: Oura's published scope
+        // names are incomplete (`heart_health`, `stress` and `ring_configuration` are
+        // absent from the documented set) and it has answered a `spo2` request with
+        // `spo2Daily`. A name this app fails to match must not hide data the user granted,
+        // so Oura is asked and only Oura's answer marks a collection unavailable.
         endpointStates[endpoint] = .syncing
         do {
             let result = try await operation()
@@ -308,7 +304,14 @@ final class OuraManager {
             // Oura currently returns HTTP 401 (rather than 403) when a valid token lacks
             // newer scopes such as `heart_health`. That is an endpoint permission issue,
             // not an invalid bearer token, so keep the account and continue the sync.
-            if Self.isScopePermissionFailure(error) {
+            // A 401 whose detail does not spell out "scope" would otherwise fall through
+            // to handleAuthorizationFailure and clear the whole credential. When the
+            // callback already told us this scope was withheld, that reading is wrong:
+            // declining one permission must not sign the account out.
+            let scopeWithheldByCallback = endpoint.requiredScope
+                .map { !credential.mayAttemptAccess(requiring: $0) } ?? false
+            if Self.isScopePermissionFailure(error)
+                || (scopeWithheldByCallback && Self.isUnauthorized(error)) {
                 let message = Self.describe(error, endpoint: endpoint.title)
                 endpointStates[endpoint] = .permissionMissing
                 endpointIssues.append(OuraEndpointIssue(
@@ -341,6 +344,12 @@ final class OuraManager {
             return "\(endpoint): \(failure.errorDescription ?? "failed")"
         }
         return "\(endpoint): \(error.localizedDescription)"
+    }
+
+    nonisolated static func isUnauthorized(_ error: any Error) -> Bool {
+        guard let failure = error as? OuraClient.Failure, case .unauthorized = failure
+        else { return false }
+        return true
     }
 
     nonisolated static func isScopePermissionFailure(_ error: any Error) -> Bool {

@@ -134,7 +134,7 @@ struct OuraDataModelTests {
         oldCardiovascularAge.id = "cardio-old"
         oldCardiovascularAge.day = "2026-08-27"
 
-        var vo2Max = try decode(OuraClient.VO2MaxDocument.self, OuraFixtures.vo2Max)
+        let vo2Max = try decode(OuraClient.VO2MaxDocument.self, OuraFixtures.vo2Max)
         var oldVO2Max = vo2Max
         oldVO2Max.id = "vo2-old"
         oldVO2Max.day = "2026-08-27"

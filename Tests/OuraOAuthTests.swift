@@ -96,6 +96,30 @@ struct OuraOAuthTests {
         ))
     }
 
+    @Test("A bare 401 on a scope the callback withheld is permission, not a dead token")
+    func bareUnauthorizedOnWithheldScopeIsPermission() {
+        // Oura does not always name the scope in a 401 body. Without corroboration from
+        // the callback such a response is indistinguishable from an expired token, and
+        // clearing the credential would sign the account out over one declined
+        // permission. These two predicates are what keep those cases apart.
+        let expired = OuraClient.Failure.unauthorized("Access token expired")
+        #expect(OuraManager.isUnauthorized(expired))
+        #expect(!OuraManager.isScopePermissionFailure(expired))
+
+        #expect(!OuraManager.isUnauthorized(OuraClient.Failure.forbidden("Missing required scope: daily")))
+
+        let credential = OuraOAuthCredential(
+            accessToken: "token",
+            expiresAt: .distantFuture,
+            grantedScopes: ["personal", "daily"],
+            scopeFieldWasReturned: true
+        )
+        // Withheld by the callback, so a bare 401 here is a permission issue.
+        #expect(!credential.mayAttemptAccess(requiring: "heart_health"))
+        // Granted, so a bare 401 here really is the token dying and must be handled as one.
+        #expect(credential.mayAttemptAccess(requiring: "daily"))
+    }
+
     @Test("Legacy credentials decode without the new scope metadata field")
     func legacyCredentialCompatibility() throws {
         struct LegacyCredential: Encodable {

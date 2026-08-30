@@ -117,7 +117,7 @@ no Health data.
 
 ## Tests
 
-68 tests cover the parts where a silent error would corrupt every comparison downstream:
+69 tests cover the parts where a silent error would corrupt every comparison downstream:
 GATT frame parsing against hand-built spec vectors (IEEE-11073 SFLOAT special values,
 R–R interval unit conversion, optional-field skip order), HRV artefact rejection, window
 alignment, bias-versus-noise classification, estimator clamping, and Oura mapping.
