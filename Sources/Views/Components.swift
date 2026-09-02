@@ -12,7 +12,8 @@ struct SourceDot: View {
         Circle()
             .fill(color)
             .frame(width: size, height: size)
-            .overlay(Circle().strokeBorder(.background, lineWidth: 1))
+            .overlay(Circle().strokeBorder(.white.opacity(0.55), lineWidth: 1))
+            .shadow(color: color.opacity(0.45), radius: size * 0.35, y: 0)
             .accessibilityHidden(true)
     }
 }
@@ -64,7 +65,7 @@ struct SourceValueRow: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(source.displayName)
-                    .font(.subheadline)
+                    .font(.subheadline.weight(.medium))
                     .lineLimit(1)
                 HStack(spacing: 4) {
                     if provenance != .measured {
@@ -93,7 +94,7 @@ struct SourceValueRow: View {
                 }
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityDescription)
     }
@@ -128,12 +129,13 @@ struct AgreementBadge: View {
             Image(systemName: severity.systemImage)
                 .font(.caption2)
             Text(label)
-                .font(.caption.weight(.medium))
+                .font(.caption.weight(.semibold))
         }
         .foregroundStyle(severity.tint)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(severity.tint.opacity(0.12), in: Capsule())
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(severity.tint.opacity(0.14), in: Capsule())
+        .overlay(Capsule().strokeBorder(severity.tint.opacity(0.22), lineWidth: 0.8))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(severity.title). \(label).")
     }
@@ -154,7 +156,7 @@ struct AgreementBadge: View {
 /// Deliberately neutral in colour and wording: insufficient evidence is not agreement, and
 /// this note must never be mistaken for a green result.
 struct ComparisonUnavailableNote: View {
-    /// Plain-language reason, e.g. "readings 12 min apart · no shared 1-minute window".
+    /// Plain-language reason, e.g. "readings 12 min apart \u{00b7} no shared 1-minute window".
     var detail: String
 
     var body: some View {
@@ -172,9 +174,9 @@ struct ComparisonUnavailableNote: View {
             }
         }
         .foregroundStyle(.secondary)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: HeartSyncTheme.compactCornerRadius, style: .continuous))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Not compared. \(detail).")
     }
@@ -193,13 +195,27 @@ struct EmptyStateView: View {
     @ScaledMetric(relativeTo: .largeTitle) private var glyphSize: CGFloat = 42
 
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: systemImage)
-                .font(.system(size: glyphSize))
-                .foregroundStyle(.tertiary)
-                .accessibilityHidden(true)
+        VStack(spacing: 14) {
+            ZStack {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                HeartSyncTheme.accent.opacity(0.22),
+                                HeartSyncTheme.accentSecondary.opacity(0.10),
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: glyphSize + 36, height: glyphSize + 36)
+                Image(systemName: systemImage)
+                    .font(.system(size: glyphSize))
+                    .foregroundStyle(HeartSyncTheme.accent)
+                    .accessibilityHidden(true)
+            }
             Text(title)
-                .font(.headline)
+                .font(.title3.weight(.semibold))
             Text(message)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -207,6 +223,7 @@ struct EmptyStateView: View {
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
                     .buttonStyle(.borderedProminent)
+                    .tint(HeartSyncTheme.accent)
                     .padding(.top, 4)
             }
         }
@@ -231,9 +248,13 @@ struct EstimateDisclaimer: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(10)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+        .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: HeartSyncTheme.compactCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: HeartSyncTheme.compactCornerRadius, style: .continuous)
+                .strokeBorder(.orange.opacity(0.22))
+        }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Estimate. \(text)")
     }
@@ -248,8 +269,11 @@ struct BatteryBadge: View {
             Image(systemName: symbol)
             Text("\(percent)%")
         }
-        .font(.caption2.monospacedDigit())
+        .font(.caption2.monospacedDigit().weight(.medium))
         .foregroundStyle(percent <= 15 ? .red : .secondary)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background((percent <= 15 ? Color.red : Color.secondary).opacity(0.10), in: Capsule())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(percent <= 15 ? "Battery low, \(percent) percent" : "Battery \(percent) percent")
     }
@@ -273,20 +297,11 @@ struct SignalBars: View {
         HStack(alignment: .bottom, spacing: 2) {
             ForEach(1...3, id: \.self) { index in
                 RoundedRectangle(cornerRadius: 1)
-                    .fill(index <= bars ? Color.accentColor : Color.secondary.opacity(0.25))
+                    .fill(index <= bars ? HeartSyncTheme.accent : Color.secondary.opacity(0.25))
                     .frame(width: 3, height: CGFloat(index) * 4 + 3)
             }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Signal strength \(bars) of 3")
-    }
-}
-
-extension View {
-    /// Standard card treatment for dashboard tiles.
-    func metricCard() -> some View {
-        self
-            .padding(14)
-            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 16))
     }
 }
