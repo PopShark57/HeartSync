@@ -59,6 +59,12 @@ final class HealthKitManager {
     /// sync instead of materialising an arbitrarily large backlog in one call.
     nonisolated static let queryBatchLimit = 500
     nonisolated static let maximumObjectsPerSync = 10_000
+    /// HealthKit raises `NSInvalidArgumentException` if an anchored query with a finite limit
+    /// is given an update handler. Keep finite limits on the one-shot drains above, while the
+    /// long-running query uses the framework's required no-limit mode. The one-slot stream still
+    /// bounds queued callbacks, and the threshold below moves unusually large callbacks back
+    /// through the finite drain path.
+    nonisolated static let observerQueryLimit = HKObjectQueryNoLimit
     /// A slow main actor must not accumulate an unbounded observer-task queue. If this one-slot
     /// buffer fills, the query is stopped and the saved anchor is drained again in order.
     nonisolated static let observerBufferLimit = 1
@@ -522,7 +528,7 @@ final class HealthKitManager {
             type: type,
             predicate: Self.recentPredicate(),
             anchor: loadAnchor(for: mapping.identifier),
-            limit: Self.queryBatchLimit,
+            limit: Self.observerQueryLimit,
             resultsHandler: handler
         )
         query.updateHandler = handler
