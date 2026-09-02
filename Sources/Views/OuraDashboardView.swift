@@ -115,10 +115,15 @@ struct OuraDashboardView: View {
 
     private var dashboard: some View {
         ScrollView {
-            // Eager stack on purpose. This page is a fixed handful of section cards, and a
-            // Swift Charts plot (Heart rate) nested in LazyVStack triggers an unbounded
-            // layout negotiation that freezes scrolling once that chart enters the lazy
-            // viewport - roughly a third of the way down. Lazy loading buys nothing here.
+            // Eager stack on purpose: this page is a fixed handful of section cards, so
+            // lazy loading buys nothing and only delays the same work until mid-scroll.
+            //
+            // The hang this replaced was never the stack. `OuraHeartRateSection` derived
+            // its chart points in computed properties and read one of them from inside the
+            // `Chart` content closure, which Swift Charts runs once per plotted sample, so
+            // every sample re-parsed the whole cached heart-rate collection. Making the
+            // stack eager only moved the freeze from mid-scroll to tab entry; the fix is in
+            // `OuraHeartRateSeries`, which resolves that set exactly once.
             VStack(alignment: .leading, spacing: 24) {
                 connectionHeader
 

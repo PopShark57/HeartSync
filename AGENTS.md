@@ -388,7 +388,7 @@ Tests use Apple's Swift Testing package (`import Testing`, `@Suite`, `@Test`, `#
 - `Tests/AnalysisTests.swift`: 53 tests covering HRV, comparison/windowing/statistics/evidence, chart thinning, estimators, Oura mapping, debug fixtures, and stable identifiers.
 - `Tests/ParsingTests.swift`: 17 tests covering binary reads and GATT measurement parsing, including units, optional fields, and invalid frames.
 - `Tests/OuraOAuthTests.swift`: 13 tests covering exact authorization URL/scopes, callback/state/token metadata, scope-related 401 behavior, expiry, and compatibility behavior.
-- `Tests/OuraDataTests.swift`: 8 tests covering decoding, snapshot/upsert behavior, and injected-`URLProtocol` request/error behavior.
+- `Tests/OuraDataTests.swift`: 14 tests covering decoding, snapshot/upsert behavior, injected-`URLProtocol` request/error behavior, and the Oura heart-rate chart series (window anchoring, unparseable timestamps, and plot thinning).
 - `Tests/PairwiseExportTests.swift`: 8 tests covering stable schemas, canonical A/B semantics, RFC escaping, evidence language, metadata isolation, UTC, and fallback output.
 - `Tests/HealthStoreTests.swift`: 35 tests covering validation, indexing, batch ingestion, deletion, persistence safety, retention, and bounded compaction.
 - `Tests/ReadingArchiveTests.swift`: 19 tests covering envelopes, legacy payloads, corrupt preservation, unreadable-file handling, and Oura cache compatibility.

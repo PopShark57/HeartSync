@@ -263,6 +263,110 @@ struct OuraDataTransportTests {
     }
 }
 
+@Suite("Oura heart-rate chart series")
+struct OuraHeartRateSeriesTests {
+
+    /// Fixed instant so a test can express "so many minutes before the newest sample"
+    /// without depending on when it runs.
+    private static let anchor = Date(timeIntervalSince1970: 1_756_000_000)
+
+    private func sample(_ bpm: Int, minutesBefore: Int) -> OuraClient.HeartRatePoint {
+        OuraClient.HeartRatePoint(
+            bpm: bpm,
+            source: "awake",
+            timestamp: OuraClient.iso8601.string(
+                from: Self.anchor.addingTimeInterval(-Double(minutesBefore) * 60)
+            )
+        )
+    }
+
+    @Test("An empty cache produces nothing to draw")
+    func emptyCacheDrawsNothing() {
+        let series = OuraHeartRateSeries(heartRates: [])
+
+        #expect(series.points.isEmpty)
+        #expect(series.sampleCount == 0)
+        #expect(series.lowest == nil)
+        #expect(series.highest == nil)
+        #expect(!series.isThinned)
+    }
+
+    @Test("The window is measured back from the newest cached sample, not from now")
+    func windowIsAnchoredToTheNewestCachedSample() {
+        let series = OuraHeartRateSeries(heartRates: [
+            sample(58, minutesBefore: 2_880),
+            sample(60, minutesBefore: 1_441),
+            sample(62, minutesBefore: 1_440),
+            sample(64, minutesBefore: 0),
+        ])
+
+        #expect(series.sampleCount == 2)
+        #expect(series.points.map(\.bpm) == [62, 64])
+        #expect(series.lowest == 62)
+        #expect(series.highest == 64)
+    }
+
+    @Test("A sample Oura could not timestamp is dropped rather than plotted at a guess")
+    func unparseableTimestampsAreDropped() {
+        let series = OuraHeartRateSeries(heartRates: [
+            OuraClient.HeartRatePoint(bpm: 61, source: nil, timestamp: "sometime yesterday"),
+            sample(64, minutesBefore: 0),
+        ])
+
+        #expect(series.sampleCount == 1)
+        #expect(series.points.map(\.bpm) == [64])
+    }
+
+    @Test("The area baseline sits below the lowest sample and never goes negative")
+    func baselineStaysBelowTheLowestSample() {
+        let series = OuraHeartRateSeries(heartRates: [
+            sample(50, minutesBefore: 5),
+            sample(70, minutesBefore: 0),
+        ])
+        #expect(series.floor == 42)
+
+        #expect(OuraHeartRateSeries(heartRates: [sample(3, minutesBefore: 0)]).floor == 0)
+    }
+
+    @Test("A window small enough to draw is never thinned")
+    func smallWindowIsDrawnInFull() {
+        let series = OuraHeartRateSeries(
+            heartRates: (0..<10).map { sample(60 + $0, minutesBefore: 10 - $0) }
+        )
+
+        #expect(!series.isThinned)
+        #expect(series.points.count == 10)
+        #expect(series.points.count == series.sampleCount)
+    }
+
+    @Test("A dense day is bounded for drawing while the range still describes every sample")
+    func thinningBoundsThePlottedSetWithoutHidingTheExtremes() {
+        let samples = stride(from: 1_200, through: 0, by: -1).map { minute -> OuraClient.HeartRatePoint in
+            let bpm: Int
+            switch minute {
+            case 700: bpm = 39
+            case 300: bpm = 191
+            default: bpm = 65
+            }
+            return sample(bpm, minutesBefore: minute)
+        }
+        let series = OuraHeartRateSeries(heartRates: samples)
+
+        #expect(series.sampleCount == 1_201)
+        #expect(series.isThinned)
+        #expect(series.points.count < series.sampleCount)
+        #expect(series.points.count <= OuraHeartRateSeries.maximumPlottedSamples + 3)
+        // The label above the chart names the range, so the drawn line has to reach it.
+        #expect(series.lowest == 39)
+        #expect(series.highest == 191)
+        #expect(series.points.contains { $0.bpm == 39 })
+        #expect(series.points.contains { $0.bpm == 191 })
+        #expect(series.points.map(\.date) == series.points.map(\.date).sorted())
+        #expect(series.points.last?.date == series.points.map(\.date).max())
+        #expect(Set(series.points.map(\.id)).count == series.points.count)
+    }
+}
+
 private func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
     try JSONDecoder().decode(type, from: Data(json.utf8))
 }

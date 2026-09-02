@@ -357,6 +357,25 @@ second timeout exists to bound.
 Coalesce: update the backing dictionary on every packet, but publish and re-sort on a timer
 (2–3 Hz is far more than the UI needs).
 
+### 2.8 The Oura heart-rate chart re-derived its whole sample set once per plotted point
+
+**Status: Fixed.** `OuraHeartRateSeries` parses the cached collection once per update and
+supplies the plotted points, the area baseline, the range label, and the thinning note as
+stored properties. `OuraSnapshot.latestHeartRate` likewise parses each timestamp once
+instead of inside a comparator.
+
+**High.** `OuraHeartRateSection` derived its chart points in a computed property that
+`compactMap`ped, parsed, and sorted the entire cached heart-rate collection, and read it
+five times per body pass. One of those reads was the area mark's baseline, evaluated inside
+the `Chart` content closure — which Swift Charts runs once per plotted sample.
+
+A fortnight of five-minute samples is roughly 4,000 cached records and 288 inside the
+24-hour window, so drawing the card cost about 1.2 million `ISO8601DateFormatter` parses,
+288 sorts of a 4,000-element array, and 1.2 million string interpolations for the point ids
+— all on the main thread, repeated on every body pass. The Oura tab froze on entry; a
+denser cache (Oura can sample once a minute) froze it for minutes. Replacing the section's
+`LazyVStack` with an eager `VStack` had only moved the freeze from mid-scroll to tab entry.
+
 ---
 
 ## 3. Storage and scale
