@@ -181,6 +181,7 @@ final class HealthKitManager {
             // data actually arrives is only knowable by querying.
             availability = .authorized
             lastError = nil
+            persistAuthorizationCompleted()
             await startObserving()
             await syncAll()
         } catch {

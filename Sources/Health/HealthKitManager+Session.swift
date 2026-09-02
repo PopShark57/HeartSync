@@ -58,6 +58,14 @@ extension HealthKitManager {
         set { UserDefaults.standard.set(newValue, forKey: didCompleteAuthorizationKey) }
     }
 
+    /// Records that HeartSync's Health authorization flow completed (sheet answered).
+    ///
+    /// Called from `requestAuthorization` on success so Devices Connect, session restore,
+    /// and mirror write all share one persistence seam.
+    func persistAuthorizationCompleted() {
+        Self.didCompleteAuthorizationFlag = true
+    }
+
     /// Restores a previously completed HealthKit session without re-prompting.
     ///
     /// `availability` starts as `.notDetermined` every cold launch. Without this restore,
@@ -67,7 +75,8 @@ extension HealthKitManager {
     ///
     /// Implementation reuses `requestAuthorization(allowWriting: false)`, which (when the
     /// read request is already determined) does not present the sheet again, and already
-    /// owns setting `.authorized`, installing observers, and syncing.
+    /// owns setting `.authorized`, installing observers, syncing, and persisting the
+    /// completed-authorization flag.
     func restoreSessionIfNeeded() async {
         guard HKHealthStore.isHealthDataAvailable() else { return }
 
@@ -92,8 +101,10 @@ extension HealthKitManager {
         )
         guard decision == .restore else { return }
 
+        // On success, `requestAuthorization` persists the completed flag. Do not set it
+        // here — a failed request must leave the flag unchanged so the next launch can
+        // still decide from HealthKit status / a prior good Connect.
         await requestAuthorization(allowWriting: false)
-        Self.didCompleteAuthorizationFlag = true
     }
 
     /// Requests HealthKit share types when the user turns on Bluetooth\u{2192}Health mirroring.
@@ -111,8 +122,12 @@ extension HealthKitManager {
         if Self.isWriteAuthorizationSatisfied(statuses: currentStatuses) {
             if availability != .authorized {
                 await requestAuthorization(allowWriting: true)
+                guard availability == .authorized else {
+                    return availability == .unavailable ? .unavailable : .denied
+                }
+            } else {
+                persistAuthorizationCompleted()
             }
-            Self.didCompleteAuthorizationFlag = true
             return .granted
         }
 
@@ -120,7 +135,6 @@ extension HealthKitManager {
 
         let afterStatuses = Self.shareTypes.map { probe.authorizationStatus(for: $0) }
         if Self.isWriteAuthorizationSatisfied(statuses: afterStatuses) {
-            Self.didCompleteAuthorizationFlag = true
             return .granted
         }
         return .denied
