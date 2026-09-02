@@ -185,6 +185,7 @@ final class HealthKitManager {
             availability = .authorized
             markAuthorizationCompleted()
             lastError = nil
+            persistAuthorizationCompleted()
             await startObserving()
             await syncAll()
         } catch {

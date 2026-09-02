@@ -110,7 +110,7 @@ struct SettingsView: View {
                         settings.snapshot.mirrorBluetoothToHealthKit = false
                         mirrorWriteAlert = .denied(
                             model.healthKit.lastError
-                                ?? "Health write access was not granted."
+                                ?? "Health write access was not granted. Enable it in Settings \u{2192} Health \u{2192} Data Access & Devices."
                         )
                     case .unavailable:
                         settings.snapshot.mirrorBluetoothToHealthKit = false

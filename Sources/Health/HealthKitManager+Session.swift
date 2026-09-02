@@ -31,6 +31,9 @@ extension HealthKitManager {
     /// `statusForAuthorizationRequest` for **read** types only (empty share set), so a user
     /// who connected without mirroring still restores, and turning mirroring on later can
     /// still prompt for write types.
+    ///
+    /// Note: `.unnecessary` means the user already answered the sheet (grant or deny). That
+    /// matches HeartSync's `.authorized` meaning — sheet completed — not "every read granted".
     nonisolated static func sessionRestoreDecision(
         healthDataAvailable: Bool,
         didCompleteAuthorization: Bool,
@@ -50,13 +53,17 @@ extension HealthKitManager {
         !statuses.isEmpty && statuses.allSatisfy { $0 == .sharingAuthorized }
     }
 
-    private var didCompleteAuthorization: Bool {
-        get { UserDefaults.standard.bool(forKey: Self.didCompleteAuthorizationKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.didCompleteAuthorizationKey) }
+    private static var didCompleteAuthorizationFlag: Bool {
+        get { UserDefaults.standard.bool(forKey: didCompleteAuthorizationKey) }
+        set { UserDefaults.standard.set(newValue, forKey: didCompleteAuthorizationKey) }
     }
 
-    func markAuthorizationCompleted() {
-        didCompleteAuthorization = true
+    /// Records that HeartSync's Health authorization flow completed (sheet answered).
+    ///
+    /// Called from `requestAuthorization` on success so Devices Connect, session restore,
+    /// and mirror write all share one persistence seam.
+    func persistAuthorizationCompleted() {
+        Self.didCompleteAuthorizationFlag = true
     }
 
     /// Restores a previously completed HealthKit session without re-prompting.
@@ -65,40 +72,39 @@ extension HealthKitManager {
     /// Devices offers "Connect Apple Health" again and `AppModel.start` skips `syncAll`
     /// even though the user already finished the sheet. Completing the sheet still does
     /// not mean every read type was granted \u{2014} that honesty stays in `Availability.title`.
+    ///
+    /// Implementation reuses `requestAuthorization(allowWriting: false)`, which (when the
+    /// read request is already determined) does not present the sheet again, and already
+    /// owns setting `.authorized`, installing observers, syncing, and persisting the
+    /// completed-authorization flag.
     func restoreSessionIfNeeded() async {
-        let healthAvailable = HKHealthStore.isHealthDataAvailable()
+        guard HKHealthStore.isHealthDataAvailable() else { return }
+
         var requestUnnecessary = false
-        if healthAvailable {
-            do {
-                // Read types only: share types are requested separately when mirroring is
-                // enabled, and must not block restoring a read-only Connect session.
-                let status = try await healthStore.statusForAuthorizationRequest(
-                    toShare: [],
-                    read: Self.readTypes
-                )
-                requestUnnecessary = (status == .unnecessary)
-            } catch {
-                logger.debug(
-                    "Authorization request status unavailable: \(error.localizedDescription, privacy: .public)"
-                )
-            }
+        do {
+            // Local store: avoids needing access to the manager's private `healthStore`.
+            // Read types only so a prior read-only Connect still restores; share types are
+            // requested separately when mirroring is enabled.
+            let status = try await HKHealthStore().statusForAuthorizationRequest(
+                toShare: [],
+                read: Self.readTypes
+            )
+            requestUnnecessary = (status == .unnecessary)
+        } catch {
+            // Status probe failed; fall back to the persisted Connect flag alone.
         }
 
-        switch Self.sessionRestoreDecision(
-            healthDataAvailable: healthAvailable,
-            didCompleteAuthorization: didCompleteAuthorization,
+        let decision = Self.sessionRestoreDecision(
+            healthDataAvailable: true,
+            didCompleteAuthorization: Self.didCompleteAuthorizationFlag,
             authorizationRequestUnnecessary: requestUnnecessary
-        ) {
-        case .unavailable:
-            availability = .unavailable
-        case .leaveNotDetermined:
-            break
-        case .restore:
-            availability = .authorized
-            markAuthorizationCompleted()
-            lastError = nil
-            await startObserving()
-        }
+        )
+        guard decision == .restore else { return }
+
+        // On success, `requestAuthorization` persists the completed flag. Do not set it
+        // here — a failed request must leave the flag unchanged so the next launch can
+        // still decide from HealthKit status / a prior good Connect.
+        await requestAuthorization(allowWriting: false)
     }
 
     /// Requests HealthKit share types when the user turns on Bluetooth\u{2192}Health mirroring.
@@ -108,36 +114,29 @@ extension HealthKitManager {
     /// granted / denied / unavailable so Settings can show an alert instead of a no-op.
     func requestWriteAuthorization() async -> WriteAuthorizationOutcome {
         guard HKHealthStore.isHealthDataAvailable() else {
-            availability = .unavailable
             return .unavailable
         }
 
-        let currentStatuses = Self.shareTypes.map { healthStore.authorizationStatus(for: $0) }
+        let probe = HKHealthStore()
+        let currentStatuses = Self.shareTypes.map { probe.authorizationStatus(for: $0) }
         if Self.isWriteAuthorizationSatisfied(statuses: currentStatuses) {
             if availability != .authorized {
-                availability = .authorized
-                markAuthorizationCompleted()
-                lastError = nil
-                await startObserving()
-                await syncAll()
+                await requestAuthorization(allowWriting: true)
+                guard availability == .authorized else {
+                    return availability == .unavailable ? .unavailable : .denied
+                }
+            } else {
+                persistAuthorizationCompleted()
             }
             return .granted
         }
 
         await requestAuthorization(allowWriting: true)
-        guard availability != .unavailable else { return .unavailable }
 
-        let afterStatuses = Self.shareTypes.map { healthStore.authorizationStatus(for: $0) }
+        let afterStatuses = Self.shareTypes.map { probe.authorizationStatus(for: $0) }
         if Self.isWriteAuthorizationSatisfied(statuses: afterStatuses) {
-            lastError = nil
             return .granted
         }
-
-        lastError = String(
-            localized: "healthKit.writeAuthorization.denied",
-            defaultValue: "Health write access was not granted. Enable it in Settings \u{2192} Health \u{2192} Data Access & Devices.",
-            comment: "Shown when mirroring is enabled but the user did not grant HealthKit share types"
-        )
         return .denied
     }
 }
