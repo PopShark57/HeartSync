@@ -44,7 +44,7 @@ struct DashboardView: View {
                     )
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 14) {
+                        LazyVStack(spacing: 16) {
                             summaryHeader
                             ForEach(snapshot.metrics) { summary in
                                 MetricCard(summary: summary)
@@ -55,7 +55,9 @@ struct DashboardView: View {
                     }
                 }
             }
+            .background { HeartSyncAmbientBackground() }
             .navigationTitle("Now")
+            .heartSyncChrome()
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     if model.healthKit.isSyncing || model.oura.isSyncing {
@@ -84,23 +86,32 @@ struct DashboardView: View {
             case .manual:    false
             }
         }
-        return HStack(spacing: 8) {
-            ForEach(connected) { source in
-                HStack(spacing: 5) {
-                    SourceDot(color: source.color, size: 8)
-                    Text(source.displayName)
-                        .font(.caption)
-                        .lineLimit(1)
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("Live sources")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .tracking(0.6)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(connected) { source in
+                        HStack(spacing: 6) {
+                            SourceDot(color: source.color, size: 8)
+                            Text(source.displayName)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 7)
+                        .background(source.color.opacity(0.14), in: Capsule())
+                        .overlay(Capsule().strokeBorder(source.color.opacity(0.22), lineWidth: 0.8))
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("\(source.displayName), connected")
+                    }
                 }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(source.color.opacity(0.12), in: Capsule())
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(source.displayName), connected")
             }
-            Spacer(minLength: 0)
         }
-        .padding(.top, 4)
+        .padding(.top, 6)
     }
 }
 
@@ -154,7 +165,7 @@ private struct MetricSummary: Identifiable {
 /// One resolved pass over the store for the live screen.
 ///
 /// Building every card from a single bounded read keeps the screen O(recent readings)
-/// instead of O(archive × metrics × cards), and makes every card describe the same instant.
+/// instead of O(archive \u{00d7} metrics \u{00d7} cards), and makes every card describe the same instant.
 @MainActor
 private struct DashboardSnapshot {
     let metrics: [MetricSummary]
@@ -356,19 +367,19 @@ private struct MetricCard: View {
     var summary: MetricSummary
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 Label(summary.kind.title, systemImage: summary.kind.systemImage)
                     .font(.headline)
                     .foregroundStyle(summary.kind.tint)
                 Spacer()
                 if let headline = summary.headline {
-                    HStack(alignment: .firstTextBaseline, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text(summary.kind.format(headline))
-                            .font(.system(.title, design: .rounded, weight: .bold))
+                            .font(.system(size: 34, weight: .bold, design: .rounded))
                             .monospacedDigit()
                         Text(summary.kind.unit)
-                            .font(.caption)
+                            .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }
                     .accessibilityElement(children: .ignore)
@@ -392,7 +403,7 @@ private struct MetricCard: View {
                 ComparisonUnavailableNote(detail: detail)
             }
 
-            VStack(spacing: 6) {
+            VStack(spacing: 2) {
                 ForEach(summary.rows) { row in
                     SourceValueRow(
                         source: row.source,
@@ -415,16 +426,19 @@ private struct MetricCard: View {
             } label: {
                 HStack {
                     Text("History and agreement")
-                        .font(.caption.weight(.medium))
+                        .font(.caption.weight(.semibold))
                     Spacer()
                     Image(systemName: "chevron.right")
-                        .font(.caption2)
+                        .font(.caption2.weight(.semibold))
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(summary.kind.tint.opacity(0.10), in: Capsule())
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(summary.kind.tint)
         }
-        .metricCard()
+        .metricCard(tint: summary.kind.tint)
     }
 
     /// Says which number this is, because the headline means different things depending on
