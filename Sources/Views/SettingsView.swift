@@ -4,6 +4,7 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var showingCalibration = false
     @State private var showingDeleteConfirmation = false
+    @State private var mirrorWriteAlert: MirrorWriteAlert?
 
     var body: some View {
         @Bindable var settings = model.settings
@@ -97,6 +98,34 @@ struct SettingsView: View {
                 model.store.retention = TimeInterval(days) * 86_400
                 model.store.prune()
             }
+            .onChange(of: settings.snapshot.mirrorBluetoothToHealthKit) { _, enabled in
+                guard enabled else { return }
+                Task {
+                    let outcome = await model.healthKit.requestWriteAuthorization()
+                    switch outcome {
+                    case .granted:
+                        mirrorWriteAlert = .granted
+                    case .denied:
+                        mirrorWriteAlert = .denied(
+                            model.healthKit.lastError
+                                ?? "Health write access was not granted."
+                        )
+                    case .unavailable:
+                        mirrorWriteAlert = .unavailable
+                    }
+                }
+            }
+            .alert(
+                mirrorWriteAlert?.title ?? "",
+                isPresented: Binding(
+                    get: { mirrorWriteAlert != nil },
+                    set: { if !$0 { mirrorWriteAlert = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(mirrorWriteAlert?.message ?? "")
+            }
         }
     }
 
@@ -173,6 +202,43 @@ struct SettingsView: View {
         let examples: [MetricKind] = [.heartRate, .spo2, .hrvRMSSD]
         let parts = examples.map { "\($0.shortTitle) \($0.format($0.agreement.warn))\($0.unit == "%" ? "%" : " \($0.unit)")" }
         return "Tolerances are per metric \u{2014} \(parts.joined(separator: ", ")). They reflect each metric's real-world measurement error, so a gap only gets flagged when it exceeds what both devices' own accuracy would explain."
+    }
+}
+
+/// Alert payload after the mirroring toggle asks for HealthKit write access.
+private enum MirrorWriteAlert: Identifiable {
+    case granted
+    case denied(String)
+    case unavailable
+
+    var id: String {
+        switch self {
+        case .granted: return "granted"
+        case .denied(let message): return "denied:\(message)"
+        case .unavailable: return "unavailable"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .granted:
+            "Health writing enabled"
+        case .denied:
+            "Health writing not enabled"
+        case .unavailable:
+            "Health unavailable"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .granted:
+            "Bluetooth readings can be written to Apple Health."
+        case .denied(let detail):
+            detail
+        case .unavailable:
+            "Health data is not available on this device."
+        }
     }
 }
 

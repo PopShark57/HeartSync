@@ -55,6 +55,9 @@ final class AppModel {
                 self?.removeDeletedHealthKitSamples(ids)
             }
         )
+        // Cold start always begins as `.notDetermined`; restore a prior Connect without
+        // re-prompting so observers install and the sync below can run.
+        await healthKit.restoreSessionIfNeeded()
         await oura.configure(store: store) { [weak self] readings in
             self?.ingest(readings, replacingExisting: true)
         }
