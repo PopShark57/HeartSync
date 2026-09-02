@@ -3,8 +3,9 @@ import HealthKit
 import Testing
 @testable import HeartSyncChecker
 
-@Suite("HealthKit session restore decision")
-struct HealthKitSessionRestoreDecisionTests {
+/// Pure decision helpers from `HealthKitManager+Session` — no device / HealthKit sheet required.
+@Suite("HealthKit session restore")
+struct HealthKitSessionRestoreTests {
 
     @Test("Unavailable hardware never restores")
     func unavailableHardware() {
@@ -17,7 +18,7 @@ struct HealthKitSessionRestoreDecisionTests {
         )
     }
 
-    @Test("A completed Connect flag restores without re-prompting")
+    @Test("HeartSync's own completed-Connect flag restores without a HealthKit sheet")
     func completedFlagRestores() {
         #expect(
             HealthKitManager.sessionRestoreDecision(
@@ -28,8 +29,8 @@ struct HealthKitSessionRestoreDecisionTests {
         )
     }
 
-    @Test("HealthKit reporting the request is unnecessary restores upgrades without a flag")
-    func requestStatusRestoresExistingUsers() {
+    @Test("HealthKit reporting the read request unnecessary also restores")
+    func requestUnnecessaryRestores() {
         #expect(
             HealthKitManager.sessionRestoreDecision(
                 healthDataAvailable: true,
@@ -39,8 +40,8 @@ struct HealthKitSessionRestoreDecisionTests {
         )
     }
 
-    @Test("A fresh install stays notDetermined until the user connects")
-    func freshInstallStaysNotDetermined() {
+    @Test("First launch with no prior Connect stays notDetermined")
+    func firstLaunchLeavesNotDetermined() {
         #expect(
             HealthKitManager.sessionRestoreDecision(
                 healthDataAvailable: true,
@@ -54,23 +55,29 @@ struct HealthKitSessionRestoreDecisionTests {
 @Suite("HealthKit write authorization satisfaction")
 struct HealthKitWriteAuthorizationTests {
 
-    @Test("Every share type must be sharingAuthorized")
-    func allShareTypesRequired() {
-        #expect(
-            HealthKitManager.isWriteAuthorizationSatisfied(
-                statuses: [.sharingAuthorized, .sharingAuthorized]
-            )
-        )
-        #expect(
-            !HealthKitManager.isWriteAuthorizationSatisfied(
-                statuses: [.sharingAuthorized, .sharingDenied]
-            )
-        )
-        #expect(
-            !HealthKitManager.isWriteAuthorizationSatisfied(
-                statuses: [.notDetermined, .notDetermined]
-            )
-        )
+    @Test("Empty status list is never satisfied")
+    func emptyIsUnsatisfied() {
         #expect(!HealthKitManager.isWriteAuthorizationSatisfied(statuses: []))
+    }
+
+    @Test("Every share type must be sharingAuthorized")
+    func allMustBeAuthorized() {
+        #expect(
+            HealthKitManager.isWriteAuthorizationSatisfied(statuses: [
+                .sharingAuthorized,
+                .sharingAuthorized,
+            ])
+        )
+        #expect(
+            !HealthKitManager.isWriteAuthorizationSatisfied(statuses: [
+                .sharingAuthorized,
+                .sharingDenied,
+            ])
+        )
+        #expect(
+            !HealthKitManager.isWriteAuthorizationSatisfied(statuses: [
+                .notDetermined,
+            ])
+        )
     }
 }
