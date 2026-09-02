@@ -21,6 +21,7 @@ struct RootView: View {
                 SettingsView()
             }
         }
+        .tint(HeartSyncTheme.accent)
     }
 }
 
