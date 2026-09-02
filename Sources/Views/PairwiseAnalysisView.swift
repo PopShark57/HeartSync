@@ -35,6 +35,11 @@ struct PairwiseAnalysisView: View {
     var body: some View {
         let currentAnalysis = analysis
         let points = plotted(currentAnalysis)
+        // Both of these read the store/Bluetooth manager, so they are resolved once per
+        // render alongside the analysis rather than from inside a computed property that
+        // several subviews would each re-evaluate.
+        let sensingNote = sensingDifferenceNote
+        let beatQuality = hrvBeatQuality()
 
         List {
             Section {
@@ -47,7 +52,7 @@ struct PairwiseAnalysisView: View {
 
             Section {
                 sourceOrder
-                evidenceCard(currentAnalysis)
+                evidenceCard(currentAnalysis, beatQuality: beatQuality)
             } header: {
                 Text("Evidence")
             } footer: {
@@ -99,6 +104,21 @@ struct PairwiseAnalysisView: View {
                 } icon: {
                     Image(systemName: statePresentation(currentAnalysis).systemImage)
                         .foregroundStyle(statePresentation(currentAnalysis).tint)
+                }
+
+                // Deliberately a separate, secondary row rather than part of the verdict
+                // text above: a sensing-technology difference explains where a gap can
+                // come from, and must never read as the conclusion itself.
+                if let sensingNote {
+                    Label {
+                        Text(sensingNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: "waveform.path.ecg")
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -178,7 +198,27 @@ struct PairwiseAnalysisView: View {
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Device A \(sourceAName), minus Device B \(sourceBName)")
+        .accessibilityLabel("Device A \(sourceAName)\(accessibleSensing(sourceA)), minus Device B \(sourceBName)\(accessibleSensing(sourceB))")
+    }
+
+    /// Spoken form of a device's sensing technology, empty when the device never reported
+    /// Body Sensor Location. Kept separate from the visible rows so VoiceOver users get the
+    /// same interpretive context sighted users read in the identity rows.
+    private func accessibleSensing(_ source: DataSource?) -> String {
+        guard let location = source?.bodyLocation else { return "" }
+        guard location != .other else { return ", sensor location reported as other" }
+        return ", \(location.sensingTechnology) at the \(location.title.lowercased())"
+    }
+
+    /// Visible description of where a sensor sits and what it senses.
+    ///
+    /// `.other` is shown as a location only. The model treats every non-chest location as
+    /// optical, which is a sound default for a finger, wrist or ear sensor but is not
+    /// evidence about a device that declined to say where it sits, and this screen must
+    /// not turn that default into a stated technology.
+    private func sensingDescription(_ location: BodySensorLocation) -> String {
+        guard location != .other else { return location.title }
+        return "\(location.title) · \(location.sensingTechnology)"
     }
 
     private func sourceIdentity(
@@ -200,12 +240,22 @@ struct PairwiseAnalysisView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+                // Only Bluetooth devices that report Body Sensor Location (0x2A38) have
+                // this; the row is simply absent for everything else rather than guessing.
+                if let location = source?.bodyLocation {
+                    Text(sensingDescription(location))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 0)
         }
     }
 
-    private func evidenceCard(_ analysis: PairwiseAnalysis) -> some View {
+    private func evidenceCard(
+        _ analysis: PairwiseAnalysis,
+        beatQuality: [HRVBeatQuality]
+    ) -> some View {
         let presentation = statePresentation(analysis)
 
         return VStack(alignment: .leading, spacing: 12) {
@@ -242,6 +292,20 @@ struct PairwiseAnalysisView: View {
                 LabeledContent("95% limits") {
                     Text("\(signed(stats.limitsOfAgreement.lowerBound)) to \(signed(stats.limitsOfAgreement.upperBound)) \(kind.unit)")
                 }
+            }
+
+            if !beatQuality.isEmpty {
+                Divider()
+                ForEach(beatQuality) { entry in
+                    LabeledContent("Beat quality · \(entry.label)") {
+                        Text("\(percentText(entry.quality.artefactFraction)) rejected  ·  \(entry.quality.beatCount) beats  ·  ")
+                            + Text(entry.quality.measuredAt, format: .relative(presentation: .named))
+                    }
+                }
+                Text(beatQualityCaveat(beatQuality))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .font(.caption)
@@ -601,6 +665,116 @@ struct PairwiseAnalysisView: View {
         return " Showing \(points.count) of \(analysis.observations.count) paired windows for legibility, including the widest differences; every window is used for the statistics and the export."
     }
 
+    // MARK: - Sensing technology
+
+    /// One sentence explaining that the two devices sense different physical signals,
+    /// or `nil` when that cannot be said honestly.
+    ///
+    /// Returns a note only when *both* devices reported Body Sensor Location (0x2A38) and
+    /// one is optical while the other is electrical. A missing location is not assumed to
+    /// mean anything, and two devices using the same technology get no note: the point is
+    /// to name a known difference in what is being sensed, not to speculate.
+    ///
+    /// Framing invariant: this text explains where a difference can originate. It must
+    /// never claim the devices therefore agree, never excuse or discount a measured
+    /// disagreement, and never present either technology as the reference standard — an
+    /// electrical sensor is not "the correct one" here. It is deliberately rendered as a
+    /// secondary row beneath the verdict, and the verdict text itself is untouched.
+    private var sensingDifferenceNote: String? {
+        guard let locationA = sourceA?.bodyLocation, let locationB = sourceB?.bodyLocation else { return nil }
+        // `.other` says where the sensor is not, so its optical/electrical classification
+        // is a default rather than a report. Nothing is claimed from it.
+        guard locationA != .other, locationB != .other else { return nil }
+        guard locationA.isOptical != locationB.isOptical else { return nil }
+
+        var sentences = [
+            "These devices do not sense the same physical signal. \(sourceAName): \(locationA.sensingTechnology) at the \(locationA.title.lowercased()). \(sourceBName): \(locationB.sensingTechnology) at the \(locationB.title.lowercased()).",
+        ]
+
+        if isVariabilityMetric {
+            sentences.append("An optical sensor times a pulse wave arriving at the skin, while an electrical sensor times the heartbeat's R wave directly, so beat-to-beat timing — and therefore \(kind.title) — is expected to differ between the two.")
+        } else {
+            sentences.append("Optical and electrical sensors derive a beat differently, so part of any difference above can come from the technologies rather than from either device malfunctioning.")
+        }
+
+        sentences.append("This explains where a difference can come from. It does not resolve one, does not make either value correct, and neither technology is treated as a reference standard.")
+
+        return sentences.joined(separator: " ")
+    }
+
+    /// Whether this screen compares a beat-to-beat variability metric. Exhaustive so a new
+    /// `MetricKind` has to decide whether the HRV beat-quality caveat applies to it.
+    private var isVariabilityMetric: Bool {
+        switch kind {
+        case .hrvSDNN, .hrvRMSSD:
+            true
+        case .heartRate, .restingHeartRate, .spo2, .respiratoryRate, .bodyTemperature,
+             .vo2Max, .bloodPressureSystolic, .bloodPressureDiastolic:
+            false
+        }
+    }
+
+    // MARK: - Beat quality
+
+    /// The most recent HRV window quality HeartSync derived for one side of the pair.
+    ///
+    /// Only exists for Bluetooth sources, because it comes from this app's own R–R
+    /// artefact rejection (`HRVCalculator`); HealthKit and Oura deliver finished HRV
+    /// numbers with no beat-level provenance to report.
+    private struct HRVBeatQuality: Identifiable {
+        var id: String { sourceID }
+        /// "A" or "B", matching the canonical ordering used everywhere else on this screen.
+        var label: String
+        var sourceID: String
+        var sourceName: String
+        var quality: HRVQuality
+    }
+
+    /// Artefact fraction at or above which the caveat is escalated from descriptive to a
+    /// warning. `HRVMetrics.maximumArtefactFraction` (0.25) already discards a window
+    /// outright, so anything reaching this screen is below that; 10% is the point where
+    /// enough beats were discarded that the surviving HRV figure deserves a hedge.
+    private static let notableArtefactFraction = 0.10
+
+    /// Latest beat quality for each side of the pair, in canonical A-then-B order. Empty
+    /// for non-variability metrics and for pairs with no Bluetooth-derived HRV.
+    private func hrvBeatQuality() -> [HRVBeatQuality] {
+        guard isVariabilityMetric else { return [] }
+
+        return [(label: "A", id: sourceAID, name: sourceAName), (label: "B", id: sourceBID, name: sourceBName)]
+            .compactMap { entry in
+                guard model.store.source(id: entry.id)?.transport == .bluetooth else { return nil }
+                // Bluetooth source IDs are the peripheral's `CBPeripheral.identifier`
+                // string, which is exactly how `BluetoothManager` keys its HRV quality.
+                guard let peripheralID = UUID(uuidString: entry.id),
+                      let quality = model.bluetooth.hrvQuality[peripheralID] else { return nil }
+                return HRVBeatQuality(
+                    label: entry.label,
+                    sourceID: entry.id,
+                    sourceName: entry.name,
+                    quality: quality
+                )
+            }
+    }
+
+    /// States exactly what the artefact fraction covers, and hedges the comparison when a
+    /// large share of beats was discarded.
+    ///
+    /// Two honesty constraints: the figure describes the *latest* HRV window from that
+    /// device, not every window in the selected range, so it is never presented as a
+    /// property of the analysis; and a weak window weakens this comparison rather than
+    /// transferring the difference onto the other device.
+    private func beatQualityCaveat(_ entries: [HRVBeatQuality]) -> String {
+        let base = "Beat quality is the most recent HRV window HeartSync derived for that device, not every window in this range. Rejected beats are R–R intervals the artefact filter discarded before HRV was computed."
+
+        guard let worst = entries.max(by: { $0.quality.artefactFraction < $1.quality.artefactFraction }),
+              worst.quality.artefactFraction >= Self.notableArtefactFraction else {
+            return base
+        }
+
+        return base + " \(worst.sourceName) discarded \(percentText(worst.quality.artefactFraction)) of its intervals in that window, so its HRV there is weak evidence. That weakens this comparison; it does not attribute the difference to the other device."
+    }
+
     // MARK: - Interpretation
 
     private struct StatePresentation {
@@ -711,6 +885,11 @@ struct PairwiseAnalysisView: View {
         let magnitude = kind.format(abs(value))
         let valueText = value >= 0 ? "+\(magnitude)" : "−\(magnitude)"
         return withUnit ? "\(valueText) \(kind.unit)" : valueText
+    }
+
+    /// Formats a 0...1 fraction as a whole-number percentage.
+    private func percentText(_ fraction: Double) -> String {
+        fraction.formatted(.percent.precision(.fractionLength(0)))
     }
 
     private func windowDescription(_ seconds: TimeInterval) -> String {

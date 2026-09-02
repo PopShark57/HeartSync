@@ -124,28 +124,33 @@ final class OuraOAuthSession: NSObject, ASWebAuthenticationPresentationContextPr
         case invalidExpiration
         case system(String)
 
+        /// User-facing failure text. "Client ID", "redirect URI", and "OAuth" are terms
+        /// the user reads verbatim in Oura's own developer console, so a translation
+        /// should keep whatever wording that console uses in the same language.
         var errorDescription: String? {
             switch self {
             case .missingClientID:
-                "Enter the Client ID from your Oura OAuth application."
+                String(localized: "ouraOAuth.failure.missingClientID", defaultValue: "Enter the Client ID from your Oura OAuth application.", comment: "Oura sign-in error: no client ID configured")
             case .couldNotStart:
-                "Could not open Oura sign-in. Please try again."
+                String(localized: "ouraOAuth.failure.couldNotStart", defaultValue: "Could not open Oura sign-in. Please try again.", comment: "Oura sign-in error: the web authentication session would not start")
             case .cancelled:
-                "Oura sign-in was cancelled."
+                String(localized: "ouraOAuth.failure.cancelled", defaultValue: "Oura sign-in was cancelled.", comment: "Oura sign-in error: the user dismissed the sheet")
             case .invalidCallback:
-                "Oura returned to an unexpected callback address. Check the redirect URI in your Oura application."
+                String(localized: "ouraOAuth.failure.invalidCallback", defaultValue: "Oura returned to an unexpected callback address. Check the redirect URI in your Oura application.", comment: "Oura sign-in error: the callback URL did not match the expected scheme, host, or path")
             case .stateMismatch:
-                "Oura sign-in could not be verified. Please start it again."
+                String(localized: "ouraOAuth.failure.stateMismatch", defaultValue: "Oura sign-in could not be verified. Please start it again.", comment: "Oura sign-in error: the OAuth state value did not match the one sent")
             case .denied(let reason):
-                reason.map { "Oura authorization was denied: \($0)" } ?? "Oura authorization was denied."
+                reason.map {
+                    String(localized: "ouraOAuth.failure.denied.reason", defaultValue: "Oura authorization was denied: \($0)", comment: "Oura sign-in error: denied, with the reason Oura reported")
+                } ?? String(localized: "ouraOAuth.failure.denied", defaultValue: "Oura authorization was denied.", comment: "Oura sign-in error: denied with no reason given")
             case .missingAccessToken:
-                "Oura did not return an access token. Please try again."
+                String(localized: "ouraOAuth.failure.missingAccessToken", defaultValue: "Oura did not return an access token. Please try again.", comment: "Oura sign-in error: the callback carried no access token")
             case .invalidTokenType:
-                "Oura returned an unsupported token type. Please try again."
+                String(localized: "ouraOAuth.failure.invalidTokenType", defaultValue: "Oura returned an unsupported token type. Please try again.", comment: "Oura sign-in error: the token type was not the expected bearer token")
             case .invalidExpiration:
-                "Oura returned an invalid token expiration. Please try again."
+                String(localized: "ouraOAuth.failure.invalidExpiration", defaultValue: "Oura returned an invalid token expiration. Please try again.", comment: "Oura sign-in error: the expires_in value could not be used")
             case .system(let message):
-                "Could not complete Oura sign-in: \(message)"
+                String(localized: "ouraOAuth.failure.system", defaultValue: "Could not complete Oura sign-in: \(message)", comment: "Oura sign-in error: an underlying system error. The placeholder is the system message.")
             }
         }
     }
@@ -218,11 +223,23 @@ final class OuraOAuthSession: NSObject, ASWebAuthenticationPresentationContextPr
         webSession = nil
     }
 
+    /// `authorize` captures a real window from a foreground scene before starting the
+    /// session, so the common path returns exactly the window the user tapped in and cannot
+    /// drift to a different iPad window between the tap and presentation.
+    ///
+    /// It is not, however, the only path. `ASWebAuthenticationSession` may ask for an anchor
+    /// again — after a scene change, or once the completion handler has already cleared the
+    /// captured window — and force-unwrapping put a crash in the middle of the OAuth flow
+    /// for that. The fallbacks re-find an active window and, failing even that, hand back an
+    /// empty window rather than trapping: a sign-in sheet that fails to present is a bad
+    /// outcome, and terminating the app over it is a worse one.
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        // `authorize` captures a real window from a foreground scene before starting the
-        // session, so this cannot drift to a different iPad window between the tap and
-        // presentation.
-        presentationWindow!
+        if let presentationWindow { return presentationWindow }
+        if let active = Self.activePresentationWindow() {
+            presentationWindow = active
+            return active
+        }
+        return Self.lastResortWindow()
     }
 
     // MARK: - Pure OAuth helpers (also exercised by unit tests)
@@ -337,5 +354,15 @@ final class OuraOAuthSession: NSObject, ASWebAuthenticationPresentationContextPr
             .filter { $0.activationState == .foregroundActive }
         let windows = scenes.flatMap(\.windows)
         return windows.first(where: \.isKeyWindow) ?? windows.first
+    }
+
+    /// Only reached when no scene is foreground-active, which is not a state a user-initiated
+    /// sign-in can normally be in. Any existing window is preferable to a fresh one; the
+    /// empty window is the floor that keeps `presentationAnchor` total.
+    private static func lastResortWindow() -> UIWindow {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        if let existing = scenes.flatMap(\.windows).first { return existing }
+        if let scene = scenes.first { return UIWindow(windowScene: scene) }
+        return UIWindow()
     }
 }

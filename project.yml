@@ -5,6 +5,13 @@ options:
     iOS: "18.0"
   createIntermediateGroups: true
   groupSortPosition: top
+  # Base language of Resources/Localizable.xcstrings ("sourceLanguage": "en"). Pinned rather
+  # than left to XcodeGen's default so the project's developmentRegion, the catalog's source
+  # language, and the CFBundleDevelopmentRegion that XcodeGen writes into Resources/Info.plist
+  # as $(DEVELOPMENT_LANGUAGE) can never drift apart. knownRegions is not a spec key in
+  # XcodeGen 2.46; it is derived (Base + this language + any .lproj found), which is why the
+  # matching DEVELOPMENT_LANGUAGE build setting is declared below.
+  developmentLanguage: en
 
 settings:
   base:
@@ -14,6 +21,22 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     GENERATE_INFOPLIST_FILE: NO
+    # -- Localization ---------------------------------------------------------------------
+    # The app calls String(localized:) in ~80 places and uses SwiftUI Text literals
+    # throughout, but without these the compiler emits no .stringsdata, nothing reaches
+    # Resources/Localizable.xcstrings, and `xcodebuild -exportLocalizations` hands a
+    # translator an empty catalog. That matters more here than in most apps: a large share of
+    # those strings are medical caveats (the blood-pressure disclaimer, the "neither device is
+    # a reference standard" language, the insufficient-evidence wording), and shipping to a
+    # non-English reader without them means shipping health claims with the caveats stripped.
+    #
+    # These affect extraction only. They do not change any string's runtime value: every
+    # String(localized:) carries an English defaultValue, so an untranslated build renders
+    # exactly what it renders today.
+    DEVELOPMENT_LANGUAGE: en
+    SWIFT_EMIT_LOC_STRINGS: YES
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+    LOCALIZATION_EXPORT_SUPPORTED: YES
 
 targets:
   HeartSyncChecker:
@@ -56,6 +79,21 @@ targets:
       properties:
         com.apple.developer.healthkit: true
         com.apple.developer.healthkit.access: []
+        # HealthKitManager.startObserving calls enableBackgroundDelivery(for:frequency:.hourly),
+        # which the system only honours when the app is entitled for it. Declaring it here keeps
+        # the code's intent and the app's provisioning in agreement.
+        #
+        # This is a capability, not just a plist key: the App ID com.heartsync.HeartSyncChecker
+        # must have HealthKit *and* its background-delivery capability enabled in the developer
+        # portal (team 7RLDYXQTNX), otherwise provisioning-profile generation fails with
+        # "doesn't support the HealthKit Background Delivery capability" at signing time.
+        #
+        # Verify only with a SIGNED build on a physical iPhone: confirm the embedded
+        # HeartSync.app/embedded.mobileprovision carries the entitlement, then background the app
+        # and check that new Health samples arrive without a foreground refresh. A simulator build
+        # proves nothing here -- it is unsigned, entitlements are not enforced, and no real
+        # background wake occurs.
+        com.apple.developer.healthkit.background-delivery: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.heartsync.HeartSyncChecker

@@ -16,6 +16,25 @@ struct PairwiseExport: Hashable, Sendable {
 }
 
 /// Creates the two contextual artifacts for one metric and one ordered device pair.
+///
+/// Every string this type emits is **locale-independent by contract**. An export is a file
+/// the user hands to someone else — a clinician, a vendor, another user comparing their own
+/// devices — so the same analysis must produce identical bytes on an English phone and on a
+/// Japanese one, and a CSV consumer must not have to know the exporting device's language to
+/// parse the `unit` or `severity` column. Concretely that means:
+///
+/// - metric names and units come from `MetricKind.exportTitle` / `exportUnit`, never `title`
+///   or `unit`;
+/// - transport names come from `SourceTransport.exportTitle`, never `title`;
+/// - severity comes from `DiscrepancySeverity.exportTitle`, never `title`;
+/// - the literals in this file (headings, "Unknown", the methodology and limitations
+///   paragraphs, and every "Conclusion withheld" sentence) stay untranslated for the same
+///   reason. `PairwiseExportTests` asserts on them directly, including the safety-critical
+///   check that a withheld conclusion never prints "Severity: In agreement".
+///
+/// Localizing the export is a separate, deliberate feature: it would need a target language
+/// chosen at export time rather than inherited from the device, plus a machine-readable
+/// language marker in the file so a reader knows what they are parsing.
 enum PairwiseExporter {
 
     /// Stable, machine-readable CSV columns. Values for A and B always follow the
@@ -110,7 +129,7 @@ enum PairwiseExporter {
                 formatting.iso8601UTC(observation.start),
                 formatting.iso8601UTC(observation.end),
                 analysis.kind.rawValue,
-                analysis.kind.unit,
+                analysis.kind.exportUnit,
                 sourceA.id,
                 sourceA.name,
                 sourceA.transportRawValue,
@@ -168,7 +187,7 @@ enum PairwiseExporter {
             "",
             "App version: \(singleLine(appVersion))",
             "Generated at (UTC): \(formatting.iso8601UTC(generatedAt))",
-            "Metric: \(analysis.kind.title) (\(analysis.kind.unit))",
+            "Metric: \(analysis.kind.exportTitle) (\(analysis.kind.exportUnit))",
             "Selected range (UTC): \(formatting.iso8601UTC(analysis.range.start)) to \(formatting.iso8601UTC(analysis.range.end))",
             "Comparison window: \(durationDescription(analysis.windowSize))",
             "",
@@ -209,11 +228,11 @@ enum PairwiseExporter {
                 "Evidence state: Ready",
                 "",
                 "Descriptive results",
-                "Mean bias (A - B): \(decimal(statistics.meanBias)) \(analysis.kind.unit)",
-                "Mean absolute difference: \(decimal(statistics.meanAbsoluteDifference)) \(analysis.kind.unit)",
-                "Sample standard deviation of differences: \(decimal(statistics.differenceSD)) \(analysis.kind.unit)",
-                "95% limits of agreement: \(decimal(statistics.limitsOfAgreement.lowerBound)) to \(decimal(statistics.limitsOfAgreement.upperBound)) \(analysis.kind.unit)",
-                "Severity: \(statistics.severity.title)",
+                "Mean bias (A - B): \(decimal(statistics.meanBias)) \(analysis.kind.exportUnit)",
+                "Mean absolute difference: \(decimal(statistics.meanAbsoluteDifference)) \(analysis.kind.exportUnit)",
+                "Sample standard deviation of differences: \(decimal(statistics.differenceSD)) \(analysis.kind.exportUnit)",
+                "95% limits of agreement: \(decimal(statistics.limitsOfAgreement.lowerBound)) to \(decimal(statistics.limitsOfAgreement.upperBound)) \(analysis.kind.exportUnit)",
+                "Severity: \(statistics.severity.exportTitle)",
                 "Pattern classification: \(classificationTitle(statistics.classification))",
                 "Interpretation: \(interpretation(for: statistics, kind: analysis.kind))",
             ]
@@ -222,8 +241,8 @@ enum PairwiseExporter {
         lines += [
             "",
             "Fixed comparison tolerances",
-            "Notable gap: absolute difference at or above \(decimal(analysis.kind.agreement.warn)) \(analysis.kind.unit)",
-            "Major gap: absolute difference at or above \(decimal(analysis.kind.agreement.alert)) \(analysis.kind.unit)",
+            "Notable gap: absolute difference at or above \(decimal(analysis.kind.agreement.warn)) \(analysis.kind.exportUnit)",
+            "Major gap: absolute difference at or above \(decimal(analysis.kind.agreement.alert)) \(analysis.kind.exportUnit)",
             "",
             "Methodology",
             "Readings are placed into Unix-epoch-aligned windows. Each source is represented by the median of its non-estimated, plausible samples in a window. Only windows containing both ordered sources are paired. The signed difference is A minus B. Ready analyses use the sample standard deviation (n - 1); 95% limits of agreement are mean bias plus or minus 1.96 times that standard deviation.",
@@ -235,6 +254,11 @@ enum PairwiseExporter {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    /// The sentence pair that reads the statistics back in words.
+    ///
+    /// `exportTitle.lowercased()` rather than `title.lowercased()`: `lowercased()` itself is
+    /// locale-insensitive in Swift, so the only thing that could vary here is the metric name
+    /// underneath it, and this sentence has to match the "Metric:" header above it.
     private static func interpretation(
         for statistics: PairwiseSummaryStatistics,
         kind: MetricKind
@@ -242,7 +266,7 @@ enum PairwiseExporter {
         let pattern: String
         switch statistics.classification {
         case .noApparentDifference:
-            pattern = "The paired values show no apparent difference at HeartSync's fixed \(kind.title.lowercased()) tolerance."
+            pattern = "The paired values show no apparent difference at HeartSync's fixed \(kind.exportTitle.lowercased()) tolerance."
         case .systematicBias:
             pattern = "The differences are predominantly in one direction, which is descriptive of a consistent offset between the sources."
         case .measurementNoise:
@@ -275,7 +299,7 @@ enum PairwiseExporter {
             id: source.id,
             name: source.displayName,
             transportRawValue: source.transport.rawValue,
-            transportTitle: source.transport.title,
+            transportTitle: source.transport.exportTitle,
             model: source.model ?? ""
         )
     }
@@ -352,6 +376,9 @@ private struct SourceDescriptor {
     let id: String
     let name: String
     let transportRawValue: String
+    /// `SourceTransport.exportTitle`, or the literal "Unknown" when the source has been
+    /// removed since the analysis was made. Both halves are locale-independent, matching the
+    /// rest of the summary; `PairwiseExportTests` pins the fallback as "Transport: Unknown".
     let transportTitle: String
     let model: String
 

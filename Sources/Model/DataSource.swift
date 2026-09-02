@@ -12,7 +12,33 @@ enum SourceTransport: String, Codable, Sendable, CaseIterable {
     case oura
     case manual
 
+    /// Human-readable transport name **for the screen**.
+    ///
+    /// Localized. Three of the four are product names that stay as they are in every
+    /// language; they are still routed through the catalog so a translator can see them in
+    /// context and adapt the one that is ordinary prose. The English `defaultValue`s are
+    /// byte-identical to `exportTitle`.
     var title: String {
+        switch self {
+        case .bluetooth:
+            String(localized: "transport.bluetooth", defaultValue: "Bluetooth", comment: "Transport name: a direct Bluetooth Low Energy sensor. Bluetooth is a trademark and is not translated.")
+        case .healthKit:
+            String(localized: "transport.healthKit", defaultValue: "Apple Health", comment: "Transport name: data Apple Health already collected, including anything an Apple Watch synced. Use Apple's own localized name for the Health app.")
+        case .oura:
+            String(localized: "transport.oura", defaultValue: "Oura Cloud", comment: "Transport name: data pulled from the Oura web API. Oura is a brand name and is not translated.")
+        case .manual:
+            String(localized: "transport.manual", defaultValue: "Manual Entry", comment: "Transport name: a value the user typed in themselves rather than a device reporting it")
+        }
+    }
+
+    /// Human-readable transport name **for exports**, in English regardless of the device
+    /// language.
+    ///
+    /// `PairwiseExporter` writes it into the plain-text summary ("Transport: Bluetooth"),
+    /// which is a stable exported artefact rather than screen copy: two users comparing
+    /// their summaries must not find the same device described by two different words.
+    /// The CSV uses `rawValue` and is unaffected either way.
+    var exportTitle: String {
         switch self {
         case .bluetooth: "Bluetooth"
         case .healthKit: "Apple Health"
@@ -48,7 +74,9 @@ enum SourceTransport: String, Codable, Sendable, CaseIterable {
 ///
 /// `id` is stable across launches so historical readings keep pointing at the right device:
 /// for Bluetooth it is the `CBPeripheral.identifier`, for HealthKit the bundle id of the
-/// writing source plus its device model, for Oura a constant.
+/// writing source (the device model is metadata, not identity), and for Oura a constant.
+/// The HealthKit formula is migration-sensitive: adding the model now would split existing
+/// sources and orphan their historical relationship.
 struct DataSource: Identifiable, Codable, Hashable, Sendable {
     var id: String
     var displayName: String
@@ -66,6 +94,14 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
     var observedMetrics: Set<MetricKind>
     /// Last known battery level, 0...100, when the device exposes the Battery Service.
     var batteryPercent: Int?
+    /// Where on the body the sensor sits, when it reports Body Sensor Location (0x2A38).
+    ///
+    /// This is the field that explains *why* two devices disagree rather than just that
+    /// they do: a finger or wrist sensor is optical (PPG) and a chest sensor is electrical
+    /// (ECG), and those two technologies disagreeing on HRV is expected behaviour rather
+    /// than a fault. Optional both because most transports never report it and because
+    /// `sources.json` archives written before this field existed must still decode.
+    var bodyLocation: BodySensorLocation?
 
     init(
         id: String,
@@ -77,7 +113,8 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
         addedAt: Date = .now,
         lastSeenAt: Date? = nil,
         observedMetrics: Set<MetricKind> = [],
-        batteryPercent: Int? = nil
+        batteryPercent: Int? = nil,
+        bodyLocation: BodySensorLocation? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -89,6 +126,7 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
         self.lastSeenAt = lastSeenAt
         self.observedMetrics = observedMetrics
         self.batteryPercent = batteryPercent
+        self.bodyLocation = bodyLocation
     }
 
     var color: Color { Self.palette[colorIndex % Self.palette.count] }
@@ -116,11 +154,20 @@ enum Provenance: String, Codable, Sendable {
     /// A modelled guess, not a measurement. Never medical.
     case estimated
 
+    /// How the value was obtained, for the badge shown next to a reading.
+    ///
+    /// Safe to localize: the export writes `rawValue`, never this, so translating it cannot
+    /// move a `provenance` CSV field. The distinction it names is load-bearing — an
+    /// estimate must never read as a measurement — so the wording must stay exact in
+    /// every language.
     var title: String {
         switch self {
-        case .measured:  "Measured"
-        case .derived:   "Derived"
-        case .estimated: "Estimated"
+        case .measured:
+            String(localized: "provenance.measured", defaultValue: "Measured", comment: "Badge: the sensor reported this value directly")
+        case .derived:
+            String(localized: "provenance.derived", defaultValue: "Derived", comment: "Badge: HeartSync computed this value from raw sensor data, such as RMSSD from R-R intervals")
+        case .estimated:
+            String(localized: "provenance.estimated", defaultValue: "Estimated", comment: "Badge: a modelled guess, never a measurement and never medical")
         }
     }
 

@@ -33,21 +33,92 @@ struct HRVMetrics: Equatable, Sendable {
     }
 }
 
+/// The part of an HRV window that is *about the measurement* rather than about the heart.
+///
+/// `HRVMetrics` computes these and the store only ever receives RMSSD and SDNN, so without
+/// this type the caveats are thrown away. They matter because they answer a question no
+/// cross-device comparison can: `impliedHeartRate` is the rate the device's own R\u{2013}R
+/// intervals imply, so comparing it against the heart rate that same device reports
+/// directly detects a device that disagrees with *itself* \u{2014} a stronger signal than two
+/// devices disagreeing with each other. `artefactFraction` is the honesty caveat that
+/// belongs beside any HRV comparison: "this window rejected 22% of beats" changes how the
+/// number should be read.
+///
+/// This is measurement quality, not a measurement. It is deliberately not a `Reading` and
+/// never reaches `HealthStore`, HealthKit, or an export: it describes one live window from
+/// one device and is replaced on every emission.
+struct HRVQuality: Equatable, Sendable {
+    /// Intervals that survived artefact rejection in the emitting window.
+    var beatCount: Int
+    /// Fraction of R\u{2013}R intervals rejected, 0...1.
+    var artefactFraction: Double
+    /// Heart rate in bpm implied by the R\u{2013}R intervals themselves.
+    var impliedHeartRate: Double
+    /// Percentage of successive intervals differing by more than 50 ms.
+    var pnn50: Double
+    /// When the window that produced this was emitted.
+    var measuredAt: Date
+}
+
+extension HRVQuality {
+    /// Lifts the quality fields out of a computed window. Declared in an extension so the
+    /// memberwise initializer stays available to callers that build one directly.
+    init(metrics: HRVMetrics, measuredAt: Date) {
+        self.init(
+            beatCount: metrics.beatCount,
+            artefactFraction: metrics.artefactFraction,
+            impliedHeartRate: metrics.meanHeartRate,
+            pnn50: metrics.pnn50,
+            measuredAt: measuredAt
+        )
+    }
+}
+
 enum HRVCalculator {
 
     /// Physiologically possible R\u{2013}R range: 300 ms is 200 bpm, 2000 ms is 30 bpm.
     /// Anything outside is a dropped or doubled beat, not a heartbeat.
     static let plausibleIntervalMS: ClosedRange<Double> = 300...2000
 
-    /// Maximum beat-to-beat change accepted as physiological. A genuine sinus rhythm does
-    /// not jump more than ~20% from one beat to the next; larger jumps are ectopic beats
-    /// or missed detections, and leaving them in inflates RMSSD dramatically.
-    static let maximumSuccessiveChange = 0.20
+    /// Maximum deviation from the running reference rate accepted as physiological, as a
+    /// fraction of the reference. This is *not* a successive-difference test: an interval
+    /// is compared against the prevailing rhythm, not against its immediate predecessor,
+    /// so a single ectopic beat is rejected on its own rather than also condemning the
+    /// normal beat that follows it. Leaving ectopics in inflates RMSSD dramatically.
+    static let maximumDeviationFromReference = 0.20
+
+    /// How many of the most recent accepted intervals form the reference rate. A median
+    /// over a short window follows genuine drift while ignoring a single outlier that
+    /// slipped through, which an exponential average cannot do.
+    static let referenceWindow = 5
+
+    /// Consecutive rejections that count as "the rhythm moved" rather than "these beats
+    /// are artefacts". Three is deliberately small: a run this long of mutually consistent
+    /// intervals is a rate change, and holding the old reference against it would reject
+    /// every beat from then on.
+    static let rejectionRunLimit = 3
 
     /// Removes non-physiological intervals.
     ///
-    /// Two passes: an absolute range filter, then a relative filter against a running
-    /// median so a stretch of genuinely fast or slow beats is not thrown away wholesale.
+    /// Two passes. First an absolute range filter. Then a relative filter that compares
+    /// each surviving interval against a *reference rate* \u{2014} the median of the last
+    /// `referenceWindow` accepted intervals, seeded from the median of the whole batch so
+    /// a corrupted first beat cannot poison the sequence. Intervals within
+    /// `maximumDeviationFromReference` of that reference are kept.
+    ///
+    /// Because the reference only advances on accepted beats, a sustained rate change
+    /// (rest ~1000 ms to exercise ~600 ms is a 40% step) would otherwise reject every
+    /// interval forever and stall HRV emission until the old beats aged out of the
+    /// accumulator's window. So a run of `rejectionRunLimit` consecutive rejections that
+    /// are *mutually consistent* \u{2014} all within `maximumDeviationFromReference` of their own
+    /// median \u{2014} is treated as a genuine rhythm change: the reference is re-seeded from
+    /// that run and the run's intervals are accepted retroactively rather than being
+    /// counted as artefacts. Scattered rejections are never consistent with each other, so
+    /// real noise still fails the check, keeps being rejected, and drives
+    /// `artefactFraction` past `HRVMetrics.maximumArtefactFraction` where it belongs.
+    ///
+    /// The returned `rejected` count is relative to the *supplied* intervals, so it
+    /// includes both out-of-range values and beats the relative filter dropped.
     static func filterArtefacts(_ intervals: [Double]) -> (clean: [Double], rejected: Int) {
         let inRange = intervals.filter { plausibleIntervalMS.contains($0) }
         guard inRange.count >= 2 else {
@@ -58,15 +129,38 @@ enum HRVCalculator {
         clean.reserveCapacity(inRange.count)
         // Seed the reference with the median so a corrupted first beat cannot poison the
         // whole sequence.
+        var recentAccepted: [Double] = []
         var reference = median(inRange)
+        var rejectedRun: [Double] = []
 
         for interval in inRange {
             let deviation = abs(interval - reference) / reference
-            if deviation <= maximumSuccessiveChange {
+            if deviation <= maximumDeviationFromReference {
                 clean.append(interval)
-                // Track slowly so the reference follows real drift but not single spikes.
-                reference = reference * 0.8 + interval * 0.2
+                recentAccepted.append(interval)
+                if recentAccepted.count > referenceWindow { recentAccepted.removeFirst() }
+                reference = median(recentAccepted)
+                rejectedRun.removeAll(keepingCapacity: true)
+                continue
             }
+
+            rejectedRun.append(interval)
+            guard rejectedRun.count >= rejectionRunLimit else { continue }
+
+            // Only the trailing run is considered, so noise immediately followed by a real
+            // rate change still re-seeds on the change rather than being held back by the
+            // scattered intervals in front of it.
+            let candidate = Array(rejectedRun.suffix(rejectionRunLimit))
+            let candidateReference = median(candidate)
+            let isConsistent = candidate.allSatisfy {
+                abs($0 - candidateReference) / candidateReference <= maximumDeviationFromReference
+            }
+            guard isConsistent else { continue }
+
+            clean.append(contentsOf: candidate)
+            recentAccepted = candidate
+            reference = candidateReference
+            rejectedRun.removeAll(keepingCapacity: true)
         }
 
         return (clean, intervals.count - clean.count)

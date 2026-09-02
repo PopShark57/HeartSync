@@ -94,11 +94,14 @@ struct DevicesView: View {
                 Label("Add Bluetooth device", systemImage: "plus.circle.fill")
             }
             .disabled(!model.bluetooth.isPoweredOn)
+            .accessibilityHint("Opens a scan for nearby heart-rate, pulse-oximeter, and thermometer sensors")
 
             if !model.bluetooth.isPoweredOn {
                 Text(model.bluetooth.stateDescription)
                     .font(.caption)
                     .foregroundStyle(.orange)
+                    // Orange is the only visual carrier of "this is a problem"; say it.
+                    .accessibilityLabel("Bluetooth unavailable. \(model.bluetooth.stateDescription)")
             }
         } header: {
             Text("Bluetooth sensors")
@@ -153,7 +156,10 @@ struct DevicesView: View {
                     Label("Connect Apple Health", systemImage: "heart.text.square.fill")
                 }
                 if case .denied = model.healthKit.availability, let error = model.healthKit.lastError {
-                    Text(error).font(.caption).foregroundStyle(.red)
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .accessibilityLabel("Health authorization problem. \(error)")
                 }
 
             case .authorized:
@@ -179,10 +185,12 @@ struct DevicesView: View {
                 } label: {
                     Label("Sync now", systemImage: "arrow.clockwise")
                 }
+                .accessibilityHint("Re-reads recent samples from Apple Health")
                 if let last = model.healthKit.lastSyncedAt {
                     Text("Last synced \(last, format: .relative(presentation: .named))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .accessibilityElement(children: .combine)
                 }
             }
         } header: {
@@ -207,26 +215,44 @@ struct DevicesView: View {
                     Label("Connected", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                 }
+                // The client-side OAuth flow issues no refresh token, so the credential
+                // expires outright. Warn here rather than letting the next sync fail first.
+                let expiry = OuraAuthorizationExpiry(expiresAt: model.oura.authorizationExpiresAt)
+                if let message = expiry.message {
+                    Button {
+                        showingOuraSetup = true
+                    } label: {
+                        Label(message, systemImage: expiry.systemImage)
+                            .font(.subheadline)
+                    }
+                    .foregroundStyle(expiry.tint)
+                    .accessibilityLabel(message)
+                    .accessibilityHint("Opens Oura sign-in so you can authorize HeartSync again")
+                }
+
                 Button {
                     Task { await model.oura.sync() }
                 } label: {
                     Label(model.oura.isSyncing ? "Syncing\u{2026}" : "Sync now", systemImage: "arrow.clockwise")
                 }
                 .disabled(model.oura.isSyncing)
+                .accessibilityHint("Fetches the most recent two weeks of Oura Cloud data")
 
                 if let last = model.oura.lastSyncedAt {
                     Text("Last synced \(last, format: .relative(presentation: .named))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .accessibilityElement(children: .combine)
                 }
 
                 if !model.oura.endpointIssues.isEmpty {
-                    Label(
-                        "\(model.oura.endpointIssues.count) Oura collection\(model.oura.endpointIssues.count == 1 ? " is" : "s are") unavailable. The Oura tab shows permissions and details.",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                    // Not "unavailable": an endpoint issue can also be a collection that
+                    // imported only a prefix. The Oura tab distinguishes the two.
+                    let issueText = "\(model.oura.endpointIssues.count) Oura collection\(model.oura.endpointIssues.count == 1 ? " needs" : "s need") attention: unavailable or incomplete. The Oura tab shows permissions and details."
+                    Label(issueText, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel("Warning. \(issueText)")
                 }
 
                 Button("Disconnect Oura", role: .destructive) {
@@ -236,14 +262,19 @@ struct DevicesView: View {
                         model.oura.disconnect()
                     }
                 }
+                .accessibilityHint("Removes the Oura authorization and its readings from this device")
             } else {
                 Button {
                     showingOuraSetup = true
                 } label: {
                     Label("Connect Oura account", systemImage: "circle.circle.fill")
                 }
+                .accessibilityHint("Opens the one-time Oura setup and sign-in")
                 if case .error(let message) = model.oura.status {
-                    Text(message).font(.caption).foregroundStyle(.red)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .accessibilityLabel("Oura error. \(message)")
                 }
             }
         } header: {
@@ -300,6 +331,12 @@ private struct SourceRow: View {
                 }
             }
 
+            if let placement = placementText {
+                Text(placement)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
             if let hrvProgress {
                 Text(hrvProgress)
                     .font(.caption2)
@@ -307,10 +344,48 @@ private struct SourceRow: View {
             }
         }
         .padding(.vertical, 3)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityDescription)
     }
 
     private var orderedMetrics: [MetricKind] {
         MetricKind.allCases.filter { source.observedMetrics.contains($0) }
+    }
+
+    /// Where the sensor sits and what technology that implies, when the device reported
+    /// Body Sensor Location (0x2A38).
+    ///
+    /// Shown because it is the field that explains *why* two devices disagree rather than
+    /// just that they do: an optical (PPG) ring and an electrical (ECG) chest strap are not
+    /// measuring the same signal, so an HRV gap between them is expected rather than a
+    /// fault. Nil for every source that does not report the characteristic — which is most
+    /// of them, including everything arriving via Apple Health or the Oura Cloud API — and
+    /// the row simply omits the line in that case rather than guessing a placement.
+    private var placementText: String? {
+        guard let location = source.bodyLocation else { return nil }
+        return "\(location.title) \u{00B7} \(location.sensingTechnology)"
+    }
+
+    /// One VoiceOver element for the whole row.
+    ///
+    /// Visually this row is a compound of colour dot, status dot, name, status text,
+    /// battery pill, sensor placement, metric chips, and HRV progress. Read as separate
+    /// children it becomes a stream of unrelated fragments ("RHR", "SpO2", "78%"), and both
+    /// dots carry meaning only as colour, which VoiceOver cannot convey at all. Children are
+    /// therefore ignored in favour of one composed sentence that restates the status in
+    /// words and spells out each metric chip with its full `MetricKind.title` rather than
+    /// the abbreviation the chip shows.
+    private var accessibilityDescription: String {
+        var parts: [String] = [source.displayName, statusText]
+        if let battery { parts.append("Battery \(battery) percent") }
+        if let location = source.bodyLocation {
+            parts.append("Worn on the \(location.title.lowercased()), \(location.sensingTechnology) sensor")
+        }
+        if !orderedMetrics.isEmpty {
+            parts.append("Reports \(orderedMetrics.map(\.title).joined(separator: ", "))")
+        }
+        if let hrvProgress { parts.append(hrvProgress) }
+        return parts.joined(separator: ". ")
     }
 }
 

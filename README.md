@@ -91,6 +91,14 @@ OAuth access token stored in the device-only keychain (never synced to iCloud). 
 client secret is embedded in the app. Writing readings back into Apple Health is off by
 default, and only ever writes directly measured values — never an estimate.
 
+Readings, sources, settings, and the token-free Oura cache use versioned, atomic JSON archives
+under Application Support. They are protected until the first device unlock after boot and
+remain eligible for encrypted device backup; a temporarily unreadable archive is never treated
+as empty or overwritten. To bound a long-retention whole-file archive, readings older than 14
+days are irreversibly reduced to one median per source, metric, and comparison window. This
+preserves the comparison value and verdict, but permanently discards individual samples, raw
+counts, within-window spread, and later corrections to those windows.
+
 ### Oura OAuth setup
 
 Personal access tokens were retired by Oura in December 2025. HeartSync uses Oura's
@@ -130,20 +138,22 @@ open HeartSyncChecker.xcodeproj
 ```
 
 Requires Xcode 16+ (developed against Xcode 27 / Swift 6.4, strict concurrency enabled).
-Set your development team in the target's Signing settings before running on hardware.
+The generated project currently pins development team `7RLDYXQTNX`; change it only as a
+deliberate deployment decision. A physical-device build also requires the App ID and
+provisioning profile to carry both HealthKit and HealthKit Background Delivery capabilities.
 
 **Bluetooth and HealthKit only work on a real device** — the simulator has no BLE radio and
 no Health data.
 
 ## Tests
 
-The test suite covers the parts where a silent error would corrupt every comparison downstream:
-GATT frame parsing against hand-built spec vectors (IEEE-11073 SFLOAT special values,
-R–R interval unit conversion, optional-field skip order), HRV artefact rejection, window
-alignment, overlap/evidence states, sample-variance limits of agreement, RFC 4180 export
-escaping, the rule that neither insufficient evidence nor the alert threshold can produce
-an agreement claim, chart thinning that keeps outliers, bias-versus-noise classification,
-estimator clamping, and Oura mapping.
+The hosted bundle contains 212 Swift Testing declarations covering GATT frame parsing,
+HealthStore ingestion/indexing/retention/compaction, archive and settings safety, HealthKit
+conversion/deletions/self-source filtering, HRV artefact rejection, comparison evidence and
+statistics, export semantics, estimator limits, OAuth, Oura mapping, and incremental Oura sync.
+Bluetooth, HealthKit callbacks, background delivery, and UI behavior still require representative
+hardware or an installed iOS simulator as appropriate; compiling the bundle is not evidence that
+those runtime paths passed.
 
 ```bash
 xcodebuild test -project HeartSyncChecker.xcodeproj -scheme HeartSyncChecker \

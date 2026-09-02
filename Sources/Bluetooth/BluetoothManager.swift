@@ -40,14 +40,30 @@ enum PeripheralConnectionState: Equatable, Sendable {
         }
     }
 
+    /// Connection status for the device row.
+    ///
+    /// `.failed` carries a reason produced elsewhere (CoreBluetooth error text or an
+    /// already-localized message), so it is passed through rather than looked up here.
+    /// The streaming case is split by count instead of interpolating a plural suffix,
+    /// because a suffix is not how most languages form a plural.
     var title: String {
         switch self {
-        case .disconnected:        "Not connected"
-        case .connecting:          "Connecting\u{2026}"
-        case .discoveringServices: "Reading services\u{2026}"
+        case .disconnected:
+            String(localized: "peripheral.state.disconnected", defaultValue: "Not connected", comment: "Bluetooth device status: no connection")
+        case .connecting:
+            String(localized: "peripheral.state.connecting", defaultValue: "Connecting\u{2026}", comment: "Bluetooth device status: connection in progress")
+        case .discoveringServices:
+            String(localized: "peripheral.state.discoveringServices", defaultValue: "Reading services\u{2026}", comment: "Bluetooth device status: discovering GATT services after connecting")
         case .streaming(let kinds):
-            kinds.isEmpty ? "Connected" : "Streaming \(kinds.count) metric\(kinds.count == 1 ? "" : "s")"
-        case .failed(let reason):  reason
+            if kinds.isEmpty {
+                String(localized: "peripheral.state.connected", defaultValue: "Connected", comment: "Bluetooth device status: connected but not yet receiving any metric")
+            } else if kinds.count == 1 {
+                String(localized: "peripheral.state.streaming.one", defaultValue: "Streaming 1 metric", comment: "Bluetooth device status: receiving exactly one metric")
+            } else {
+                String(localized: "peripheral.state.streaming.many", defaultValue: "Streaming \(kinds.count) metrics", comment: "Bluetooth device status: receiving several metrics. The number is always 2 or more.")
+            }
+        case .failed(let reason):
+            reason
         }
     }
 }
@@ -72,6 +88,12 @@ final class BluetoothManager: NSObject {
     /// Live per-device HRV buffer progress, so the UI can show "collecting beats" rather
     /// than an empty HRV tile for the first few minutes.
     private(set) var hrvProgress: [UUID: (beats: Int, seconds: TimeInterval)] = [:]
+    /// Quality of the most recently emitted HRV window per device.
+    ///
+    /// Keyed by `CBPeripheral.identifier`, which is the same UUID the source ID is built
+    /// from. Replaced on every emission and cleared on disconnect/forget, because this
+    /// describes one live window and a stale entry would caveat the wrong data.
+    private(set) var hrvQuality: [UUID: HRVQuality] = [:]
 
     /// When true the scan reports every peripheral, not just ones advertising a health
     /// service. Many inexpensive rings omit their service UUIDs from the advertisement
@@ -83,13 +105,20 @@ final class BluetoothManager: NSObject {
 
     var stateDescription: String {
         switch state {
-        case .poweredOn:   "Ready"
-        case .poweredOff:  "Bluetooth is off. Turn it on in Settings or Control Centre."
-        case .unauthorized:"HeartSync is not allowed to use Bluetooth. Enable it in Settings \u{203A} HeartSync."
-        case .unsupported: "This device does not support Bluetooth Low Energy."
-        case .resetting:   "Bluetooth is restarting\u{2026}"
-        case .unknown:     "Checking Bluetooth\u{2026}"
-        @unknown default:  "Unavailable"
+        case .poweredOn:
+            String(localized: "bluetooth.state.poweredOn", defaultValue: "Ready", comment: "Bluetooth radio status: available for scanning")
+        case .poweredOff:
+            String(localized: "bluetooth.state.poweredOff", defaultValue: "Bluetooth is off. Turn it on in Settings or Control Centre.", comment: "Bluetooth radio status: the user must switch the radio on")
+        case .unauthorized:
+            String(localized: "bluetooth.state.unauthorized", defaultValue: "HeartSync is not allowed to use Bluetooth. Enable it in Settings \u{203A} HeartSync.", comment: "Bluetooth radio status: permission denied. HeartSync is the app name and is not translated; the arrow separates Settings navigation steps.")
+        case .unsupported:
+            String(localized: "bluetooth.state.unsupported", defaultValue: "This device does not support Bluetooth Low Energy.", comment: "Bluetooth radio status: hardware cannot do BLE")
+        case .resetting:
+            String(localized: "bluetooth.state.resetting", defaultValue: "Bluetooth is restarting\u{2026}", comment: "Bluetooth radio status: the system stack is resetting")
+        case .unknown:
+            String(localized: "bluetooth.state.unknown", defaultValue: "Checking Bluetooth\u{2026}", comment: "Bluetooth radio status: not yet reported by the system")
+        @unknown default:
+            String(localized: "bluetooth.state.unavailable", defaultValue: "Unavailable", comment: "Bluetooth radio status: a future state this build does not recognise")
         }
     }
 
@@ -100,11 +129,56 @@ final class BluetoothManager: NSObject {
     /// released `CBPeripheral` silently stops delivering notifications.
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var hrvAccumulators: [UUID: HRVAccumulator] = [:]
-    private var pendingModelInfo: [UUID: (manufacturer: String?, model: String?)] = [:]
+    private var pendingModelInfo: [UUID: DeviceInformation] = [:]
     private var scanTimeoutTask: Task<Void, Never>?
+
+    /// Scan results as they arrive, before publication.
+    ///
+    /// The scan allows duplicates, so a busy room delivers advertisement packets far
+    /// faster than any list needs to change. Packets land here; `publishDiscovered()`
+    /// sorts and copies them into the observable `discovered` at `discoveryPublishInterval`
+    /// so SwiftUI is invalidated a few times a second instead of a few hundred.
+    private var discoveredByID: [UUID: DiscoveredPeripheral] = [:]
+    private var hasUnpublishedDiscoveries = false
+    private var discoveryPublishTask: Task<Void, Never>?
+
+    /// Publication cadence for scan results. 400 ms (2.5 Hz) is well inside the ~100 ms
+    /// at which a list stops looking responsive, and far below the packet rate.
+    private static let discoveryPublishInterval: Duration = .milliseconds(400)
+
+    /// Reconnection attempts since the last successful connection, per peripheral.
+    private var reconnectAttempts: [UUID: Int] = [:]
+    private var reconnectTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// Reconnection backoff. A ring that connects and drops repeatedly would otherwise
+    /// spin a tight connect loop forever; these bound it and give the user a state to
+    /// retry from instead of an invisible failure.
+    private static let firstReconnectDelay: TimeInterval = 1
+    private static let maximumReconnectDelay: TimeInterval = 60
+    private static let maximumReconnectAttempts = 6
 
     private weak var store: HealthStore?
     private var onReading: (@MainActor (Reading) -> Void)?
+
+    /// Device Information Service strings, accumulated as the individual characteristics
+    /// arrive. They are read separately and in no guaranteed order, so the display string
+    /// is rebuilt from whatever is known each time one lands.
+    private struct DeviceInformation {
+        var manufacturer: String?
+        var model: String?
+        var firmware: String?
+
+        /// "Polar H10 (firmware 3.1.1)" \u{2014} the identity first, the revision parenthesised
+        /// after it, and any missing part simply omitted.
+        var displayString: String {
+            let identity = [manufacturer, model]
+                .compactMap { $0 }
+                .joined(separator: " ")
+            guard let firmware, !firmware.isEmpty else { return identity }
+            guard !identity.isEmpty else { return "Firmware \(firmware)" }
+            return "\(identity) (firmware \(firmware))"
+        }
+    }
 
     // MARK: Setup
 
@@ -129,6 +203,8 @@ final class BluetoothManager: NSObject {
     func startScan() {
         guard isPoweredOn, !isScanning else { return }
         discovered.removeAll()
+        discoveredByID.removeAll()
+        hasUnpublishedDiscoveries = false
         isScanning = true
         central.scanForPeripherals(
             withServices: scanForAllDevices ? nil : GATT.scanServices,
@@ -144,15 +220,45 @@ final class BluetoothManager: NSObject {
             guard !Task.isCancelled else { return }
             self?.stopScan()
         }
+
+        discoveryPublishTask?.cancel()
+        discoveryPublishTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.discoveryPublishInterval)
+                guard !Task.isCancelled else { return }
+                // Return rather than keep ticking if the manager has gone: a `self?` call
+                // in the loop body would leave the task spinning for nobody.
+                guard let self else { return }
+                self.publishDiscovered()
+            }
+        }
     }
 
     func stopScan() {
         scanTimeoutTask?.cancel()
         scanTimeoutTask = nil
+        discoveryPublishTask?.cancel()
+        discoveryPublishTask = nil
         guard isScanning else { return }
         isScanning = false
         central?.stopScan()
+        // Packets can arrive after the last tick, so publish once more: the list the user
+        // is left looking at must be the complete one, not whatever the final tick caught.
+        publishDiscovered()
         logger.info("Scan stopped")
+    }
+
+    /// Copies coalesced scan results into the observable list, strongest signal first.
+    ///
+    /// Ties break on name so the ordering is stable across ticks \u{2014} dictionary iteration
+    /// order is not, and an unstable sort would make equally-strong devices swap places
+    /// several times a second.
+    private func publishDiscovered() {
+        guard hasUnpublishedDiscoveries else { return }
+        hasUnpublishedDiscoveries = false
+        discovered = discoveredByID.values.sorted {
+            $0.rssi == $1.rssi ? $0.name < $1.name : $0.rssi > $1.rssi
+        }
     }
 
     // MARK: Connecting
@@ -211,8 +317,12 @@ final class BluetoothManager: NSObject {
         connectionStates[uuid] = .disconnected
     }
 
+    /// User-initiated reconnection. Clears the backoff, because an explicit tap is the
+    /// signal that whatever was wrong (device off, out of range) has been dealt with.
     func reconnect(sourceID: String) {
         guard let uuid = UUID(uuidString: sourceID) else { return }
+        cancelPendingReconnect(for: uuid)
+        reconnectAttempts[uuid] = nil
         if let peripheral = peripherals[uuid] ?? central.retrievePeripherals(withIdentifiers: [uuid]).first {
             peripherals[uuid] = peripheral
             connect(peripheral)
@@ -224,10 +334,64 @@ final class BluetoothManager: NSObject {
         if let peripheral = peripherals[uuid] {
             central.cancelPeripheralConnection(peripheral)
         }
+        cancelPendingReconnect(for: uuid)
+        // Everything keyed by this peripheral goes, or a device re-added later inherits
+        // the stale HRV window, quality caveat, or half-collected model string of the one
+        // the user just removed.
         peripherals[uuid] = nil
         connectionStates[uuid] = nil
         hrvAccumulators[uuid] = nil
         hrvProgress[uuid] = nil
+        hrvQuality[uuid] = nil
+        pendingModelInfo[uuid] = nil
+        reconnectAttempts[uuid] = nil
+        // `discoveredByID` is deliberately left alone: a forgotten device should still be
+        // offered by an in-flight scan so the user can add it back.
+    }
+
+    private func cancelPendingReconnect(for id: UUID) {
+        reconnectTasks[id]?.cancel()
+        reconnectTasks[id] = nil
+    }
+
+    /// Schedules a reconnection attempt after an exponentially growing delay.
+    ///
+    /// Called only from the disconnect path. Gives up after
+    /// `maximumReconnectAttempts` and leaves the device in `.failed`, which is a state the
+    /// user can act on from the devices list \u{2014} a silent retry loop is not.
+    private func scheduleReconnect(_ peripheral: CBPeripheral) {
+        let id = peripheral.identifier
+        cancelPendingReconnect(for: id)
+
+        let attempt = (reconnectAttempts[id] ?? 0) + 1
+        guard attempt <= Self.maximumReconnectAttempts else {
+            // Names the recovery the devices list actually offers ("Reconnect" in the row's
+            // menu) rather than leaving a dead end.
+            connectionStates[id] = .failed("Lost connection. Use Reconnect to try again.")
+            logger.info(
+                "Gave up reconnecting \(id.uuidString, privacy: .public) after \(Self.maximumReconnectAttempts) attempts"
+            )
+            return
+        }
+        reconnectAttempts[id] = attempt
+
+        let delay = min(
+            Self.firstReconnectDelay * pow(2, Double(attempt - 1)),
+            Self.maximumReconnectDelay
+        )
+        reconnectTasks[id] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            self.reconnectTasks[id] = nil
+            // The radio can go away while we wait. Retrying then would burn an attempt on
+            // a call that cannot succeed; `centralManagerDidUpdateState` reconnects every
+            // enabled source when power comes back, so nothing is lost by stopping here.
+            guard self.isPoweredOn else { return }
+            guard let source = self.store?.source(id: id.uuidString), source.isEnabled else { return }
+            guard let peripheral = self.peripherals[id] else { return }
+            self.connect(peripheral)
+        }
     }
 
     func connectionState(forSource id: String) -> PeripheralConnectionState {
@@ -294,6 +458,9 @@ final class BluetoothManager: NSObject {
                          start: windowStart, end: now, provenance: .derived))
             note(metric: .hrvRMSSD, for: id)
             note(metric: .hrvSDNN, for: id)
+            // Published alongside, not stored: it qualifies the window that was just
+            // emitted rather than being a measurement of its own.
+            hrvQuality[id] = HRVQuality(metrics: metrics, measuredAt: now)
         }
         hrvAccumulators[id] = accumulator
     }
@@ -343,6 +510,21 @@ final class BluetoothManager: NSObject {
         store?.updateBattery(Int(percent), forSource: peripheral.identifier.uuidString)
     }
 
+    /// Records where on the body the sensor sits (Body Sensor Location, 0x2A38).
+    ///
+    /// A single uint8 from the SIG enumeration. Unknown values are dropped rather than
+    /// coerced to `.other`: the interpretation text keys off optical-versus-electrical
+    /// sensing, and inventing a location would let the UI explain away a real
+    /// disagreement with a technology difference that may not exist.
+    fileprivate func handleBodySensorLocation(_ data: Data, from peripheral: CBPeripheral) {
+        var reader = BinaryReader(data)
+        guard let raw = reader.uint8(), let location = BodySensorLocation(rawValue: raw) else {
+            logger.debug("Unrecognised body sensor location value")
+            return
+        }
+        store?.setBodyLocation(location, forSource: peripheral.identifier.uuidString)
+    }
+
     fileprivate func handleDeviceInfo(_ characteristic: CBCharacteristic, from peripheral: CBPeripheral) {
         guard let data = characteristic.value,
               let text = String(data: data, encoding: .utf8)?
@@ -351,17 +533,19 @@ final class BluetoothManager: NSObject {
         else { return }
 
         let id = peripheral.identifier
-        var info = pendingModelInfo[id] ?? (nil, nil)
+        var info = pendingModelInfo[id] ?? DeviceInformation()
         switch characteristic.uuid {
-        case GATT.manufacturerNameString: info.manufacturer = text
-        case GATT.modelNumberString:      info.model = text
+        case GATT.manufacturerNameString:   info.manufacturer = text
+        case GATT.modelNumberString:        info.model = text
+        // Firmware matters here because two units of the same model on different firmware
+        // are genuinely different measuring instruments, and this app exists to explain
+        // why two devices disagree.
+        case GATT.firmwareRevisionString:   info.firmware = text
         default: return
         }
         pendingModelInfo[id] = info
 
-        let combined = [info.manufacturer, info.model]
-            .compactMap { $0 }
-            .joined(separator: " ")
+        let combined = info.displayString
         guard !combined.isEmpty, let store, var source = store.source(id: id.uuidString) else { return }
         source.model = combined
         store.upsert(source)
@@ -379,7 +563,13 @@ extension BluetoothManager: CBCentralManagerDelegate {
             if newState == .poweredOn {
                 self.reconnectKnownDevices()
             } else {
-                self.isScanning = false
+                // Ends the scan properly rather than only flipping the flag: the timeout
+                // and coalescing tasks have to stop too, and the last packets published.
+                self.stopScan()
+                // Pending reconnects cannot succeed without a radio, and would otherwise
+                // spend their attempt ceiling while Bluetooth is off.
+                for task in self.reconnectTasks.values { task.cancel() }
+                self.reconnectTasks.removeAll()
                 // Mark everything disconnected so the UI does not keep showing stale
                 // "streaming" badges after the radio goes away.
                 for key in self.connectionStates.keys {
@@ -415,19 +605,20 @@ extension BluetoothManager: CBCentralManagerDelegate {
                 isConnectable: connectable,
                 lastSeen: .now
             )
-            if let index = self.discovered.firstIndex(where: { $0.id == id }) {
-                self.discovered[index] = entry
-            } else {
-                self.discovered.append(entry)
-            }
-            // Strongest first, so the device on the user's body floats to the top.
-            self.discovered.sort { $0.rssi > $1.rssi }
+            // Coalesced rather than published here: with duplicates allowed this runs for
+            // every advertisement packet from every device in range.
+            self.discoveredByID[id] = entry
+            self.hasUnpublishedDiscoveries = true
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         MainActor.assumeIsolated {
             self.logger.info("Connected to \(peripheral.identifier.uuidString, privacy: .public)")
+            // A connection that actually succeeded resets the backoff, so a device that
+            // drops once an hour never accumulates its way to the attempt ceiling.
+            self.cancelPendingReconnect(for: peripheral.identifier)
+            self.reconnectAttempts[peripheral.identifier] = nil
             self.store?.markSeen(sourceID: peripheral.identifier.uuidString)
             self.discoverServices(on: peripheral)
         }
@@ -455,13 +646,15 @@ extension BluetoothManager: CBCentralManagerDelegate {
             // disconnection invalidates it rather than pausing it.
             self.hrvAccumulators[peripheral.identifier]?.reset()
             self.hrvProgress[peripheral.identifier] = nil
+            self.hrvQuality[peripheral.identifier] = nil
 
             // Rings drop out constantly. Reconnect automatically as long as the source is
-            // still enabled; CoreBluetooth will wait for the device to come back.
+            // still enabled, but with a backoff: an immediate retry against a device that
+            // is dropping every second is a tight loop with no end state.
             guard let source = self.store?.source(id: peripheral.identifier.uuidString),
                   source.isEnabled
             else { return }
-            self.connect(peripheral)
+            self.scheduleReconnect(peripheral)
         }
     }
 
@@ -551,7 +744,9 @@ extension BluetoothManager: CBPeripheralDelegate {
                 self.handleTemperature(data, from: peripheral)
             case GATT.batteryLevel:
                 self.handleBattery(data, from: peripheral)
-            case GATT.manufacturerNameString, GATT.modelNumberString:
+            case GATT.bodySensorLocation:
+                self.handleBodySensorLocation(data, from: peripheral)
+            case GATT.manufacturerNameString, GATT.modelNumberString, GATT.firmwareRevisionString:
                 self.handleDeviceInfo(characteristic, from: peripheral)
             default:
                 break

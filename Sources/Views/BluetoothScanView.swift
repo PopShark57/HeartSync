@@ -13,6 +13,7 @@ struct BluetoothScanView: View {
                         Label(model.bluetooth.stateDescription, systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
                             .font(.subheadline)
+                            .accessibilityLabel("Bluetooth unavailable. \(model.bluetooth.stateDescription)")
                     }
                 }
 
@@ -24,6 +25,10 @@ struct BluetoothScanView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .font(.subheadline)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(model.bluetooth.isScanning
+                            ? "Scanning for nearby sensors. Nothing found yet."
+                            : "Not scanning. No devices found.")
                     } else {
                         ForEach(candidates) { peripheral in
                             Button {
@@ -33,13 +38,21 @@ struct BluetoothScanView: View {
                                 DiscoveredRow(peripheral: peripheral)
                             }
                             .disabled(!peripheral.isConnectable)
+                            .accessibilityHint(peripheral.isConnectable
+                                ? "Adds this sensor to your devices and connects to it"
+                                : "This device is not accepting connections")
                         }
                     }
                 } header: {
                     HStack {
                         Text("Nearby")
                         Spacer()
-                        if model.bluetooth.isScanning { ProgressView().controlSize(.mini) }
+                        // Decorative duplicate of the toolbar's Stop/Scan state.
+                        if model.bluetooth.isScanning {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .accessibilityHidden(true)
+                        }
                     }
                 } footer: {
                     Text("Put your sensor into pairing mode and make sure it is on your body \u{2014} many rings and straps only advertise once they detect skin contact.")
@@ -66,6 +79,9 @@ struct BluetoothScanView: View {
                         }
                     }
                     .disabled(!model.bluetooth.isPoweredOn)
+                    .accessibilityHint(model.bluetooth.isScanning
+                        ? "Stops the Bluetooth scan"
+                        : "Starts a Bluetooth scan, which stops on its own after a minute")
                 }
             }
             .onAppear { model.bluetooth.startScan() }
@@ -110,16 +126,10 @@ private struct DiscoveredRow: View {
                 Text(peripheral.name)
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.primary)
-                if peripheral.advertisedServices.isEmpty {
-                    Text(peripheral.isConnectable ? "Services unknown until connected" : "Not connectable")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(peripheral.advertisedServices.joined(separator: " \u{00B7} "))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                Text(detailText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
 
             Spacer()
@@ -128,5 +138,26 @@ private struct DiscoveredRow: View {
                 .foregroundStyle(.tint)
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityDescription)
+    }
+
+    /// Advertised services, or why we cannot say what this device offers yet.
+    private var detailText: String {
+        guard peripheral.advertisedServices.isEmpty else {
+            return peripheral.advertisedServices.joined(separator: " \u{00B7} ")
+        }
+        return peripheral.isConnectable ? "Services unknown until connected" : "Not connectable"
+    }
+
+    /// One VoiceOver element per scan result.
+    ///
+    /// The row's icons are decorative — the sensor glyph is the same on every row and the
+    /// plus glyph duplicates what tapping the row already does — while signal strength is
+    /// drawn as bars, which carry no text at all. Children are ignored so the composed
+    /// sentence can state the name, what the device advertises, and the signal in words.
+    private var accessibilityDescription: String {
+        [peripheral.name, detailText, "Signal strength \(peripheral.signalBars) of 3"]
+            .joined(separator: ". ")
     }
 }
