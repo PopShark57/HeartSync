@@ -139,10 +139,11 @@ struct HealthKitSelfSourceTests {
 @MainActor
 struct HealthKitTypeMappingTests {
 
-    @Test("HealthKit synchronization uses finite pages and a finite per-sync budget")
-    func queryWorkIsBounded() {
+    @Test("HealthKit synchronization uses finite drains and a valid long-running observer")
+    func queryWorkIsBounded() throws {
         #expect(HealthKitManager.queryBatchLimit > 0)
         #expect(HealthKitManager.maximumObjectsPerSync >= HealthKitManager.queryBatchLimit)
+        #expect(HealthKitManager.observerQueryLimit == HKObjectQueryNoLimit)
         #expect(HealthKitManager.observerBufferLimit == 1)
         #expect(HealthKitManager.nextQueryLimit(afterProcessed: 0) == HealthKitManager.queryBatchLimit)
         #expect(HealthKitManager.nextQueryLimit(afterProcessed: HealthKitManager.maximumObjectsPerSync) == nil)
@@ -151,6 +152,26 @@ struct HealthKitTypeMappingTests {
             limit: HealthKitManager.queryBatchLimit
         ))
         #expect(!HealthKitManager.shouldContinuePaging(objectCount: 0, limit: HealthKitManager.queryBatchLimit))
+
+        let type = try #require(HKQuantityType.quantityType(forIdentifier: .heartRate))
+        let handler: @Sendable (
+            HKAnchoredObjectQuery,
+            [HKSample]?,
+            [HKDeletedObject]?,
+            HKQueryAnchor?,
+            Error?
+        ) -> Void = { _, _, _, _, _ in }
+        let query = HKAnchoredObjectQuery(
+            type: type,
+            predicate: nil,
+            anchor: nil,
+            limit: HealthKitManager.observerQueryLimit,
+            resultsHandler: handler
+        )
+
+        // A finite limit makes this setter raise NSInvalidArgumentException and abort the host.
+        query.updateHandler = handler
+        #expect(query.updateHandler != nil)
     }
 
     /// A probe expressed in a unit chosen independently of the mapping, so the assertion is
