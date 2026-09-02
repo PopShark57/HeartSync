@@ -9,9 +9,24 @@ struct MetricDetailView: View {
     var initialRange: TimeRange = .day
 
     @State private var range: TimeRange = .day
+    /// Presentation only. Estimated values are drawn as dashed lines when this is on; they
+    /// are never fed into a comparison verdict either way \u{2014} see `MetricDetailSnapshot`.
     @State private var showEstimates = true
 
     var body: some View {
+        // Resolved once per update and threaded through every section. The chart, the
+        // band, the legend, the per-device table, and the pair list are five projections
+        // of one windowing pass; computing them separately re-read the whole archive and
+        // re-bucketed it for each projection, and `TimeRange.interval` is relative to
+        // `.now`, so those passes did not even describe the same span.
+        let snapshot = MetricDetailSnapshot(
+            store: model.store,
+            kind: kind,
+            range: range,
+            includeEstimates: showEstimates,
+            hrvQuality: isHRV ? model.bluetooth.hrvQuality : [:]
+        )
+
         List {
             Section {
                 Picker("Range", selection: $range) {
@@ -19,41 +34,49 @@ struct MetricDetailView: View {
                 }
                 .pickerStyle(.segmented)
                 .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+
+                if snapshot.hasEstimatedReadings {
+                    Toggle("Show estimated values", isOn: $showEstimates)
+                        .font(.subheadline)
+                }
+            } footer: {
+                if snapshot.hasEstimatedReadings {
+                    Text("Estimated values are modelled, not measured, and are drawn as dashed lines. This switch changes the chart and the per-device table only: an estimate never contributes to a device agreement statistic, whichever way it is set.")
+                }
             }
 
             Section {
-                if points.isEmpty {
+                if snapshot.points.isEmpty {
                     Text("No \(kind.title.lowercased()) data in this range.")
                         .foregroundStyle(.secondary)
                         .font(.subheadline)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 30)
                 } else {
-                    chart
+                    chart(snapshot)
                         .frame(height: 240)
                         .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 12, trailing: 12))
-                    legend
+                    legend(snapshot)
                 }
             } header: {
                 Text(kind.title)
             } footer: {
-                if !bandPoints.isEmpty {
-                    Text("The shaded band spans the highest and lowest device reading in each \(bucketDescription) window. A wide band means your devices disagree at that moment.")
+                if !snapshot.bandPoints.isEmpty {
+                    Text("The shaded band spans the highest and lowest device reading in each \(WindowLabel.length(snapshot.bucketSize)) window. A wide band means your devices disagree at that moment.")
                 }
             }
 
-            if !perSourceStats.isEmpty {
+            if !snapshot.perSourceStats.isEmpty {
                 Section("Per device, \(range.title.lowercased())") {
-                    ForEach(perSourceStats, id: \.source.id) { entry in
+                    ForEach(snapshot.perSourceStats) { entry in
                         PerSourceStatsRow(kind: kind, entry: entry)
                     }
                 }
             }
 
-            let pairs = pairwiseAnalyses
-            if !pairs.isEmpty {
+            if !snapshot.pairwiseAnalyses.isEmpty {
                 Section {
-                    ForEach(pairs) { analysis in
+                    ForEach(snapshot.pairwiseAnalyses) { analysis in
                         NavigationLink {
                             PairwiseAnalysisView(
                                 kind: kind,
@@ -72,11 +95,23 @@ struct MetricDetailView: View {
                 }
             }
 
-            if kind == .hrvRMSSD || kind == .hrvSDNN {
+            if isHRV {
                 Section {
                     Text("HRV is the metric where devices disagree most. Vendors use different window lengths, different artefact-rejection rules, and different sensors \u{2014} an ECG chest strap and an optical ring are not measuring the same signal. Treat each device's HRV as its own scale and watch its trend, rather than expecting two devices to match.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    ForEach(snapshot.hrvQuality) { entry in
+                        HRVQualityRow(entry: entry)
+                    }
+                } header: {
+                    if !snapshot.hrvQuality.isEmpty {
+                        Text("How good is this HRV?")
+                    }
+                } footer: {
+                    if !snapshot.hrvQuality.isEmpty {
+                        Text("Beat quality is reported by HeartSync's own HRV calculation from the R\u{2013}R intervals a Bluetooth device sent, and describes that device's latest window only. It is a caveat on the numbers above, not a comparison between devices.")
+                    }
                 }
             }
         }
@@ -85,11 +120,13 @@ struct MetricDetailView: View {
         .onAppear { range = initialRange }
     }
 
+    private var isHRV: Bool { kind == .hrvRMSSD || kind == .hrvSDNN }
+
     // MARK: Chart
 
-    private var chart: some View {
+    private func chart(_ snapshot: MetricDetailSnapshot) -> some View {
         Chart {
-            ForEach(bandPoints) { band in
+            ForEach(snapshot.bandPoints) { band in
                 AreaMark(
                     x: .value("Time", band.date),
                     yStart: .value("Low", band.low),
@@ -99,7 +136,7 @@ struct MetricDetailView: View {
                 .interpolationMethod(.monotone)
             }
 
-            ForEach(points) { point in
+            ForEach(snapshot.points) { point in
                 LineMark(
                     x: .value("Time", point.date),
                     y: .value(kind.title, point.value),
@@ -110,9 +147,9 @@ struct MetricDetailView: View {
                 .interpolationMethod(.monotone)
             }
         }
-        .chartForegroundStyleScale(domain: styleDomain, range: styleRange)
+        .chartForegroundStyleScale(domain: snapshot.styleDomain, range: snapshot.styleRange)
         .chartLegend(.hidden)
-        .chartYScale(domain: yDomain)
+        .chartYScale(domain: snapshot.yDomain)
         .chartXAxis {
             AxisMarks(preset: .aligned) { _ in
                 AxisGridLine()
@@ -124,94 +161,20 @@ struct MetricDetailView: View {
         }
     }
 
-    private var legend: some View {
+    private func legend(_ snapshot: MetricDetailSnapshot) -> some View {
         HStack(spacing: 14) {
-            ForEach(sourcesInRange, id: \.id) { source in
+            ForEach(snapshot.sourcesInRange, id: \.id) { source in
                 HStack(spacing: 5) {
                     SourceDot(color: source.color, size: 8)
                     Text(source.displayName)
                         .font(.caption2)
                         .lineLimit(1)
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(source.displayName)
             }
             Spacer(minLength: 0)
         }
-    }
-
-    // MARK: Data shaping
-
-    private struct ChartPoint: Identifiable {
-        var id: String
-        var date: Date
-        var value: Double
-        var sourceName: String
-        var isEstimate: Bool
-    }
-
-    private struct BandPoint: Identifiable {
-        var id: String
-        var date: Date
-        var low: Double
-        var high: Double
-        var severity: DiscrepancySeverity
-    }
-
-    /// Windows re-bucketed at the chart's zoom level rather than the metric's comparison
-    /// window, so a month of data does not try to render 43,000 points.
-    private var chartWindows: [ComparisonWindow] {
-        ComparisonEngine.windows(
-            from: model.store.readings(kind: kind, in: range.interval),
-            kind: kind,
-            windowSize: max(kind.comparisonWindow, range.chartBucket),
-            range: range.interval,
-            includeEstimated: showEstimates
-        )
-    }
-
-    private var points: [ChartPoint] {
-        chartWindows.flatMap { window in
-            window.values.map { value in
-                ChartPoint(
-                    id: "\(value.sourceID)-\(window.start.timeIntervalSince1970)",
-                    date: window.start,
-                    value: value.value,
-                    sourceName: model.store.displayName(forSource: value.sourceID),
-                    isEstimate: value.provenance == .estimated
-                )
-            }
-        }
-    }
-
-    private var bandPoints: [BandPoint] {
-        chartWindows.compactMap { window in
-            guard window.values.count >= 2,
-                  let low = window.minimum, let high = window.maximum
-            else { return nil }
-            return BandPoint(
-                id: window.id,
-                date: window.start,
-                low: low.value,
-                high: high.value,
-                severity: window.severity
-            )
-        }
-    }
-
-    private var sourcesInRange: [DataSource] {
-        let ids = Set(chartWindows.flatMap { $0.values.map(\.sourceID) })
-        return ids.compactMap { model.store.source(id: $0) }.sorted { $0.displayName < $1.displayName }
-    }
-
-    private var styleDomain: [String] { sourcesInRange.map(\.displayName) }
-    private var styleRange: [Color] { sourcesInRange.map(\.color) }
-
-    /// Pads the observed range slightly so lines are not flush against the plot edges,
-    /// and never collapses to zero height when every reading is identical.
-    private var yDomain: ClosedRange<Double> {
-        let values = points.map(\.value)
-        guard let low = values.min(), let high = values.max() else { return kind.displayRange }
-        let padding = max((high - low) * 0.15, kind.agreement.warn)
-        return (low - padding)...(high + padding)
     }
 
     private var axisFormat: Date.FormatStyle {
@@ -221,57 +184,242 @@ struct MetricDetailView: View {
         case .week, .month:    .dateTime.month(.abbreviated).day()
         }
     }
+}
 
-    private var bucketDescription: String {
-        let seconds = max(kind.comparisonWindow, range.chartBucket)
-        if seconds >= 3_600 { return "\(Int(seconds / 3_600))-hour" }
-        return "\(Int(seconds / 60))-minute"
+// MARK: - Snapshot
+
+private struct ChartPoint: Identifiable {
+    var id: String
+    var date: Date
+    var value: Double
+    var sourceName: String
+    var isEstimate: Bool
+}
+
+private struct BandPoint: Identifiable {
+    var id: String
+    var date: Date
+    var low: Double
+    var high: Double
+    var severity: DiscrepancySeverity
+}
+
+private struct SourceStats: Identifiable {
+    var source: DataSource
+    var mean: Double
+    var minimum: Double
+    var maximum: Double
+    var sampleCount: Int
+    var lastSeen: Date?
+
+    var id: String { source.id }
+}
+
+/// One Bluetooth device's own verdict on the beats behind its latest HRV window.
+private struct HRVQualityEntry: Identifiable {
+    var source: DataSource
+    var quality: HRVQuality
+    /// Heart rate the same device reported closest to the HRV window, when it reported one
+    /// near enough to be a fair cross-check. Nil means no cross-check is possible, which is
+    /// not the same as the device agreeing with itself.
+    var reportedHeartRate: Double?
+
+    var id: String { source.id }
+}
+
+/// One resolved pass over the store for one metric and range.
+///
+/// Every projection this screen draws comes from the same read and the same windowing, so
+/// the chart, the band, the legend, the per-device table and the pair list cannot describe
+/// slightly different spans of time, and drawing the screen costs one pass rather than ten.
+@MainActor
+private struct MetricDetailSnapshot {
+    /// Chart bucket actually used, which is the metric's comparison window widened to the
+    /// zoom level so a month does not try to render 43,000 points.
+    let bucketSize: TimeInterval
+    let points: [ChartPoint]
+    let bandPoints: [BandPoint]
+    let sourcesInRange: [DataSource]
+    let styleDomain: [String]
+    let styleRange: [Color]
+    let yDomain: ClosedRange<Double>
+    let perSourceStats: [SourceStats]
+    let pairwiseAnalyses: [PairwiseAnalysis]
+    /// Whether the range holds any modelled value at all, so the estimate switch is only
+    /// offered where it does something.
+    let hasEstimatedReadings: Bool
+    let hrvQuality: [HRVQualityEntry]
+
+    /// How far from an HRV window a heart-rate reading may sit and still be treated as the
+    /// same moment: half of the 300-second HRV comparison window.
+    private static let crossCheckTolerance: TimeInterval = 150
+
+    init(
+        store: HealthStore,
+        kind: MetricKind,
+        range: TimeRange,
+        includeEstimates: Bool,
+        hrvQuality: [UUID: HRVQuality]
+    ) {
+        let interval = range.interval
+        let readings = store.readings(kind: kind, in: interval)
+        self.hasEstimatedReadings = readings.contains { $0.provenance == .estimated }
+
+        let bucketSize = max(kind.comparisonWindow, range.chartBucket)
+        self.bucketSize = bucketSize
+        let windows = ComparisonEngine.windows(
+            from: readings,
+            kind: kind,
+            windowSize: bucketSize,
+            range: interval,
+            includeEstimated: includeEstimates
+        )
+
+        let sources = Set(windows.flatMap { $0.values.map(\.sourceID) })
+            .compactMap { store.source(id: $0) }
+            .sorted { $0.displayName < $1.displayName }
+        self.sourcesInRange = sources
+        self.styleDomain = sources.map(\.displayName)
+        self.styleRange = sources.map(\.color)
+        var names: [String: String] = [:]
+        for source in sources { names[source.id] = source.displayName }
+
+        self.points = windows.flatMap { window in
+            window.values.map { value in
+                ChartPoint(
+                    id: "\(value.sourceID)-\(window.start.timeIntervalSince1970)",
+                    date: window.start,
+                    value: value.value,
+                    sourceName: names[value.sourceID] ?? store.displayName(forSource: value.sourceID),
+                    isEstimate: value.provenance == .estimated
+                )
+            }
+        }
+
+        // The band is a disagreement verdict drawn on a chart, so it is built from measured
+        // and derived values only. Showing estimates must never widen it or change its
+        // colour: the switch above is presentation, and an estimate is not a device.
+        self.bandPoints = windows.compactMap { window in
+            let comparable = window.values.filter { $0.provenance != .estimated }
+            guard comparable.count >= 2,
+                  let low = comparable.min(by: { $0.value < $1.value }),
+                  let high = comparable.max(by: { $0.value < $1.value })
+            else { return nil }
+            return BandPoint(
+                id: window.id,
+                date: window.start,
+                low: low.value,
+                high: high.value,
+                severity: kind.agreement.severity(forDelta: high.value - low.value)
+            )
+        }
+
+        // Pads the observed range slightly so lines are not flush against the plot edges,
+        // and never collapses to zero height when every reading is identical.
+        let plotted = self.points.map(\.value)
+        if let low = plotted.min(), let high = plotted.max() {
+            let padding = max((high - low) * 0.15, kind.agreement.warn)
+            self.yDomain = (low - padding)...(high + padding)
+        } else {
+            self.yDomain = kind.displayRange
+        }
+
+        // The estimate switch is presentation, so it filters this descriptive table too.
+        let statsReadings = includeEstimates
+            ? readings
+            : readings.filter { $0.provenance != .estimated }
+        self.perSourceStats = Dictionary(grouping: statsReadings, by: \.sourceID)
+            .compactMap { sourceID, samples -> SourceStats? in
+                guard let source = store.source(id: sourceID), !samples.isEmpty else { return nil }
+                let values = samples.map(\.value)
+                return SourceStats(
+                    source: source,
+                    mean: values.reduce(0, +) / Double(values.count),
+                    minimum: values.min() ?? 0,
+                    maximum: values.max() ?? 0,
+                    sampleCount: samples.count,
+                    lastSeen: samples.map(\.end).max()
+                )
+            }
+            .sorted { $0.source.displayName < $1.source.displayName }
+
+        // Alert preferences do not filter analytical detail: agreeing and
+        // insufficient-evidence pairs remain inspectable here. Estimates are excluded by
+        // the engine's own default, so `includeEstimates` cannot reach a verdict.
+        self.pairwiseAnalyses = ComparisonEngine.allPairwiseAnalyses(
+            from: readings,
+            kind: kind,
+            range: interval
+        )
+
+        self.hrvQuality = Self.qualityEntries(
+            store: store,
+            sources: sources,
+            quality: hrvQuality,
+            range: interval
+        )
     }
 
-    // MARK: Per-source stats
+    /// Pairs each Bluetooth source with its latest HRV window quality and the heart rate it
+    /// reported at the same moment.
+    ///
+    /// Only sources whose window falls inside the selected range are returned, so the
+    /// caveat always describes data the user can see. The heart rates come from one bounded
+    /// read spanning the candidate windows rather than a query per device.
+    private static func qualityEntries(
+        store: HealthStore,
+        sources: [DataSource],
+        quality: [UUID: HRVQuality],
+        range: DateInterval
+    ) -> [HRVQualityEntry] {
+        guard !quality.isEmpty else { return [] }
+        let candidates: [(source: DataSource, quality: HRVQuality)] = sources.compactMap { source in
+            guard source.transport == .bluetooth,
+                  let uuid = UUID(uuidString: source.id),
+                  let measured = quality[uuid],
+                  range.contains(measured.measuredAt)
+            else { return nil }
+            return (source, measured)
+        }
+        guard let earliest = candidates.map({ $0.quality.measuredAt }).min(),
+              let latest = candidates.map({ $0.quality.measuredAt }).max()
+        else { return [] }
 
-    struct SourceStats {
-        var source: DataSource
-        var mean: Double
-        var minimum: Double
-        var maximum: Double
-        var sampleCount: Int
-        var lastSeen: Date?
-    }
+        let heartRates = store.readings(
+            kind: .heartRate,
+            in: DateInterval(
+                start: earliest.addingTimeInterval(-crossCheckTolerance),
+                end: latest.addingTimeInterval(crossCheckTolerance)
+            )
+        )
+        let bySource = Dictionary(grouping: heartRates, by: \.sourceID)
 
-    private var perSourceStats: [SourceStats] {
-        let readings = model.store.readings(kind: kind, in: range.interval)
-        let grouped = Dictionary(grouping: readings, by: \.sourceID)
-        return grouped.compactMap { sourceID, samples -> SourceStats? in
-            guard let source = model.store.source(id: sourceID), !samples.isEmpty else { return nil }
-            let values = samples.map(\.value)
-            return SourceStats(
-                source: source,
-                mean: values.reduce(0, +) / Double(values.count),
-                minimum: values.min() ?? 0,
-                maximum: values.max() ?? 0,
-                sampleCount: samples.count,
-                lastSeen: samples.map(\.end).max()
+        return candidates.map { candidate in
+            let nearest = bySource[candidate.source.id]?
+                .min { lhs, rhs in
+                    abs(lhs.end.timeIntervalSince(candidate.quality.measuredAt))
+                        < abs(rhs.end.timeIntervalSince(candidate.quality.measuredAt))
+                }
+            let reported = nearest.flatMap { reading -> Double? in
+                abs(reading.end.timeIntervalSince(candidate.quality.measuredAt)) <= crossCheckTolerance
+                    ? reading.value
+                    : nil
+            }
+            return HRVQualityEntry(
+                source: candidate.source,
+                quality: candidate.quality,
+                reportedHeartRate: reported
             )
         }
         .sorted { $0.source.displayName < $1.source.displayName }
     }
-
-    /// Alert preferences do not filter analytical detail: agreeing and
-    /// insufficient-evidence pairs remain inspectable here.
-    private var pairwiseAnalyses: [PairwiseAnalysis] {
-        let interval = range.interval
-        return ComparisonEngine.allPairwiseAnalyses(
-            from: model.store.readings(kind: kind, in: interval),
-            kind: kind,
-            range: interval
-        )
-    }
 }
+
+// MARK: - Rows
 
 private struct PerSourceStatsRow: View {
     var kind: MetricKind
-    var entry: MetricDetailView.SourceStats
+    var entry: SourceStats
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -291,6 +439,8 @@ private struct PerSourceStatsRow: View {
             }
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(entry.source.displayName), mean \(kind.formatWithUnit(entry.mean)), low \(kind.format(entry.minimum)), high \(kind.format(entry.maximum)), \(entry.sampleCount) samples")
     }
 
     private func statistic(_ label: String, _ value: String) -> some View {
@@ -301,6 +451,88 @@ private struct PerSourceStatsRow: View {
             Text(value)
                 .font(.caption.monospacedDigit())
         }
+    }
+}
+
+/// Beat-level caveat for one device's latest HRV window.
+///
+/// Two things a comparison cannot say on its own: how much of the window was thrown away as
+/// artefact, and whether the device agrees with *itself* \u{2014} the heart rate implied by the
+/// R\u{2013}R intervals it sent versus the heart rate it reported over the same seconds. Neither
+/// is a claim about which device is correct.
+///
+/// A published window has already passed `HRVMetrics.isReliable`, so the artefact figure
+/// says how close to that limit this window ran rather than announcing a rejected one. The
+/// over-limit wording is kept for the case where a window reaches this row without having
+/// gone through `HRVAccumulator.emitIfReady`.
+private struct HRVQualityRow: View {
+    var entry: HRVQualityEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                SourceDot(color: entry.source.color, size: 8)
+                Text(entry.source.displayName)
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Text(entry.quality.measuredAt, format: .relative(presentation: .numeric))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(beatQualityText)
+                .font(.caption)
+                .foregroundStyle(isNoisy ? Color.orange : Color.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(crossCheckText)
+                .font(.caption)
+                .foregroundStyle(crossCheckTint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// Above the calculator's own rejection ceiling the HRV figure is not trustworthy
+    /// whatever it says, which is exactly the caveat an HRV comparison needs.
+    private var isNoisy: Bool {
+        entry.quality.artefactFraction > HRVMetrics.maximumArtefactFraction
+    }
+
+    /// `artefactFraction` is a 0...1 fraction; `pnn50` is already a percentage, as
+    /// `HRVMetrics` documents. They are converted at the call site rather than guessed at.
+    private var beatQualityText: String {
+        let rejected = percentText(entry.quality.artefactFraction * 100)
+        let pnn50 = percentText(entry.quality.pnn50)
+        let base = "This HRV window rejected \(rejected) of beats and kept \(entry.quality.beatCount). pNN50 \(pnn50)."
+        guard isNoisy else { return base }
+        return base + " That is above HeartSync's \(percentText(HRVMetrics.maximumArtefactFraction * 100)) artefact limit, so read this window's HRV with caution."
+    }
+
+    private var crossCheckText: String {
+        let implied = MetricKind.heartRate.formatWithUnit(entry.quality.impliedHeartRate)
+        guard let reported = entry.reportedHeartRate else {
+            return "Its R\u{2013}R intervals imply \(implied). This device reported no heart rate close enough to the window to cross-check that."
+        }
+        let difference = entry.quality.impliedHeartRate - reported
+        let base = "Its R\u{2013}R intervals imply \(implied) while the same device reported \(MetricKind.heartRate.formatWithUnit(reported))."
+        guard crossCheckSeverity != .agreeing else { return base }
+        return base + " A device that disagrees with itself by \(MetricKind.heartRate.formatWithUnit(abs(difference))) is describing its own beat detection, not another device."
+    }
+
+    private var crossCheckSeverity: DiscrepancySeverity {
+        guard let reported = entry.reportedHeartRate else { return .agreeing }
+        return MetricKind.heartRate.agreement
+            .severity(forDelta: entry.quality.impliedHeartRate - reported)
+    }
+
+    private var crossCheckTint: Color {
+        crossCheckSeverity == .agreeing ? .secondary : crossCheckSeverity.tint
+    }
+
+    private func percentText(_ percent: Double) -> String {
+        percent.formatted(.number.precision(.fractionLength(0))) + "%"
     }
 }
 

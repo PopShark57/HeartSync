@@ -1,11 +1,13 @@
 @preconcurrency import CoreBluetooth
+import Foundation
 
 /// Bluetooth SIG assigned numbers for the services and characteristics HeartSync speaks.
 ///
 /// Everything here is from the public GATT specification, which is what generic
 /// heart-rate straps, most chest sensors, and standards-compliant rings and pulse
-/// oximeters actually advertise. Vendor-proprietary profiles are handled separately \u{2014}
-/// see `DeviceProfile`.
+/// oximeters actually advertise. There is deliberately no vendor-proprietary path: a
+/// device that does not speak these standard profiles is not supported, and
+/// `BluetoothManager` reports that rather than guessing at a private protocol.
 enum GATT {
 
     // MARK: Services
@@ -47,6 +49,13 @@ enum GATT {
     /// PLX Continuous Measurement (notify). Streaming SpO2 + pulse rate.
     static let plxContinuousMeasurement = CBUUID(string: "2A5F")
     /// PLX Features (read). Declares which optional fields the device populates.
+    ///
+    /// Deliberately absent from `readOnceCharacteristics`. The measurement parsers already
+    /// discover the populated optional fields from each frame's own flags byte, so this
+    /// characteristic tells the app nothing it does not already know, and nothing in the
+    /// UI consumes it. Requesting it only to discard the answer would be a read the user
+    /// pays for in radio time. The constant stays because it is the spec identifier a
+    /// future "which fields does this oximeter support?" screen would need.
     static let plxFeatures = CBUUID(string: "2A60")
 
     /// Temperature Measurement (indicate).
@@ -72,9 +81,11 @@ enum GATT {
     ]
 
     /// Characteristics to read once on connect.
+    ///
+    /// Every entry has a consumer in `BluetoothManager.didUpdateValueFor`; a characteristic
+    /// whose value would be discarded does not belong here.
     static let readOnceCharacteristics: Set<CBUUID> = [
         bodySensorLocation,
-        plxFeatures,
         batteryLevel,
         manufacturerNameString,
         modelNumberString,
@@ -94,18 +105,32 @@ enum GATT {
 }
 
 /// Body Sensor Location (characteristic 0x2A38) enumeration.
-enum BodySensorLocation: UInt8, Sendable {
+///
+/// The raw values are the Bluetooth SIG assigned numbers and are persisted inside
+/// `DataSource` in `sources.json`, so they are a storage contract: never renumber a case.
+/// `Codable`/`Hashable` exist for that persistence and for `DataSource`'s synthesized
+/// conformances; `CaseIterable` so a picker can offer the full list.
+enum BodySensorLocation: UInt8, Sendable, Codable, Hashable, CaseIterable {
     case other = 0, chest = 1, wrist = 2, finger = 3, hand = 4, earLobe = 5, foot = 6
 
+    /// Where the device says it is worn, for display. Only the display text is localized;
+    /// the raw values above remain the persisted SIG numbers.
     var title: String {
         switch self {
-        case .other:   "Other"
-        case .chest:   "Chest"
-        case .wrist:   "Wrist"
-        case .finger:  "Finger"
-        case .hand:    "Hand"
-        case .earLobe: "Ear"
-        case .foot:    "Foot"
+        case .other:
+            String(localized: "bodySensorLocation.other", defaultValue: "Other", comment: "Body sensor location the device did not specify")
+        case .chest:
+            String(localized: "bodySensorLocation.chest", defaultValue: "Chest", comment: "Body sensor location: chest")
+        case .wrist:
+            String(localized: "bodySensorLocation.wrist", defaultValue: "Wrist", comment: "Body sensor location: wrist")
+        case .finger:
+            String(localized: "bodySensorLocation.finger", defaultValue: "Finger", comment: "Body sensor location: finger")
+        case .hand:
+            String(localized: "bodySensorLocation.hand", defaultValue: "Hand", comment: "Body sensor location: hand")
+        case .earLobe:
+            String(localized: "bodySensorLocation.earLobe", defaultValue: "Ear", comment: "Body sensor location: ear lobe")
+        case .foot:
+            String(localized: "bodySensorLocation.foot", defaultValue: "Foot", comment: "Body sensor location: foot")
         }
     }
 
@@ -113,4 +138,15 @@ enum BodySensorLocation: UInt8, Sendable {
     /// This matters for interpreting a discrepancy: PPG and ECG disagreeing on HRV is
     /// expected behaviour, not a fault.
     var isOptical: Bool { self != .chest }
+
+    /// How the sensor acquires a beat, for the interpretation text on a comparison.
+    ///
+    /// Note that `.other` is reported by devices that decline to say, so it is grouped
+    /// with the optical majority rather than claimed as electrical: overstating a sensor
+    /// as ECG would let the UI dismiss a real disagreement as an expected one.
+    var sensingTechnology: String {
+        isOptical
+            ? String(localized: "sensingTechnology.optical", defaultValue: "Optical (PPG)", comment: "Sensing technology: a photoplethysmography sensor that times a pulse wave at the skin. Keep the PPG abbreviation, which is international.")
+            : String(localized: "sensingTechnology.electrical", defaultValue: "Electrical (ECG)", comment: "Sensing technology: an electrocardiography sensor that times the heartbeat's R wave directly. Keep the ECG abbreviation, which is international.")
+    }
 }

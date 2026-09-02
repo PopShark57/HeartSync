@@ -17,10 +17,6 @@ final class AppModel {
     let healthKit = HealthKitManager()
     let oura = OuraManager()
 
-    /// Bumped whenever readings change, so views can key expensive recomputation off a
-    /// single value instead of diffing thousands of readings.
-    private(set) var dataVersion = 0
-
     private var derivedTask: Task<Void, Never>?
     private var ouraTimerTask: Task<Void, Never>?
     private var hasStarted = false
@@ -34,21 +30,31 @@ final class AppModel {
         #if DEBUG
         if Self.pairwiseDemoEnabled {
             DebugAnalysisFixtures.populate(store: store)
-            dataVersion &+= 1
             return
         }
         #endif
 
         await settings.loadIfNeeded()
         await store.loadIfNeeded()
-        store.retention = TimeInterval(settings.snapshot.retentionDays) * 86_400
+        // Builds predating the HealthKit self-source filter may already have persisted a
+        // phantom `hk.<our bundle id>` device containing mirrored Bluetooth samples. The
+        // query and conversion guards stop new copies; this migration removes the old
+        // source and its readings so it cannot keep reporting perfect self-agreement.
+        HealthKitManager.removePersistedSelfSource(from: store)
+        applyRetentionSettings()
 
         bluetooth.configure(store: store) { [weak self] reading in
             self?.ingest([reading])
         }
-        healthKit.configure(store: store) { [weak self] readings in
-            self?.ingest(readings)
-        }
+        healthKit.configure(
+            store: store,
+            onReadings: { [weak self] readings in
+                self?.ingest(readings)
+            },
+            onDeletedSampleIDs: { [weak self] ids in
+                self?.removeDeletedHealthKitSamples(ids)
+            }
+        )
         await oura.configure(store: store) { [weak self] readings in
             self?.ingest(readings, replacingExisting: true)
         }
@@ -71,10 +77,31 @@ final class AppModel {
         if healthKit.availability == .authorized {
             await healthKit.syncAll()
         }
+        applyRetentionSettings()
         if settings.snapshot.autoSyncOura, oura.hasAuthorization {
             await oura.sync()
         }
         recomputeDerivedMetrics()
+    }
+
+    /// Pushes the user's retention preference into the store, and pins the compaction
+    /// horizon to the shortest value the store allows.
+    ///
+    /// Retention and compaction are separate knobs: retention decides what is *deleted*,
+    /// compaction decides what is *downsampled* while still inside retention. Compacting as
+    /// early as the store permits preserves the windowed medians and pairwise verdicts that
+    /// comparison and export consume, while permanently discarding raw sample counts and
+    /// within-window spread. This deliberately asks for the floor rather than scaling with
+    /// retention; the Settings copy discloses that irreversible tradeoff. `HealthStore`
+    /// clamps anything below `HealthStore.minimumCompactionAge`, which exists so a 14-day
+    /// Oura resync still lands on raw rows.
+    ///
+    /// Called at startup and on every foreground so a settings change can never leave the
+    /// store on a stale horizon; `SettingsView` also writes `store.retention` directly from
+    /// its picker's `onChange`, and both paths are idempotent.
+    func applyRetentionSettings() {
+        store.retention = TimeInterval(settings.snapshot.retentionDays) * 86_400
+        store.compactionAge = HealthStore.minimumCompactionAge
     }
 
     func enterBackground() async {
@@ -88,16 +115,21 @@ final class AppModel {
 
     // MARK: - Ingest
 
+    /// The single routing seam for all three transports.
+    ///
+    /// Write-back mirrors the readings the store *accepted*, never the input batch: a batch
+    /// of ten containing one new reading and nine already-known duplicates must put exactly
+    /// one sample into Apple Health. `append(contentsOf:)`/`upsert(contentsOf:)` return the
+    /// stored subset precisely so this filter can run over it.
     private func ingest(_ readings: [Reading], replacingExisting: Bool = false) {
         let accepted = replacingExisting
             ? store.upsert(contentsOf: readings)
             : store.append(contentsOf: readings)
-        guard accepted > 0 else { return }
-        dataVersion &+= 1
+        guard !accepted.isEmpty else { return }
 
         // Optional write-back into Apple Health, measured Bluetooth values only.
         if settings.snapshot.mirrorBluetoothToHealthKit, healthKit.availability == .authorized {
-            let mirrorable = readings.filter { reading in
+            let mirrorable = accepted.filter { reading in
                 reading.provenance == .measured
                     && store.source(id: reading.sourceID)?.transport == .bluetooth
             }
@@ -106,6 +138,20 @@ final class AppModel {
                 for reading in mirrorable { await healthKit.write(reading) }
             }
         }
+    }
+
+    /// Drops readings whose HealthKit samples the user deleted in Health.
+    ///
+    /// A HealthKit-sourced `Reading.id` *is* the `HKSample` uuid, and `HKDeletedObject.uuid`
+    /// reports that same value, so deleted ids map onto stored readings directly with no
+    /// lookup table. Deletion is deliberately silent for the user: a sample removed upstream
+    /// must stop contributing to comparisons, but an analysis already exported keeps whatever
+    /// it was exported with.
+    private func removeDeletedHealthKitSamples(_ sampleIDs: [UUID]) {
+        guard !sampleIDs.isEmpty else { return }
+        let removed = store.remove(readingIDs: sampleIDs)
+        guard removed > 0 else { return }
+        logger.info("Removed \(removed, privacy: .public) reading(s) deleted from Apple Health")
     }
 
     // MARK: - Derived metrics
@@ -117,7 +163,11 @@ final class AppModel {
         derivedTask?.cancel()
         derivedTask = Task { [weak self] in
             while !Task.isCancelled {
-                self?.recomputeDerivedMetrics()
+                // `guard let` rather than `self?`: once the model is gone the loop must end,
+                // not keep waking every 300 seconds to do nothing. Same shape as
+                // `startOuraSchedule`.
+                guard let self else { return }
+                self.recomputeDerivedMetrics()
                 try? await Task.sleep(for: .seconds(300))
             }
         }
@@ -128,7 +178,7 @@ final class AppModel {
         produced += vo2MaxEstimates()
         if let bp = bloodPressureEstimateReadings() { produced += bp }
         guard !produced.isEmpty else { return }
-        if store.append(contentsOf: produced) > 0 { dataVersion &+= 1 }
+        store.append(contentsOf: produced)
     }
 
     /// A VO\u{2082} max estimate per source that reports resting heart rate but no measured
@@ -255,7 +305,10 @@ final class AppModel {
                 try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled else { return }
                 if self.settings.snapshot.autoSyncOura, self.oura.hasAuthorization {
-                    await self.oura.sync()
+                    // syncIfDue, not sync: this is the unattended cadence, so it must honour
+                    // the backoff a 429 installed. User-initiated refreshes still call sync()
+                    // directly and always attempt.
+                    await self.oura.syncIfDue()
                 }
             }
         }
@@ -271,7 +324,6 @@ final class AppModel {
             guard oura.disconnect() else { return }
         }
         store.remove(sourceID: source.id)
-        dataVersion &+= 1
     }
 
     /// Pulls age and sex from Health so the estimators have what they need without the
@@ -282,11 +334,5 @@ final class AppModel {
         if let birthDate = characteristics.birthDate { profile.birthDate = birthDate }
         if let sex = characteristics.sex { profile.sex = sex }
         settings.profile = profile
-    }
-
-    // MARK: - Queries for views
-
-    func liveValues(kind: MetricKind) -> [String: Reading] {
-        ComparisonEngine.latestBySource(from: store.readings(kind: kind), kind: kind)
     }
 }

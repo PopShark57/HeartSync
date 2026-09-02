@@ -58,12 +58,23 @@ enum Estimators {
             (diastolic - diastolicMargin)...(diastolic + diastolicMargin)
         }
 
-        static let disclaimer = """
-            This is not a blood pressure measurement. It is an estimate of how far your \
-            cardiovascular state has drifted from your last cuff reading, based on heart \
-            rate and HRV. Do not use it to make any medical decision, to diagnose \
-            hypertension, or to adjust medication. Use a validated cuff.
-            """
+        /// The medical caveat shown with every estimate.
+        ///
+        /// Localized because a caveat the reader cannot read is not a caveat. A
+        /// translation must keep all four claims intact and equally blunt: this is not a
+        /// measurement, it is drift from the user's own cuff calibration, it must not
+        /// inform any medical decision, and a validated cuff is the only real answer.
+        /// Softening any of them in another language is a safety regression.
+        static let disclaimer = String(
+            localized: "estimate.bloodPressure.disclaimer",
+            defaultValue: """
+                This is not a blood pressure measurement. It is an estimate of how far your \
+                cardiovascular state has drifted from your last cuff reading, based on heart \
+                rate and HRV. Do not use it to make any medical decision, to diagnose \
+                hypertension, or to adjust medication. Use a validated cuff.
+                """,
+            comment: "Mandatory disclaimer shown wherever the estimated blood pressure appears. Keep every clause: not a measurement, drift from the user's own cuff calibration, not for medical decisions, use a validated cuff."
+        )
     }
 
     /// mmHg of systolic change modelled per bpm of heart-rate change from the calibration

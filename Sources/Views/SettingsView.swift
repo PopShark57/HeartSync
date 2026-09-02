@@ -65,13 +65,15 @@ struct SettingsView: View {
                     LabeledContent("Stored readings") {
                         Text("\(model.store.readings.count)").foregroundStyle(.secondary)
                     }
+                    .accessibilityElement(children: .combine)
                     Button("Delete all readings", role: .destructive) {
                         showingDeleteConfirmation = true
                     }
+                    .accessibilityHint("Asks for confirmation first. Configured devices and anything already written to Apple Health are kept.")
                 } header: {
                     Text("Data")
                 } footer: {
-                    Text("All readings stay on this device. HeartSync has no account, no server, and sends nothing anywhere except the requests it makes to Oura on your behalf.")
+                    Text(retentionFooter)
                 }
 
                 Section {
@@ -112,13 +114,21 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                     }
+                    // "120/80" is spoken as "120 slash 80" without this.
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Calibrated at")
+                    .accessibilityValue("\(Int(calibration.systolic)) over \(Int(calibration.diastolic)) millimetres of mercury")
                     LabeledContent(calibration.isExpired ? "Expired" : "Expires") {
                         Text(calibration.expiresAt, format: .dateTime.day().month().year())
                             .foregroundStyle(calibration.isExpired ? .red : .secondary)
                     }
+                    // Red is the only visual marker that the anchor is stale; the label says it.
+                    .accessibilityElement(children: .combine)
                     Button("Re-calibrate") { showingCalibration = true }
+                        .accessibilityHint("Replaces the cuff reading the blood pressure index is anchored to")
                 } else {
                     Button("Add cuff calibration") { showingCalibration = true }
+                        .accessibilityHint("Anchors the blood pressure index to a reading from a validated cuff")
                 }
             }
         } header: {
@@ -126,6 +136,31 @@ struct SettingsView: View {
         } footer: {
             Text("No ring or watch can measure blood pressure optically. What HeartSync shows is a trend index: how far your heart rate and HRV have drifted from where they were when you took a real cuff reading. It is not a blood pressure measurement and must not be used for any medical decision. Real cuff readings from a Bluetooth or Health-connected monitor are shown separately, as measurements.")
         }
+    }
+
+    /// Retention footer, which has to be honest about the difference between how *long*
+    /// history is kept and at what *fidelity*.
+    ///
+    /// The picker only chooses the first. `HealthStore` compacts anything older than
+    /// `compactionAge` down to one median per device per `ComparisonEngine` window — the
+    /// same windowed median the Compare tab and every export already consume — so a year of
+    /// retention is a year of windowed medians, not a year of raw one-per-second samples.
+    /// The comparison median and verdict survive, but raw counts, within-window spread, and
+    /// the ability to incorporate a late correction do not; a user picking "1 year" deserves
+    /// to read that here rather than discover it from a thinning chart.
+    /// The age is read from the store rather than hard-coded so the two cannot drift apart.
+    private var retentionFooter: String {
+        let days = max(1, Int((model.store.compactionAge / 86_400).rounded()))
+        return """
+        All readings stay on this device. HeartSync has no account, no server, and sends \
+        nothing anywhere except the requests it makes to Oura on your behalf.
+
+        Readings older than \(days) days are permanently compacted: each device's samples \
+        within a comparison window are replaced by that window's median. This preserves the \
+        comparison value and verdict, but discards individual samples, raw sample counts, \
+        within-window variation, and later corrections to that window. A longer retention \
+        therefore keeps a longer history of fixed windowed medians, not every raw sample.
+        """
     }
 
     private var profileSummary: String {
@@ -225,11 +260,17 @@ private struct BPCalibrationView: View {
                             .foregroundStyle(currentHR == nil ? .red : .secondary)
                             .monospacedDigit()
                     }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Current heart rate")
+                    .accessibilityValue(currentHR.map { "\(Int($0)) beats per minute" } ?? "No reading")
                     LabeledContent("Current HRV (RMSSD)") {
                         Text(currentRMSSD.map { "\(Int($0)) ms" } ?? "Not available")
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                     }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Current HRV, RMSSD")
+                    .accessibilityValue(currentRMSSD.map { "\(Int($0)) milliseconds" } ?? "Not available")
                 } header: {
                     Text("Reference state")
                 } footer: {

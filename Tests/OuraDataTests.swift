@@ -188,7 +188,9 @@ struct OuraDataModelTests {
     @MainActor
     @Test("Corrected Oura readings replace the same stable id instead of duplicating")
     func correctedOuraReadingUpsert() {
-        let store = HealthStore()
+        // Persistence off: a unit test must not write readings.json into the real
+        // Application Support container shared with the installed app.
+        let store = HealthStore(persistenceEnabled: false)
         let stableID = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
         let timestamp = Date(timeIntervalSince1970: 1_777_030_400)
         let first = Reading(
@@ -206,12 +208,19 @@ struct OuraDataModelTests {
             start: timestamp
         )
 
-        #expect(store.upsert(contentsOf: [first]) == 1)
-        #expect(store.upsert(contentsOf: [corrected]) == 1)
+        // upsert(contentsOf:) returns the readings it actually stored: new records
+        // plus genuine revisions. An identical resend stores nothing and returns [].
+        let inserted = store.upsert(contentsOf: [first])
+        #expect(inserted.count == 1)
+        #expect(inserted.first?.value == 61)
+        let revised = store.upsert(contentsOf: [corrected])
+        #expect(revised.count == 1)
+        #expect(revised.first?.id == stableID)
+        #expect(revised.first?.value == 63)
         #expect(store.readings.count == 1)
         #expect(store.readings.first?.id == stableID)
         #expect(store.readings.first?.value == 63)
-        #expect(store.upsert(contentsOf: [corrected]) == 0)
+        #expect(store.upsert(contentsOf: [corrected]).isEmpty)
         #expect(store.readings.count == 1)
     }
 }
@@ -371,8 +380,10 @@ private final class OuraRequestShapeURLProtocol: URLProtocol, @unchecked Sendabl
             })
             switch components.path {
             case "/v2/usercollection/daily_activity":
-                guard query["start_date"] == "2026-08-01",
-                      query["end_date"] == "2026-08-03",
+                // Day queries are padded by one day on each side so a document whose
+                // ring-local calendar day differs from its UTC day is still fetched.
+                guard query["start_date"] == "2026-07-31",
+                      query["end_date"] == "2026-08-04",
                       query["start_datetime"] == nil,
                       query["end_datetime"] == nil
                 else { throw OuraURLProtocolError.unexpectedRequest("Daily query used the wrong parameters") }

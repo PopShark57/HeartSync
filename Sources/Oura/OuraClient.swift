@@ -13,24 +13,32 @@ struct OuraClient: Sendable {
         case transport(String)
         case decoding(String)
 
+        /// User-facing failure text.
+        ///
+        /// Where Oura itself supplied a `detail`, that server string is shown unchanged:
+        /// it is already the most specific explanation available and HeartSync must not
+        /// paraphrase it. Only HeartSync's own fallback wording is localized.
         var errorDescription: String? {
             switch self {
             case .missingToken:
-                "No Oura authorization is saved. Connect your Oura account to sync."
+                String(localized: "oura.failure.missingToken", defaultValue: "No Oura authorization is saved. Connect your Oura account to sync.", comment: "Oura API error: no credential in Keychain. Oura is a brand name and is not translated.")
             case .unauthorized(let detail):
-                detail ?? "Oura authorization expired or was revoked. Connect your account again."
+                detail ?? String(localized: "oura.failure.unauthorized", defaultValue: "Oura authorization expired or was revoked. Connect your account again.", comment: "Oura API error: HTTP 401 with no server detail")
             case .forbidden(let detail):
-                detail ?? "Oura denied this data request. Its permission may be missing, or the Oura membership may not include API access."
+                detail ?? String(localized: "oura.failure.forbidden", defaultValue: "Oura denied this data request. Its permission may be missing, or the Oura membership may not include API access.", comment: "Oura API error: HTTP 403 with no server detail")
             case .rateLimited(let retryAfter, let detail):
                 if let detail { detail }
-                else if let retryAfter { "Oura is rate-limiting requests. Try again in \(retryAfter) seconds." }
-                else { "Oura is rate-limiting requests. HeartSync will try again later." }
+                else if let retryAfter {
+                    String(localized: "oura.failure.rateLimited.retryAfter", defaultValue: "Oura is rate-limiting requests. Try again in \(retryAfter) seconds.", comment: "Oura API error: HTTP 429 where the server sent a Retry-After delay in seconds")
+                } else {
+                    String(localized: "oura.failure.rateLimited", defaultValue: "Oura is rate-limiting requests. HeartSync will try again later.", comment: "Oura API error: HTTP 429 with no Retry-After header")
+                }
             case .http(let code, let detail):
-                detail ?? "Oura returned HTTP \(code)."
+                detail ?? String(localized: "oura.failure.http", defaultValue: "Oura returned HTTP \(code).", comment: "Oura API error: an unexpected HTTP status code with no server detail")
             case .transport(let message):
-                "Could not reach Oura: \(message)"
+                String(localized: "oura.failure.transport", defaultValue: "Could not reach Oura: \(message)", comment: "Oura API error: the request never completed. The placeholder is the system network error.")
             case .decoding(let message):
-                "Oura returned data HeartSync could not read: \(message)"
+                String(localized: "oura.failure.decoding", defaultValue: "Oura returned data HeartSync could not read: \(message)", comment: "Oura API error: the response did not decode. The placeholder is the decoding error.")
             }
         }
     }
@@ -49,6 +57,24 @@ struct OuraClient: Sendable {
     private struct Page<T: Decodable & Sendable>: Decodable, Sendable {
         var data: [T]
         var next_token: String?
+    }
+
+    /// The records of a paginated collection together with whether the page walk was cut
+    /// short by this client's own ceiling.
+    ///
+    /// Returning a bare array made that ceiling invisible: the caller marked the collection
+    /// available with a record count and the UI presented a partial fortnight as complete.
+    /// Truncation therefore travels with the data. The `RandomAccessCollection` conformance
+    /// keeps `count`, `isEmpty`, and iteration working for callers that only want records.
+    struct PagedResult<Element: Sendable>: RandomAccessCollection, Sendable {
+        var records: [Element]
+        /// True when Oura still offered a `next_token` at the page ceiling, so the caller
+        /// holds a prefix of the collection rather than all of it.
+        var isTruncated: Bool
+
+        var startIndex: Int { records.startIndex }
+        var endIndex: Int { records.endIndex }
+        subscript(position: Int) -> Element { records[position] }
     }
 
     private struct APIProblem: Decodable, Sendable {
@@ -334,88 +360,103 @@ struct OuraClient: Sendable {
         try await get(PersonalInfo.self, path: "personal_info", query: [])
     }
 
-    func heartRate(from start: Date, to end: Date) async throws -> [HeartRatePoint] {
+    func heartRate(from start: Date, to end: Date) async throws -> PagedResult<HeartRatePoint> {
         try await paged(HeartRatePoint.self, path: "heartrate", query: Self.dateTimeQuery(start, end))
     }
 
-    func ringBatteryLevels(from start: Date, to end: Date) async throws -> [RingBatteryLevel] {
+    func ringBatteryLevels(from start: Date, to end: Date) async throws -> PagedResult<RingBatteryLevel> {
         try await paged(RingBatteryLevel.self, path: "ring_battery_level", query: Self.dateTimeQuery(start, end))
     }
 
-    func dailyActivity(from start: Date, to end: Date) async throws -> [DailyActivity] {
+    func dailyActivity(from start: Date, to end: Date) async throws -> PagedResult<DailyActivity> {
         try await paged(DailyActivity.self, path: "daily_activity", query: Self.dayQuery(start, end))
     }
 
-    func dailyReadiness(from start: Date, to end: Date) async throws -> [DailyReadiness] {
+    func dailyReadiness(from start: Date, to end: Date) async throws -> PagedResult<DailyReadiness> {
         try await paged(DailyReadiness.self, path: "daily_readiness", query: Self.dayQuery(start, end))
     }
 
-    func dailySleep(from start: Date, to end: Date) async throws -> [DailySleep] {
+    func dailySleep(from start: Date, to end: Date) async throws -> PagedResult<DailySleep> {
         try await paged(DailySleep.self, path: "daily_sleep", query: Self.dayQuery(start, end))
     }
 
-    func dailySpO2(from start: Date, to end: Date) async throws -> [DailySpO2] {
+    func dailySpO2(from start: Date, to end: Date) async throws -> PagedResult<DailySpO2> {
         try await paged(DailySpO2.self, path: "daily_spo2", query: Self.dayQuery(start, end))
     }
 
-    func dailyStress(from start: Date, to end: Date) async throws -> [DailyStress] {
+    func dailyStress(from start: Date, to end: Date) async throws -> PagedResult<DailyStress> {
         try await paged(DailyStress.self, path: "daily_stress", query: Self.dayQuery(start, end))
     }
 
-    func dailyResilience(from start: Date, to end: Date) async throws -> [DailyResilience] {
+    func dailyResilience(from start: Date, to end: Date) async throws -> PagedResult<DailyResilience> {
         try await paged(DailyResilience.self, path: "daily_resilience", query: Self.dayQuery(start, end))
     }
 
-    func dailyCardiovascularAge(from start: Date, to end: Date) async throws -> [DailyCardiovascularAge] {
+    func dailyCardiovascularAge(from start: Date, to end: Date) async throws -> PagedResult<DailyCardiovascularAge> {
         try await paged(DailyCardiovascularAge.self, path: "daily_cardiovascular_age", query: Self.dayQuery(start, end))
     }
 
-    func sleep(from start: Date, to end: Date) async throws -> [SleepDocument] {
+    func sleep(from start: Date, to end: Date) async throws -> PagedResult<SleepDocument> {
         try await paged(SleepDocument.self, path: "sleep", query: Self.dayQuery(start, end))
     }
 
-    func sleepTime(from start: Date, to end: Date) async throws -> [SleepTimeDocument] {
+    func sleepTime(from start: Date, to end: Date) async throws -> PagedResult<SleepTimeDocument> {
         try await paged(SleepTimeDocument.self, path: "sleep_time", query: Self.dayQuery(start, end))
     }
 
-    func vo2Max(from start: Date, to end: Date) async throws -> [VO2MaxDocument] {
+    func vo2Max(from start: Date, to end: Date) async throws -> PagedResult<VO2MaxDocument> {
         try await paged(VO2MaxDocument.self, path: "vO2_max", query: Self.dayQuery(start, end))
     }
 
-    func workouts(from start: Date, to end: Date) async throws -> [Workout] {
+    func workouts(from start: Date, to end: Date) async throws -> PagedResult<Workout> {
         try await paged(Workout.self, path: "workout", query: Self.dayQuery(start, end))
     }
 
-    func sessions(from start: Date, to end: Date) async throws -> [SessionDocument] {
+    func sessions(from start: Date, to end: Date) async throws -> PagedResult<SessionDocument> {
         try await paged(SessionDocument.self, path: "session", query: Self.dayQuery(start, end))
     }
 
-    func tags(from start: Date, to end: Date) async throws -> [TagDocument] {
+    func tags(from start: Date, to end: Date) async throws -> PagedResult<TagDocument> {
         try await paged(TagDocument.self, path: "tag", query: Self.dayQuery(start, end))
     }
 
-    func enhancedTags(from start: Date, to end: Date) async throws -> [EnhancedTagDocument] {
+    func enhancedTags(from start: Date, to end: Date) async throws -> PagedResult<EnhancedTagDocument> {
         try await paged(EnhancedTagDocument.self, path: "enhanced_tag", query: Self.dayQuery(start, end))
     }
 
-    func restModePeriods(from start: Date, to end: Date) async throws -> [RestModePeriod] {
+    func restModePeriods(from start: Date, to end: Date) async throws -> PagedResult<RestModePeriod> {
         try await paged(RestModePeriod.self, path: "rest_mode_period", query: Self.dayQuery(start, end))
     }
 
-    func ringConfigurations() async throws -> [RingConfiguration] {
+    func ringConfigurations() async throws -> PagedResult<RingConfiguration> {
         try await paged(RingConfiguration.self, path: "ring_configuration", query: [])
     }
 
     // MARK: - Transport
 
+    /// Bounds one collection's page walk so a deep or looping cursor cannot hold a
+    /// sequential sync open indefinitely.
+    private static let maximumPages = 25
+
+    /// A rate limit is retried at most this many times before the failure is surfaced.
+    private static let maximumRateLimitRetries = 2
+
+    /// The longest this client will sleep inline for a single `Retry-After`.
+    ///
+    /// A sync issues 19 sequential requests; sleeping through a minute-long wait on each of
+    /// them would stall the cycle for a quarter of an hour. A longer wait is therefore not
+    /// slept through at all — the failure is reported so `OuraManager` can back off its own
+    /// sync cadence, which is the right place for a multi-minute wait.
+    private static let maximumRateLimitWait: TimeInterval = 8
+
     private func paged<T: Decodable & Sendable>(
         _ type: T.Type,
         path: String,
         query: [URLQueryItem]
-    ) async throws -> [T] {
+    ) async throws -> PagedResult<T> {
         var results: [T] = []
         var nextToken: String?
-        var pagesRemaining = 25
+        var pagesRemaining = Self.maximumPages
 
         repeat {
             var pageQuery = query
@@ -426,10 +467,53 @@ struct OuraClient: Sendable {
             pagesRemaining -= 1
         } while nextToken != nil && pagesRemaining > 0
 
-        return results
+        // A surviving token means Oura had more to give: the caller holds a prefix, and
+        // must not describe it as the whole collection.
+        return PagedResult(records: results, isTruncated: nextToken != nil)
     }
 
+    /// Performs one request, retrying only a rate limit and only within the bounds above.
+    ///
+    /// Task cancellation ends the wait immediately; the original rate-limit failure is then
+    /// reported rather than the sleep's cancellation, because that is the condition the
+    /// caller has to reason about.
     private func get<T: Decodable & Sendable>(
+        _ type: T.Type,
+        path: String,
+        query: [URLQueryItem]
+    ) async throws -> T {
+        var attempt = 0
+        while true {
+            do {
+                return try await perform(type, path: path, query: query)
+            } catch let failure as Failure {
+                guard case .rateLimited(let retryAfter, _) = failure,
+                      attempt < Self.maximumRateLimitRetries,
+                      !Task.isCancelled,
+                      let delay = Self.rateLimitDelay(retryAfter: retryAfter, attempt: attempt)
+                else { throw failure }
+                do {
+                    try await Task.sleep(for: .seconds(delay))
+                } catch {
+                    throw failure
+                }
+                attempt += 1
+            }
+        }
+    }
+
+    /// Nil means "do not retry here": Oura asked for longer than this client is willing to
+    /// hold the sync open. Without a `Retry-After` header the wait doubles from one second.
+    private static func rateLimitDelay(retryAfter: Int?, attempt: Int) -> TimeInterval? {
+        guard let retryAfter else {
+            return min(maximumRateLimitWait, TimeInterval(1 << attempt))
+        }
+        guard retryAfter > 0 else { return 0 }
+        let requested = TimeInterval(retryAfter)
+        return requested <= maximumRateLimitWait ? requested : nil
+    }
+
+    private func perform<T: Decodable & Sendable>(
         _ type: T.Type,
         path: String,
         query: [URLQueryItem]
@@ -455,17 +539,19 @@ struct OuraClient: Sendable {
         }
 
         guard let http = response as? HTTPURLResponse else { throw Failure.transport("No HTTP response") }
-        let detail = (try? JSONDecoder().decode(APIProblem.self, from: data))?.bestMessage
+        // The problem envelope is decoded only on a failure. Decoding it ahead of the status
+        // check parsed every successful response twice, including multi-megabyte heart-rate
+        // pages, for a detail string that a 2xx body never carries.
         switch http.statusCode {
         case 200...299: break
-        case 401: throw Failure.unauthorized(detail)
-        case 403: throw Failure.forbidden(detail)
+        case 401: throw Failure.unauthorized(Self.problemDetail(data))
+        case 403: throw Failure.forbidden(Self.problemDetail(data))
         case 429:
             throw Failure.rateLimited(
                 retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init),
-                detail: detail
+                detail: Self.problemDetail(data)
             )
-        default: throw Failure.http(http.statusCode, detail)
+        default: throw Failure.http(http.statusCode, Self.problemDetail(data))
         }
 
         do {
@@ -473,6 +559,10 @@ struct OuraClient: Sendable {
         } catch {
             throw Failure.decoding(error.localizedDescription)
         }
+    }
+
+    private static func problemDetail(_ data: Data) -> String? {
+        (try? JSONDecoder().decode(APIProblem.self, from: data))?.bestMessage
     }
 
     // MARK: - Dates
@@ -494,21 +584,75 @@ struct OuraClient: Sendable {
         return iso8601.date(from: string) ?? iso8601Fractional.date(from: string)
     }
 
+    /// Oura's `day` is a calendar date in the ring's own timezone, and the API never says
+    /// which zone that was. Parsing it in `TimeZone.current` made the decoded instant depend
+    /// on where the phone was standing: after the user changed zones the same document
+    /// produced a different `Reading.start`, silently moving archived history between
+    /// comparison windows.
+    ///
+    /// UTC is used instead. Determinism matters more here than a few hours of nominal
+    /// offset, because these readings are compared in 86,400-second epoch-aligned buckets
+    /// and UTC midnight is exactly a bucket boundary — a day document lands inside one whole
+    /// window instead of straddling two, in every timezone, forever.
+    ///
+    /// Reading identity is deliberately unaffected. `oura.spo2.<document id>`,
+    /// `oura.sleep.<document id>.<tag>`, `oura.vo2.<document id>` and
+    /// `oura.hr.<timestamp string>` are all derived from Oura's own strings and never from a
+    /// parsed `Date`, so no stable id moves and `upsert` still corrects a reading in place
+    /// rather than duplicating it. Archived readings keep their old `start` until the next
+    /// sync re-fetches that day and upserts them under the same id.
     private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current
+        formatter.timeZone = .gmt
         formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    /// Display formatter for day strings, anchored to the same zone as `dayFormatter`.
+    ///
+    /// `parseDay` returns UTC midnight, so rendering that date in the phone's zone would
+    /// print "Aug 31" for `2026-09-01` anywhere west of Greenwich. Only the calendar date is
+    /// zone-pinned; the format itself still follows the user's locale.
+    private static let dayLabelFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = .autoupdatingCurrent
+        formatter.timeZone = .gmt
+        formatter.setLocalizedDateFormatFromTemplate("yMMMd")
         return formatter
     }()
 
     static func parseDay(_ string: String) -> Date? { dayFormatter.date(from: string) }
 
+    /// Nil when `day` is not a `yyyy-MM-dd` string; callers show the raw value instead.
+    static func dayLabel(_ day: String) -> String? {
+        guard let date = parseDay(day) else { return nil }
+        return dayLabelFormatter.string(from: date)
+    }
+
+    /// For dates that came from `parseDay`, where the local zone must not shift the label.
+    static func dayLabel(for date: Date) -> String { dayLabelFormatter.string(from: date) }
+
+    /// Day queries are widened by a day on each side.
+    ///
+    /// The window bounds are instants, but the API filters on calendar dates in Oura's
+    /// reckoning. Formatting those instants in UTC can name a date one short of what the
+    /// user considers today or a fortnight ago. A day of padding absorbs that entirely; the
+    /// extra documents are merged by id, so they cost one comparison, not a duplicate.
+    static let dayQueryPadding: TimeInterval = 86_400
+
     private static func dayQuery(_ start: Date, _ end: Date) -> [URLQueryItem] {
         [
-            URLQueryItem(name: "start_date", value: dayFormatter.string(from: start)),
-            URLQueryItem(name: "end_date", value: dayFormatter.string(from: end)),
+            URLQueryItem(
+                name: "start_date",
+                value: dayFormatter.string(from: start.addingTimeInterval(-dayQueryPadding))
+            ),
+            URLQueryItem(
+                name: "end_date",
+                value: dayFormatter.string(from: end.addingTimeInterval(dayQueryPadding))
+            ),
         ]
     }
 

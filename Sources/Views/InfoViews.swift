@@ -27,6 +27,13 @@ struct MetricSourcesView: View {
                                 .font(.caption)
                         }
                         .padding(.vertical, 2)
+                        // Availability is drawn as a green tick against a grey dash: two
+                        // glyphs a screen reader announces identically, or not at all. State
+                        // it in words, ahead of the explanation it qualifies.
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(
+                            "\(row.transport.title) for \(entry.kind.title). \(row.available ? "Available" : "Not available"). \(row.detail)"
+                        )
                     }
                 } header: {
                     Label(entry.kind.title, systemImage: entry.kind.systemImage)
@@ -152,8 +159,12 @@ struct DisclaimerView: View {
 
     private func bullet(_ text: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
-            Text("\u{2022}").foregroundStyle(.secondary)
+            // Decorative: VoiceOver would otherwise prefix every line with "bullet".
+            Text("\u{2022}")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Text(text).font(.subheadline).fixedSize(horizontal: false, vertical: true)
         }
+        .accessibilityElement(children: .combine)
     }
 }

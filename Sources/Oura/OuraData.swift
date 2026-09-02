@@ -25,27 +25,48 @@ enum OuraEndpoint: String, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
+    /// Collection name for the Oura screen. Display only — `rawValue` stays the
+    /// identifier used for endpoint state, issues, and the request paths.
     var title: String {
         switch self {
-        case .personalInfo:       "Profile"
-        case .heartRate:          "Heart rate"
-        case .dailyActivity:      "Activity"
-        case .dailyReadiness:     "Readiness"
-        case .dailySleep:         "Sleep score"
-        case .detailedSleep:      "Sleep signals"
-        case .sleepTime:          "Bedtime guidance"
-        case .dailySpO2:          "Blood oxygen"
-        case .dailyStress:        "Stress"
-        case .dailyResilience:    "Resilience"
-        case .cardiovascularAge:  "Cardiovascular age"
-        case .vo2Max:             "VO₂ max"
-        case .workouts:           "Workouts"
-        case .sessions:           "Sessions"
-        case .tags:               "Tags"
-        case .enhancedTags:       "Enhanced tags"
-        case .restMode:           "Rest mode"
-        case .ringBattery:        "Ring battery"
-        case .ringConfiguration:  "Ring details"
+        case .personalInfo:
+            String(localized: "ouraEndpoint.personalInfo", defaultValue: "Profile", comment: "Oura collection name: account profile")
+        case .heartRate:
+            String(localized: "ouraEndpoint.heartRate", defaultValue: "Heart rate", comment: "Oura collection name: heart rate samples")
+        case .dailyActivity:
+            String(localized: "ouraEndpoint.dailyActivity", defaultValue: "Activity", comment: "Oura collection name: daily activity")
+        case .dailyReadiness:
+            String(localized: "ouraEndpoint.dailyReadiness", defaultValue: "Readiness", comment: "Oura collection name: daily readiness score")
+        case .dailySleep:
+            String(localized: "ouraEndpoint.dailySleep", defaultValue: "Sleep score", comment: "Oura collection name: daily sleep score")
+        case .detailedSleep:
+            String(localized: "ouraEndpoint.detailedSleep", defaultValue: "Sleep signals", comment: "Oura collection name: detailed per-sleep documents")
+        case .sleepTime:
+            String(localized: "ouraEndpoint.sleepTime", defaultValue: "Bedtime guidance", comment: "Oura collection name: recommended bedtime window")
+        case .dailySpO2:
+            String(localized: "ouraEndpoint.dailySpO2", defaultValue: "Blood oxygen", comment: "Oura collection name: daily blood oxygen saturation")
+        case .dailyStress:
+            String(localized: "ouraEndpoint.dailyStress", defaultValue: "Stress", comment: "Oura collection name: daily stress")
+        case .dailyResilience:
+            String(localized: "ouraEndpoint.dailyResilience", defaultValue: "Resilience", comment: "Oura collection name: daily resilience")
+        case .cardiovascularAge:
+            String(localized: "ouraEndpoint.cardiovascularAge", defaultValue: "Cardiovascular age", comment: "Oura collection name: cardiovascular age")
+        case .vo2Max:
+            String(localized: "ouraEndpoint.vo2Max", defaultValue: "VO₂ max", comment: "Oura collection name: VO2 max")
+        case .workouts:
+            String(localized: "ouraEndpoint.workouts", defaultValue: "Workouts", comment: "Oura collection name: workouts")
+        case .sessions:
+            String(localized: "ouraEndpoint.sessions", defaultValue: "Sessions", comment: "Oura collection name: guided sessions")
+        case .tags:
+            String(localized: "ouraEndpoint.tags", defaultValue: "Tags", comment: "Oura collection name: legacy tags")
+        case .enhancedTags:
+            String(localized: "ouraEndpoint.enhancedTags", defaultValue: "Enhanced tags", comment: "Oura collection name: enhanced tags")
+        case .restMode:
+            String(localized: "ouraEndpoint.restMode", defaultValue: "Rest mode", comment: "Oura collection name: rest mode periods")
+        case .ringBattery:
+            String(localized: "ouraEndpoint.ringBattery", defaultValue: "Ring battery", comment: "Oura collection name: ring battery level")
+        case .ringConfiguration:
+            String(localized: "ouraEndpoint.ringConfiguration", defaultValue: "Ring details", comment: "Oura collection name: ring hardware details")
         }
     }
 
@@ -82,9 +103,38 @@ enum OuraEndpointState: Equatable, Sendable {
     case idle
     case syncing
     case available(Int)
+    /// Oura had more pages than one sync is allowed to walk. The count is real, but it is a
+    /// prefix of the collection and must never be presented as the complete set.
+    case partial(Int)
     case permissionMissing
     case failed(String)
+
+    /// How many records the collection currently holds, or nil when it holds none because
+    /// it was never fetched, is in flight, or failed.
+    var recordCount: Int? {
+        switch self {
+        case .available(let count), .partial(let count): return count
+        case .idle, .syncing, .permissionMissing, .failed: return nil
+        }
+    }
+
+    /// False whenever the screen would overstate what HeartSync actually has.
+    var isComplete: Bool {
+        switch self {
+        case .available: true
+        case .idle, .syncing, .partial, .permissionMissing, .failed: false
+        }
+    }
 }
+
+/// Lets `OuraManager.load` notice a truncated page walk without knowing the record type.
+/// `load` is generic over whatever the collection's request returns, so the flag has to be
+/// reachable through an existential rather than the concrete `PagedResult` element type.
+protocol OuraTruncatableResult {
+    var isTruncated: Bool { get }
+}
+
+extension OuraClient.PagedResult: OuraTruncatableResult {}
 
 struct OuraEndpointIssue: Identifiable, Equatable, Sendable {
     var endpoint: OuraEndpoint
@@ -118,6 +168,25 @@ struct OuraSnapshot: Codable, Hashable, Sendable {
     var restModePeriods: [OuraClient.RestModePeriod] = []
     var batteryLevels: [OuraClient.RingBatteryLevel] = []
     var ringConfigurations: [OuraClient.RingConfiguration] = []
+
+    /// Per-collection high-water mark, keyed by `OuraEndpoint.rawValue`: the instant through
+    /// which that collection was last fetched successfully. The next sync asks only for what
+    /// came after it (less a deliberate overlap), instead of re-downloading the same
+    /// fortnight every quarter of an hour.
+    ///
+    /// Defaulted and keyed by string so an archive written by the shipping build still
+    /// decodes; an absent mark simply means "fetch the full window".
+    var collectionSyncMarks: [String: Date] = [:]
+
+    /// When the last full-window pass completed. Incremental fetches can only ever see what
+    /// Oura chose to return for recent days, so a periodic full backfill still runs to pick
+    /// up late corrections and anything an earlier failure missed.
+    var lastFullBackfillAt: Date?
+
+    /// Collections whose last page walk hit the client's page ceiling, by
+    /// `OuraEndpoint.rawValue`. Persisted so a relaunch does not describe a cached prefix as
+    /// a complete collection.
+    var truncatedCollections: Set<String> = []
 
     var hasData: Bool {
         personalInfo != nil || totalRecordCount > 0
@@ -166,5 +235,70 @@ struct OuraSnapshot: Codable, Hashable, Sendable {
             (OuraClient.parseTimestamp($0.set_up_at) ?? .distantPast)
                 < (OuraClient.parseTimestamp($1.set_up_at) ?? .distantPast)
         }
+    }
+}
+
+extension OuraSnapshot {
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case fetchedAt
+        case personalInfo
+        case heartRates
+        case activities
+        case readiness
+        case sleepScores
+        case sleeps
+        case sleepTimes
+        case oxygen
+        case stress
+        case resilience
+        case cardiovascularAge
+        case vo2Max
+        case workouts
+        case sessions
+        case tags
+        case enhancedTags
+        case restModePeriods
+        case batteryLevels
+        case ringConfigurations
+        case collectionSyncMarks
+        case lastFullBackfillAt
+        case truncatedCollections
+    }
+
+    /// Reads both the current cache and the bare snapshot written before incremental sync.
+    ///
+    /// Synthesised `Decodable` does not use a stored property's declaration-time default
+    /// when its key is absent. Without this initializer, the newly added non-optional
+    /// `collectionSyncMarks` and `truncatedCollections` keys make every existing Oura cache
+    /// fail decoding and get preserved aside as corrupt. All collections default to empty
+    /// as an additional compatibility guard for snapshots written before a collection was
+    /// introduced; missing cached data means "fetch it", not "discard the whole cache".
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        fetchedAt = try values.decodeIfPresent(Date.self, forKey: .fetchedAt)
+        personalInfo = try values.decodeIfPresent(OuraClient.PersonalInfo.self, forKey: .personalInfo)
+        heartRates = try values.decodeIfPresent([OuraClient.HeartRatePoint].self, forKey: .heartRates) ?? []
+        activities = try values.decodeIfPresent([OuraClient.DailyActivity].self, forKey: .activities) ?? []
+        readiness = try values.decodeIfPresent([OuraClient.DailyReadiness].self, forKey: .readiness) ?? []
+        sleepScores = try values.decodeIfPresent([OuraClient.DailySleep].self, forKey: .sleepScores) ?? []
+        sleeps = try values.decodeIfPresent([OuraClient.SleepDocument].self, forKey: .sleeps) ?? []
+        sleepTimes = try values.decodeIfPresent([OuraClient.SleepTimeDocument].self, forKey: .sleepTimes) ?? []
+        oxygen = try values.decodeIfPresent([OuraClient.DailySpO2].self, forKey: .oxygen) ?? []
+        stress = try values.decodeIfPresent([OuraClient.DailyStress].self, forKey: .stress) ?? []
+        resilience = try values.decodeIfPresent([OuraClient.DailyResilience].self, forKey: .resilience) ?? []
+        cardiovascularAge = try values.decodeIfPresent([OuraClient.DailyCardiovascularAge].self, forKey: .cardiovascularAge) ?? []
+        vo2Max = try values.decodeIfPresent([OuraClient.VO2MaxDocument].self, forKey: .vo2Max) ?? []
+        workouts = try values.decodeIfPresent([OuraClient.Workout].self, forKey: .workouts) ?? []
+        sessions = try values.decodeIfPresent([OuraClient.SessionDocument].self, forKey: .sessions) ?? []
+        tags = try values.decodeIfPresent([OuraClient.TagDocument].self, forKey: .tags) ?? []
+        enhancedTags = try values.decodeIfPresent([OuraClient.EnhancedTagDocument].self, forKey: .enhancedTags) ?? []
+        restModePeriods = try values.decodeIfPresent([OuraClient.RestModePeriod].self, forKey: .restModePeriods) ?? []
+        batteryLevels = try values.decodeIfPresent([OuraClient.RingBatteryLevel].self, forKey: .batteryLevels) ?? []
+        ringConfigurations = try values.decodeIfPresent([OuraClient.RingConfiguration].self, forKey: .ringConfigurations) ?? []
+        collectionSyncMarks = try values.decodeIfPresent([String: Date].self, forKey: .collectionSyncMarks) ?? [:]
+        lastFullBackfillAt = try values.decodeIfPresent(Date.self, forKey: .lastFullBackfillAt)
+        truncatedCollections = try values.decodeIfPresent(Set<String>.self, forKey: .truncatedCollections) ?? []
     }
 }

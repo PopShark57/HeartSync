@@ -1,8 +1,11 @@
-# HeartSync — Improvement Notes
+# HeartSync — Improvements and Resolutions
 
-A review of the code as it stands at `6f52d71`. Everything below was found by reading the
-sources; the app builds cleanly for `generic/platform=iOS Simulator` with no warnings from
-this codebase. Nothing here has been changed.
+The findings below were recorded against `6f52d71`. They have since been implemented and
+audited in the working tree described by `CODEX_HANDOFF.md`; each item now carries its own
+resolution status. On 2026-09-02 the app and hosted test bundle both compiled cleanly for
+`generic/platform=iOS Simulator`. No iOS simulator runtime is installed, so the hosted suite
+has **not** executed through Xcode. A native macOS harness executed 95 portable tests against
+symlinked production source; it excludes HealthKit, UIKit/views, and the real OAuth session.
 
 Items are grouped by kind and ordered roughly by impact within each group. Where a claim
 needs a physical device to confirm, that is said explicitly.
@@ -12,6 +15,12 @@ needs a physical device to confirm, that is said explicitly.
 ## 1. Correctness
 
 ### 1.1 Mirroring to Apple Health creates a phantom "HeartSync" device that compares against itself
+
+**Status: Fixed; physical HealthKit execution pending.** The query excludes `HKSource.default()`,
+the conversion core rejects this app's bundle identifier, startup removes the persisted
+phantom source and all its readings, and descriptor-based tests cover the filter, identity,
+scale conversion, and archive cleanup. Those HealthKit tests compiled but could not execute
+without an iOS runtime.
 
 **High.** When `mirrorBluetoothToHealthKit` is on, [`AppModel.ingest`](Sources/App/AppModel.swift:99)
 writes measured Bluetooth readings into HealthKit. The anchored queries that read HealthKit
@@ -47,6 +56,11 @@ that had mirroring enabled, and it can be tested without a device.
 
 ### 1.2 The "Now" screen calls devices "in agreement" using readings up to 15 minutes apart
 
+**Status: Fixed; UI runtime verification pending.** One bounded `DashboardSnapshot` now feeds
+every card. A badge and per-row delta exist only when the visible measured sources share the
+current or immediately preceding epoch-aligned comparison window; hidden stale sources are
+removed from that window's consensus and spread.
+
 **High.** [`MetricCard`](Sources/Views/DashboardView.swift:113) computes:
 
 ```swift
@@ -79,6 +93,10 @@ same gate.
 
 ### 1.3 Write-back mirrors readings the store rejected
 
+**Status: Fixed.** Batch append/upsert return the exact accepted readings, and `AppModel`
+mirrors only that subset after the measured-Bluetooth filter. Portable store tests cover
+duplicates within and across batches and genuine upsert revisions.
+
 **Medium.** [`AppModel.ingest`](Sources/App/AppModel.swift:91) guards on `accepted > 0` and
 then filters the *input* array, not the accepted subset:
 
@@ -96,6 +114,10 @@ IDs) rather than just a count, and mirror from that.
 
 ### 1.4 An Oura authorization failure leaves a collection stuck on "syncing"
 
+**Status: Fixed.** The failing endpoint is moved to `.failed` before the authorization abort,
+all other in-flight endpoints are returned to idle, and the portable Oura orchestration suite
+covers a non-scope 401 abort without a permanent spinner.
+
 **Medium.** [`OuraManager.load`](Sources/Oura/OuraManager.swift:297) sets
 `endpointStates[endpoint] = .syncing` before the request. On a non-scope 401 it calls
 `handleAuthorizationFailure` and throws `SyncAbort.authorization`
@@ -107,6 +129,10 @@ successful sync — and there will not be one, because the credential was just c
 still-`.idle` endpoints so the screen reflects "not attempted" rather than "in progress".
 
 ### 1.5 The HRV artefact filter does not do what its comment says, and stalls after a sustained rate change
+
+**Status: Fixed.** The filter now tracks sustained rate changes without laundering one- or
+two-beat artefacts, its actual heuristic is documented, and 19 portable HRV/body-location
+tests cover ramps, abrupt transitions, noise, reliability limits, and known tradeoffs.
 
 **Medium.** [`HRVCalculator.filterArtefacts`](Sources/Analysis/HRVCalculator.swift:51) is
 documented as a *successive-difference* filter — *"A genuine sinus rhythm does not jump more
@@ -138,6 +164,9 @@ Two separate issues:
 
 ### 1.6 Oura `day` strings are parsed in the phone's current time zone
 
+**Status: Fixed.** Day-only values are pinned to UTC, stable document IDs remain independent
+of parsed dates, and portable tests repeat the conversion under different process time zones.
+
 **Low.** [`OuraClient.dayFormatter`](Sources/Oura/OuraClient.swift:501) uses
 `timeZone = .current`. Oura's `day` is the ring's local day. After the user flies across
 time zones, the same document decodes to a different `start`, which shifts it into different
@@ -148,6 +177,9 @@ originating offset alongside the reading.
 
 ### 1.7 `presentationAnchor` force-unwraps a window
 
+**Status: Fixed; UIKit runtime verification pending.** The provider returns its retained
+window or re-resolves the active presentation window instead of force-unwrapping.
+
 **Low.** [`OuraOAuth.swift:225`](Sources/Oura/OuraOAuth.swift:225) is
 `presentationWindow!`. The comment argues it is captured before the session starts, which is
 true for the normal path — but `ASWebAuthenticationSession` can ask for the anchor again,
@@ -155,6 +187,10 @@ and the completion handler nils the field. A defensive fallback to
 `Self.activePresentationWindow()` costs nothing and removes a crash from an OAuth flow.
 
 ### 1.8 Loading settings immediately schedules a save of what was just loaded
+
+**Status: Fixed.** Hydration suppresses `didSet` persistence. The later safety audit also
+gave settings the archive's conclusive-load state and in-flight load sharing, so an unreadable
+protected `settings.json` is preserved and retried instead of overwritten with defaults.
 
 **Low.** [`AppSettings.snapshot`](Sources/Store/AppSettings.swift:28) has
 `didSet { scheduleSave() }`, and [`loadIfNeeded`](Sources/Store/AppSettings.swift:52)
@@ -172,6 +208,10 @@ default 30-day retention produces about **2.6 million**. The items below are fin
 documented scale and become serious well before the retention limits the UI actually offers.
 
 ### 2.1 The dashboard rescans the entire archive about 20 times per second
+
+**Status: Fixed.** The screen performs one bounded store pass into an immutable snapshot,
+precomputes metric order, and ticks only every 30 seconds for freshness/window rollover.
+Cards no longer read the store independently.
 
 **High.** [`DashboardView`](Sources/Views/DashboardView.swift:14) ticks a
 `Timer.publish(every: 1)` into `@State`, invalidating the whole view every second. On each
@@ -200,6 +240,10 @@ comparator — an O(n) lookup per comparison plus two force-unwraps. Precompute 
 
 ### 2.2 `MetricDetailView` recomputes its windowing roughly eight times per render
 
+**Status: Fixed.** `MetricDetailSnapshot` performs one metric read and one windowing pass,
+then supplies chart points, band, legend, domains, statistics, and pair analyses. HRV screens
+perform one additional bounded heart-rate read only for the same-device quality cross-check.
+
 **High.** [`chartWindows`](Sources/Views/MetricDetailView.swift:161) is a computed property
 that re-reads the store and re-runs `ComparisonEngine.windows`. It is consumed through three
 other computed properties, each of which is itself read multiple times in the body:
@@ -220,6 +264,9 @@ Hoist a single `let` snapshot at the top of `body`, exactly as
 
 ### 2.3 Ingest is O(n) per reading and schedules a save per reading
 
+**Status: Fixed.** Validated, de-duplicated batches use a stable linear merge and schedule one
+coalesced save. In-order live data extends the indexes without rebuilding them.
+
 **High.** [`HealthStore.append`](Sources/Store/HealthStore.swift:117):
 
 - `readings.lastIndex { $0.end <= reading.end }` scans backwards — cheap for in-order live
@@ -235,6 +282,10 @@ pass (both sides are sorted, so a linear merge beats *m* insertions), and calls
 
 ### 2.4 `upsert(contentsOf:)` is O(n·m)
 
+**Status: Fixed.** The store maintains an ID-to-position index and a per-metric position
+index, rebuilding them after mutations that shift positions. Adversarial portable tests cover
+interleaved append/upsert/remove/prune/compact operations and compare each index to a scan.
+
 **High.** [Line 153](Sources/Store/HealthStore.swift:153) does
 `readings.firstIndex(where: { $0.id == reading.id })` — a *forward* scan from index 0 over
 the entire array, for every incoming reading. With a large local history and a 14-day Oura
@@ -243,6 +294,10 @@ minutes. `knownReadingIDs` already exists as a `Set<UUID>`; extend it to a
 `[UUID: Int]` index, or an `OrderedDictionary`-style structure, so identity lookup is O(1).
 
 ### 2.5 The Oura tab hits the Keychain about 34 times per render
+
+**Status: Fixed.** `OuraManager` holds one observable in-memory credential cache, refreshed
+at configure/sync and after credential writes. Rendering reads the cache and performs no
+Keychain query.
 
 **Medium.** [`hasAuthorization`](Sources/Oura/OuraManager.swift:52),
 `authorizationExpiresAt`, `reportedGrantedScopes` and `missingRequestedScopes` each perform
@@ -258,6 +313,11 @@ observable `private(set) var` on `OuraManager`, refreshed on authorize/disconnec
 let Observation drive invalidation properly.
 
 ### 2.6 Oura sync refetches everything every 15 minutes, and parses every response twice
+
+**Status: Fixed.** Per-collection high-water marks, a correction overlap, daily full backfill,
+and slow refreshes for static collections narrow requests without parallelising them. Success
+responses are decoded once; the problem envelope is decoded only for non-2xx status. Portable
+tests cover incremental/full ranges, corrections, cached merges, truncation, and rate limits.
 
 **Medium.** [`OuraManager.sync`](Sources/Oura/OuraManager.swift:156) issues 19 sequential
 requests covering a rolling 14-day window on every cycle, including collections that
@@ -283,6 +343,9 @@ sequential flow) — narrowing the *window* achieves most of the win without tou
 
 ### 2.7 The Bluetooth scan sorts and invalidates on every advertisement packet
 
+**Status: Fixed; physical-device verification pending.** Advertisement packets update a
+dictionary immediately, while observable sorted results publish at 2.5 Hz and once on stop.
+
 **Medium.** [`startScan`](Sources/Bluetooth/BluetoothManager.swift:133) passes
 `CBCentralManagerScanOptionAllowDuplicatesKey: true`, and
 [`didDiscover`](Sources/Bluetooth/BluetoothManager.swift:406) responds to each packet with a
@@ -299,6 +362,15 @@ Coalesce: update the backing dictionary on every packet, but publish and re-sort
 ## 3. Storage and scale
 
 ### 3.1 The whole-file JSON archive is offered a retention setting it cannot support
+
+**Status: Implemented as bounded lossy compaction; product decision remains.** Readings older
+than 14 days collapse to one stable median per source/metric/comparison window in three-day
+passes. The cursor now advances across sparse/compacted spans and rewinds for historical
+ingest. Once compacted, a window is final: late raw rows are rejected because the discarded
+distribution cannot be recombined without median-of-median bias. The Settings footer now
+states that individual samples, raw counts, within-window spread, and later corrections are
+permanently lost. Whether this irreversible behavior should require opt-in remains a product
+decision; no SQLite/SwiftData migration was attempted.
 
 [`SettingsView`](Sources/Views/SettingsView.swift:59) lets the user pick **1 year**.
 `HealthStore` holds everything in memory and
@@ -318,18 +390,32 @@ The header comment already names the right seam. Concretely: either
 
 ### 3.2 The health archive gets no file protection and is not excluded from backup
 
+**Status: Corrected and fixed for file protection; backup policy deliberately unchanged.**
+The recommendation below was wrong: `.completeFileProtectionUnlessOpen` cannot open this
+whole-file archive during a locked background relaunch. Writes now explicitly use
+`.completeFileProtectionUntilFirstUserAuthentication`, the strongest class compatible with
+the documented post-first-unlock Bluetooth background path. Unreadable is distinct from
+missing/corrupt, and history/settings refuse to save until a conclusive load. The archive
+remains eligible for device backup so Bluetooth-only history can be restored; the Oura bearer
+credential remains device-only in Keychain.
+
 [`ReadingArchive.write`](Sources/Store/ReadingArchive.swift:38) uses `options: .atomic` only,
 so `readings.json` lands with the default protection class and is included in iCloud/iTunes
 backups. The Keychain item is deliberately `…ThisDeviceOnly`
 ([Keychain.swift:30](Sources/Store/Keychain.swift:30)), but the actual health measurements —
 arguably the more sensitive payload — get no equivalent treatment.
 
-Add `.completeFileProtectionUnlessOpen` (not `.complete`: Bluetooth background delivery must
-write while the device is locked), and decide deliberately whether the archive should carry
-`isExcludedFromBackup`. Also, [`directory`](Sources/Store/ReadingArchive.swift:24) calls
-`createDirectory` on every single access; hoist it to init.
+Do **not** add `.completeFileProtectionUnlessOpen`: this archive is closed between atomic
+writes, and that class cannot open a closed file while locked. The implemented class and
+tri-state load guard above preserve the background path without mapping an inaccessible file
+to an empty collection. The Application Support directory is resolved once per archive actor.
 
 ### 3.3 No schema migration path
+
+**Status: Fixed for current and legacy schemas.** Every file is wrapped in a versioned
+envelope, reads fall back to the legacy bare payload, and newer/undecodable bytes are preserved
+aside. `OuraSnapshot` explicitly defaults metadata/collections absent from older caches, and
+hand-built legacy payload tests cover readings, sources, settings, and Oura cache behavior.
 
 `ReadingArchive` preserves an undecodable file as `.corrupt` — good — but that is recovery,
 not migration. Adding one non-optional `Codable` field to `Reading` or renaming a
@@ -343,6 +429,9 @@ model changes routine instead of destructive.
 
 ### 4.1 Pagination truncates silently
 
+**Status: Fixed.** Page walks return a truncation flag, endpoint state renders `.partial`, and
+the flag persists in the token-free cache so relaunch cannot relabel a prefix as complete.
+
 [`OuraClient.paged`](Sources/Oura/OuraClient.swift:418) stops after 25 pages and returns
 whatever it has, with no signal. The endpoint is then marked `.available(count)` and the UI
 presents a partial collection as complete. Return a "truncated" flag, or throw, so partial
@@ -350,12 +439,20 @@ data is labelled.
 
 ### 4.2 A 429 fails the whole collection
 
+**Status: Fixed.** Short `Retry-After` values receive bounded retries; long/absent values set a
+capped manager backoff that scheduled sync honors and a clean cycle clears. Portable tests
+cover each branch without live API traffic.
+
 `Failure.rateLimited` carries `Retry-After` but nothing acts on it — the endpoint is marked
 failed and the sync moves on. Given 19 sequential requests per cycle, one rate limit can
 cascade. A bounded retry honouring `Retry-After`, plus backing off the sync timer, would make
 partial syncs much rarer.
 
 ### 4.3 Bluetooth reconnection has no backoff or ceiling
+
+**Status: Fixed in code; physical-device verification pending.** Disconnects use exponential
+backoff with a 60-second delay cap and six-attempt ceiling, stop while the radio is off, reset
+after a successful/user-requested connection, and expose an actionable failed state.
 
 [`didDisconnectPeripheral`](Sources/Bluetooth/BluetoothManager.swift:447) immediately calls
 `connect(peripheral)` with no delay, no attempt counter, and no check that the radio is still
@@ -365,6 +462,10 @@ few attempts. *(Needs a physical device to confirm the loop's real-world behavio
 
 ### 4.4 HealthKit deletions are ignored
 
+**Status: Fixed; physical HealthKit verification pending.** Both anchored handlers reduce
+deleted objects to their sample UUIDs and route them through indexed store removal after
+insertion. Store identity/removal tests execute portably; framework callbacks compiled only.
+
 Both anchored-query handlers discard the `[HKDeletedObject]` argument
 ([HealthKitManager.swift:180](Sources/Health/HealthKitManager.swift:180) and
 [:213](Sources/Health/HealthKitManager.swift:213)). A sample the user deletes from Health
@@ -373,6 +474,11 @@ store API for removal by ID plus a decision about what a deleted sample means fo
 exported analysis — worth designing, not patching.
 
 ### 4.5 Background delivery is requested without the entitlement
+
+**Status: Implemented but not device-verified; provisioning decision remains.** The entitlement
+is declared in `project.yml` and the tracked entitlements file. The App ID for team
+`7RLDYXQTNX` must enable HealthKit Background Delivery before a signed build can prove this;
+an unsigned simulator build is not evidence that background wake works.
 
 [`startObserving`](Sources/Health/HealthKitManager.swift:241) calls
 `enableBackgroundDelivery(for:frequency:.hourly)`, but
@@ -386,6 +492,12 @@ expresses an intent the app is not provisioned to fulfil.
 ## 5. Product and UX opportunities
 
 ### 5.1 Body sensor location is read from every device and thrown away
+
+**Status: Fixed; representative hardware verification pending.** Body Sensor Location is
+parsed, persisted as an optional SIG raw value, preserved across source refreshes, and shown
+in device and pair interpretations without weakening the verdict. Firmware is consumed as
+model metadata. PLX Features was removed from the read-once set because current frame flags
+already describe optional fields and no UI consumes it.
 
 [`GATT.readOnceCharacteristics`](Sources/Bluetooth/GATT.swift:75) subscribes to Body Sensor
 Location (0x2A38), and [`BodySensorLocation`](Sources/Bluetooth/GATT.swift:97) is fully
@@ -413,6 +525,10 @@ the first would let the UI explain which optional PLX fields a device actually p
 
 ### 5.2 HRV mean heart rate and pNN50 are computed and discarded
 
+**Status: Fixed.** The latest Bluetooth HRV window publishes beat count, artefact fraction,
+pNN50, and heart rate implied by clean R–R intervals. Metric and pair screens surface those
+as a quality caveat and same-device cross-check, never as a new measurement or reference.
+
 [`HRVMetrics`](Sources/Analysis/HRVCalculator.swift:8) produces `pnn50` and `meanHeartRate`;
 only `rmssd` and `sdnn` are ever emitted. The comment on `meanHeartRate` describes exactly
 the feature that is missing:
@@ -427,6 +543,11 @@ show next to an HRV comparison.
 
 ### 5.3 Oura onboarding requires the user to register their own OAuth application
 
+**Status: Partially improved; credentials/product decision remains.** The UI supplies a
+copyable exact redirect URI, validates the client ID, explains permissions, and proactively
+prompts for expiry. This repository has no first-party client ID to ship; retaining personal
+developer setup or supplying a public production client ID is the user's decision.
+
 [`OuraSetupView`](Sources/Views/OuraSetupView.swift:37) walks the user through creating an
 Oura developer application, registering a redirect URI, and pasting a Client ID. That is a
 sound choice for a serverless personal build and the reasoning is documented — but it is a
@@ -437,6 +558,12 @@ secret, since the flow is client-side).
 
 ### 5.4 No localization at all
 
+**Status: Localization foundation fixed; translations not supplied.** A source-language String
+Catalog, extraction build settings, SwiftUI extraction, and explicit `String(localized:)`
+lookups now cover the app's reusable/status/medical language. Locale-independent
+`exportTitle`/`exportUnit` keep the pinned CSV and summary bytes stable. The catalog currently
+contains English source text only.
+
 Zero uses of `NSLocalizedString` / `String(localized:)` and no String Catalog; every string
 is a hardcoded English literal. That is a reasonable v1 stance, but it matters more than
 usual here because a substantial fraction of those strings are **medical disclaimers** —
@@ -446,6 +573,11 @@ they may not read. Adding a String Catalog now is mechanical; adding it after an
 thousand lines of UI is not.
 
 ### 5.5 Accessibility is uneven
+
+**Status: Fixed for the identified gaps; runtime VoiceOver pass pending.** Compound device and
+measurement rows now expose one label/value, battery/signal controls are named, icon-only
+actions have labels/hints, destructive actions state their scope, and fixed decorative glyphs
+scale with Dynamic Type.
 
 Five of eleven view files contain no accessibility modifiers at all:
 `DevicesView`, `SettingsView`, `BluetoothScanView`, `OuraSetupView`, `InfoViews`.
@@ -471,6 +603,11 @@ The gaps are all on one side of the line.
 
 ### 6.1 The store, the archive, and HealthKit conversion have no tests
 
+**Status: Fixed.** New suites cover store ingestion/indexes/removal/retention/compaction/load
+guards, archive round trips/legacy/future/corrupt/unreadable behavior, settings load safety,
+HealthKit mapping/conversion/self-source cleanup/deletion identity, Oura orchestration, and
+HRV filter quality. The portable subset executed; the HealthKit suite only compiled.
+
 Every suite covers pure analysis, parsing, OAuth, or export. Nothing covers:
 
 - **`HealthStore`** — de-duplication, plausibility rejection, sorted insertion of
@@ -487,6 +624,9 @@ Every suite covers pure analysis, parsing, OAuth, or export. Nothing covers:
 
 ### 6.2 One test writes to the real Application Support container
 
+**Status: Fixed.** The Oura upsert test uses `HealthStore(persistenceEnabled: false)`, and new
+archive/settings tests isolate every file in a unique test folder and remove it afterwards.
+
 [`Tests/OuraDataTests.swift:191`](Tests/OuraDataTests.swift:191) constructs `HealthStore()`
 with persistence on, against the project's own convention (`AGENTS.md`: *"Use
 `HealthStore(persistenceEnabled: false)` where a unit test must not touch Application
@@ -495,16 +635,28 @@ the suite is order-dependent on any future test that reads them. One-word fix.
 
 ### 6.3 Tests cannot execute on this machine
 
+**Status: Environment limitation remains, with a documented partial workaround.**
+`xcrun simctl list runtimes` still reports no installed runtimes. `build-for-testing` proves
+the complete hosted suite compiles, not that it passes. The external SwiftPM harness executed
+95 portable tests against symlinked real sources; it stubs only the UIKit-dependent OAuth
+credential session and cannot compile HealthKit or views.
+
 No iOS simulator runtimes are installed (`xcrun simctl list runtimes` is empty), so only
 `build`/`build-for-testing` can run here. The app target builds clean. This is an
-environment gap, not a code issue, but it means none of the 99 tests have been *executed*
-during this review.
+environment gap, not a code issue, but it means the 212 hosted iOS test declarations have
+not been *executed* during this review. They compile successfully, while 95 portable tests
+covering the store, archive, settings, Oura sync, and HRV paths executed in the external
+SwiftPM harness.
 
 ---
 
 ## 7. Code health
 
 ### 7.1 Dead code and stale references
+
+**Status: Fixed.** The stale type reference and unused `dataVersion` are gone; estimate
+visibility now has a real toggle; body location and HRV quality are live features rather than
+dead state.
 
 | Item | Where | Note |
 | --- | --- | --- |
@@ -516,6 +668,9 @@ during this review.
 
 ### 7.2 `OuraDashboardView` is 1,422 lines
 
+**Status: Fixed.** Section/card/format helpers are split across ten focused files under
+`Sources/Views/Oura/`; the dashboard remains the composition screen.
+
 It is 12% of the entire codebase in one file, with around 30 computed section properties and
 14 private helper types, against a stated convention of *"one principal type or closely
 related group per file"*. Splitting by section (scores / biomarkers / heart / sleep /
@@ -524,6 +679,9 @@ slice rather than reaching into `model`, would also make the sections independen
 previewable and testable. Worth doing before the next feature lands in it.
 
 ### 7.3 Minor
+
+**Status: Fixed.** Delete-all clears stale last-seen state, forgetting Bluetooth clears pending
+device information and live HRV quality, and the derived loop exits when its owner disappears.
 
 - `HealthStore.deleteAllReadings()` clears `observedMetrics` but leaves `lastSeenAt`, so a
   wiped source still claims a recent sighting.
