@@ -108,7 +108,7 @@ struct SettingsView: View {
                     case .denied:
                         mirrorWriteAlert = .denied(
                             model.healthKit.lastError
-                                ?? "Health write access was not granted."
+                                ?? "Health write access was not granted. Enable it in Settings \u{2192} Health \u{2192} Data Access & Devices."
                         )
                     case .unavailable:
                         mirrorWriteAlert = .unavailable
