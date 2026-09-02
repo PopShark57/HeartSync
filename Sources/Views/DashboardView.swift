@@ -366,6 +366,9 @@ private struct DashboardSnapshot {
 private struct MetricCard: View {
     var summary: MetricSummary
 
+    /// Keeps the larger Now numerals while still tracking Dynamic Type (fixed 34pt does not).
+    @ScaledMetric(relativeTo: .largeTitle) private var headlineSize: CGFloat = 34
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
@@ -376,7 +379,7 @@ private struct MetricCard: View {
                 if let headline = summary.headline {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text(summary.kind.format(headline))
-                            .font(.system(size: 34, weight: .bold, design: .rounded))
+                            .font(.system(size: headlineSize, weight: .bold, design: .rounded))
                             .monospacedDigit()
                         Text(summary.kind.unit)
                             .font(.caption.weight(.semibold))
