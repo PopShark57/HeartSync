@@ -81,7 +81,8 @@ final class BluetoothManager: NSObject {
 
     // MARK: Observable state
 
-    private(set) var state: CBManagerState = .unknown
+    // Writable from BluetoothManager+Delegates (same-module extension).
+    var state: CBManagerState = .unknown
     private(set) var isScanning = false
     private(set) var discovered: [DiscoveredPeripheral] = []
     var connectionStates: [UUID: PeripheralConnectionState] = [:]
