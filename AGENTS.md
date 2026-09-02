@@ -171,7 +171,7 @@ Authorization and synchronization rules:
 - Anchored queries request a recent 30-day window and then install update handlers. Local retention settings do not imply a one-year HealthKit backfill.
 - Background delivery is requested hourly. There are no `BGTaskScheduler` identifiers or task handlers.
 - The committed entitlements declare `com.apple.developer.healthkit.background-delivery`, and the code requests hourly delivery. The capability still needs to be enabled for the App ID/provisioning profile and exercised with a signed build on a physical device; do not describe background wake behavior as guaranteed until that validation succeeds.
-- HealthKit deletion arrays are currently ignored, so local readings can outlive an upstream deletion. Supporting deletion needs an explicit store/data-model design.
+- Anchored queries apply HealthKit deletions: `HealthKitManager.deletedReadingIDs` maps each `HKDeletedObject.uuid` to a reading id (the same sample UUID used at ingest), `AppModel.removeDeletedHealthKitSamples` receives them, and `HealthStore.remove(readingIDs:)` drops matching rows. Unknown ids are a no-op. Remaining limits: an already-exported pairwise analysis is unchanged; after compaction, raw sample UUIDs are gone so an upstream deletion cannot remove the stable window median that replaced them.
 - Optional write-back is allowed only for `.measured` readings from Bluetooth sources. Estimated or HealthKit/Oura-originating values must never be written back.
 
 HealthKit readings currently use `hk.<source bundle identifier>` as the source ID and keep the device model as metadata. A nearby model comment describes a more specific identity than the implementation supplies. Treat the implemented ID formula as migration-sensitive; changing it can split or duplicate historical sources.
@@ -460,7 +460,7 @@ Exercise extra caution around:
 - CoreBluetooth's nil-queue/main-actor delegate assumption and required strong peripheral references.
 - Binary parser field ordering, sensor validity flags, RR units, and IEEE-11073 special values.
 - Stable reading/source IDs and enum raw values that persist across launches.
-- HealthKit source identity, authorization ambiguity, ignored deletions, fixed 30-day query window, and measured-only write-back.
+- HealthKit source identity, authorization ambiguity, deletion sync to the store (exports and compacted aggregates may not reverse), fixed 30-day query window, and measured-only write-back.
 - Oura endpoint path casing, pagination limit, sequential orchestration, cross-file scope mappings, nuanced 401 handling, and preservation of cached collections after partial failures.
 - Whole-file JSON archives with no general migration layer and potentially large 1 Hz histories.
 - Metric unit normalization and the RMSSD/SDNN and absolute/deviation distinctions.

@@ -356,10 +356,13 @@ final class BluetoothManager: NSObject {
 
     /// Schedules a reconnection attempt after an exponentially growing delay.
     ///
-    /// Called only from the disconnect path. Gives up after
+    /// Shared by the disconnect and fail-to-connect paths. Gives up after
     /// `maximumReconnectAttempts` and leaves the device in `.failed`, which is a state the
     /// user can act on from the devices list \u{2014} a silent retry loop is not.
-    private func scheduleReconnect(_ peripheral: CBPeripheral) {
+    private func scheduleReconnect(
+        _ peripheral: CBPeripheral,
+        gaveUpReason: String = "Lost connection. Use Reconnect to try again."
+    ) {
         let id = peripheral.identifier
         cancelPendingReconnect(for: id)
 
@@ -367,7 +370,7 @@ final class BluetoothManager: NSObject {
         guard attempt <= Self.maximumReconnectAttempts else {
             // Names the recovery the devices list actually offers ("Reconnect" in the row's
             // menu) rather than leaving a dead end.
-            connectionStates[id] = .failed("Lost connection. Use Reconnect to try again.")
+            connectionStates[id] = .failed(gaveUpReason)
             logger.info(
                 "Gave up reconnecting \(id.uuidString, privacy: .public) after \(Self.maximumReconnectAttempts) attempts"
             )
@@ -631,7 +634,23 @@ extension BluetoothManager: CBCentralManagerDelegate {
     ) {
         let reason = error?.localizedDescription ?? "Could not connect"
         MainActor.assumeIsolated {
-            self.connectionStates[peripheral.identifier] = .failed(reason)
+            self.logger.info(
+                "Failed to connect to \(peripheral.identifier.uuidString, privacy: .public): \(reason, privacy: .public)"
+            )
+            // Transient first-connect failures (device out of range, brief radio glitch)
+            // used to stay in `.failed` forever. Share the disconnect backoff so they
+            // recover automatically, and only surface a permanent failure after the ceiling.
+            guard let source = self.store?.source(id: peripheral.identifier.uuidString),
+                  source.isEnabled
+            else {
+                self.connectionStates[peripheral.identifier] = .failed(reason)
+                return
+            }
+            self.connectionStates[peripheral.identifier] = .disconnected
+            self.scheduleReconnect(
+                peripheral,
+                gaveUpReason: "Could not connect. Use Reconnect to try again."
+            )
         }
     }
 
