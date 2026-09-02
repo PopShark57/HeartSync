@@ -129,6 +129,10 @@ final class BluetoothManager: NSObject {
     /// released `CBPeripheral` silently stops delivering notifications.
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var hrvAccumulators: [UUID: HRVAccumulator] = [:]
+    /// Receipt-time admission keeps a chatty peripheral from turning every callback into a
+    /// stored row. It is deliberately per source and metric so one device cannot starve another
+    /// and a pulse-oximeter's SpO2 stream does not suppress its pulse stream.
+    private var readingAdmission = BluetoothReadingAdmission()
     private var pendingModelInfo: [UUID: DeviceInformation] = [:]
     private var scanTimeoutTask: Task<Void, Never>?
 
@@ -145,6 +149,10 @@ final class BluetoothManager: NSObject {
     /// Publication cadence for scan results. 400 ms (2.5 Hz) is well inside the ~100 ms
     /// at which a list stops looking responsive, and far below the packet rate.
     private static let discoveryPublishInterval: Duration = .milliseconds(400)
+    /// A scan list is a setup-time convenience, not a registry of every beacon in the room.
+    /// Keeping only the strongest 256 candidates bounds advertisement-controlled memory and
+    /// still leaves ample room for a user choosing among nearby health devices.
+    static let maximumDiscoveredPerScan = 256
 
     /// Reconnection attempts since the last successful connection, per peripheral.
     private var reconnectAttempts: [UUID: Int] = [:]
@@ -204,6 +212,10 @@ final class BluetoothManager: NSObject {
         guard isPoweredOn, !isScanning else { return }
         discovered.removeAll()
         discoveredByID.removeAll()
+        // Keep strong references only for configured devices between scans. Otherwise each
+        // scan could retain another roomful of never-added peripherals indefinitely.
+        let configuredIDs = Set(store?.sources.map(\.id) ?? [])
+        peripherals = peripherals.filter { configuredIDs.contains($0.key.uuidString) }
         hasUnpublishedDiscoveries = false
         isScanning = true
         central.scanForPeripherals(
@@ -341,6 +353,7 @@ final class BluetoothManager: NSObject {
         peripherals[uuid] = nil
         connectionStates[uuid] = nil
         hrvAccumulators[uuid] = nil
+        readingAdmission.reset(sourceID: uuid.uuidString)
         hrvProgress[uuid] = nil
         hrvQuality[uuid] = nil
         pendingModelInfo[uuid] = nil
@@ -412,8 +425,31 @@ final class BluetoothManager: NSObject {
 
     // MARK: Ingest
 
-    private func emit(_ reading: Reading) {
-        onReading?(reading)
+    @discardableResult
+    private func emit(
+        sourceID: String,
+        kind: MetricKind,
+        value: Double,
+        start: Date,
+        end: Date? = nil,
+        provenance: Provenance = .measured,
+        receivedAt: Date
+    ) -> Bool {
+        // Admission happens before constructing a Reading. The callback path therefore has no
+        // temporary unbounded Reading queue for a notification burst.
+        guard kind.plausibleRange.contains(value) else { return false }
+        guard readingAdmission.accept(sourceID: sourceID, kind: kind, receivedAt: receivedAt) else {
+            return false
+        }
+        onReading?(Reading(
+            sourceID: sourceID,
+            kind: kind,
+            value: value,
+            start: start,
+            end: end,
+            provenance: provenance
+        ))
+        return true
     }
 
     private func note(metric: MetricKind, for peripheralID: UUID) {
@@ -438,15 +474,22 @@ final class BluetoothManager: NSObject {
         // A sensor that supports contact detection and says it is off-body is reporting
         // noise. Storing it would generate a large, meaningless discrepancy.
         if measurement.isSensorContactDetected == false { return }
+        guard readingAdmission.acceptNotification(
+            sourceID: sourceID,
+            channel: .heartRate,
+            receivedAt: now
+        ) else { return }
 
-        emit(Reading(
+        if emit(
             sourceID: sourceID,
             kind: .heartRate,
             value: Double(measurement.beatsPerMinute),
             start: now,
-            provenance: .measured
-        ))
-        note(metric: .heartRate, for: id)
+            provenance: .measured,
+            receivedAt: now
+        ) {
+            note(metric: .heartRate, for: id)
+        }
 
         guard !measurement.rrIntervalsMS.isEmpty else { return }
         var accumulator = hrvAccumulators[id] ?? HRVAccumulator()
@@ -455,12 +498,14 @@ final class BluetoothManager: NSObject {
 
         if let metrics = accumulator.emitIfReady(at: now) {
             let windowStart = now.addingTimeInterval(-accumulator.window)
-            emit(Reading(sourceID: sourceID, kind: .hrvRMSSD, value: metrics.rmssd,
-                         start: windowStart, end: now, provenance: .derived))
-            emit(Reading(sourceID: sourceID, kind: .hrvSDNN, value: metrics.sdnn,
-                         start: windowStart, end: now, provenance: .derived))
-            note(metric: .hrvRMSSD, for: id)
-            note(metric: .hrvSDNN, for: id)
+            if emit(sourceID: sourceID, kind: .hrvRMSSD, value: metrics.rmssd,
+                    start: windowStart, end: now, provenance: .derived, receivedAt: now) {
+                note(metric: .hrvRMSSD, for: id)
+            }
+            if emit(sourceID: sourceID, kind: .hrvSDNN, value: metrics.sdnn,
+                    start: windowStart, end: now, provenance: .derived, receivedAt: now) {
+                note(metric: .hrvSDNN, for: id)
+            }
             // Published alongside, not stored: it qualifies the window that was just
             // emitted rather than being a measurement of its own.
             hrvQuality[id] = HRVQuality(metrics: metrics, measuredAt: now)
@@ -481,35 +526,70 @@ final class BluetoothManager: NSObject {
 
         let id = peripheral.identifier
         let sourceID = id.uuidString
-        let timestamp = measurement.timestamp ?? .now
+        let receivedAt = Date.now
+        guard let timestamp = BluetoothTimestampPolicy.normalized(
+            deviceTimestamp: measurement.timestamp,
+            receivedAt: receivedAt,
+            maximumAge: store?.retention ?? BluetoothTimestampPolicy.defaultMaximumAge
+        ) else {
+            logger.debug("Rejected pulse-oximeter timestamp outside the accepted receipt window")
+            return
+        }
 
         if let spo2 = measurement.spo2Percent {
-            emit(Reading(sourceID: sourceID, kind: .spo2, value: spo2,
-                         start: timestamp, provenance: .measured))
-            note(metric: .spo2, for: id)
+            let admitted = readingAdmission.acceptNotification(
+                sourceID: sourceID,
+                channel: .pulseOximeterSpO2,
+                receivedAt: receivedAt
+            )
+            if admitted, emit(sourceID: sourceID, kind: .spo2, value: spo2,
+                              start: timestamp, provenance: .measured, receivedAt: receivedAt) {
+                note(metric: .spo2, for: id)
+            }
         }
         if let pulse = measurement.pulseRateBPM {
-            emit(Reading(sourceID: sourceID, kind: .heartRate, value: pulse,
-                         start: timestamp, provenance: .measured))
-            note(metric: .heartRate, for: id)
+            let admitted = readingAdmission.acceptNotification(
+                sourceID: sourceID,
+                channel: .pulseOximeterPulse,
+                receivedAt: receivedAt
+            )
+            if admitted, emit(sourceID: sourceID, kind: .heartRate, value: pulse,
+                              start: timestamp, provenance: .measured, receivedAt: receivedAt) {
+                note(metric: .heartRate, for: id)
+            }
         }
     }
 
     fileprivate func handleTemperature(_ data: Data, from peripheral: CBPeripheral) {
         guard let measurement = TemperatureMeasurement(data: data) else { return }
-        emit(Reading(
-            sourceID: peripheral.identifier.uuidString,
-            kind: .bodyTemperature,
-            value: measurement.celsius,
-            start: measurement.timestamp ?? .now,
-            provenance: .measured
-        ))
-        note(metric: .bodyTemperature, for: peripheral.identifier)
+        let receivedAt = Date.now
+        guard let timestamp = BluetoothTimestampPolicy.normalized(
+            deviceTimestamp: measurement.timestamp,
+            receivedAt: receivedAt,
+            maximumAge: store?.retention ?? BluetoothTimestampPolicy.defaultMaximumAge
+        ) else {
+            logger.debug("Rejected thermometer timestamp outside the accepted receipt window")
+            return
+        }
+        let sourceID = peripheral.identifier.uuidString
+        guard readingAdmission.acceptNotification(
+            sourceID: sourceID,
+            channel: .temperature,
+            receivedAt: receivedAt
+        ) else { return }
+        if emit(sourceID: sourceID, kind: .bodyTemperature, value: measurement.celsius,
+                start: timestamp, provenance: .measured, receivedAt: receivedAt) {
+            note(metric: .bodyTemperature, for: peripheral.identifier)
+        }
     }
 
     fileprivate func handleBattery(_ data: Data, from peripheral: CBPeripheral) {
         var reader = BinaryReader(data)
         guard let percent = reader.uint8(), percent <= 100 else { return }
+        guard readingAdmission.acceptBattery(
+            sourceID: peripheral.identifier.uuidString,
+            receivedAt: .now
+        ) else { return }
         store?.updateBattery(Int(percent), forSource: peripheral.identifier.uuidString)
     }
 
@@ -597,8 +677,6 @@ extension BluetoothManager: CBCentralManagerDelegate {
         let rssi = RSSI.intValue
 
         MainActor.assumeIsolated {
-            self.peripherals[id] = peripheral
-
             // RSSI of 127 is CoreBluetooth's "not available" sentinel, not a strong signal.
             let entry = DiscoveredPeripheral(
                 id: id,
@@ -608,6 +686,20 @@ extension BluetoothManager: CBCentralManagerDelegate {
                 isConnectable: connectable,
                 lastSeen: .now
             )
+            if self.discoveredByID[id] == nil,
+               self.discoveredByID.count >= Self.maximumDiscoveredPerScan {
+                guard let weakest = self.discoveredByID.values.min(by: {
+                    $0.rssi == $1.rssi ? $0.lastSeen < $1.lastSeen : $0.rssi < $1.rssi
+                }) else { return }
+                let outranksWeakest = entry.rssi > weakest.rssi
+                    || (entry.rssi == weakest.rssi && entry.lastSeen > weakest.lastSeen)
+                guard outranksWeakest else { return }
+                self.discoveredByID[weakest.id] = nil
+                if self.store?.source(id: weakest.id.uuidString) == nil {
+                    self.peripherals[weakest.id] = nil
+                }
+            }
+            self.peripherals[id] = peripheral
             // Coalesced rather than published here: with duplicates allowed this runs for
             // every advertisement packet from every device in range.
             self.discoveredByID[id] = entry
@@ -664,6 +756,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
             // The HRV window is only meaningful over a continuous recording, so a
             // disconnection invalidates it rather than pausing it.
             self.hrvAccumulators[peripheral.identifier]?.reset()
+            self.readingAdmission.reset(sourceID: peripheral.identifier.uuidString)
             self.hrvProgress[peripheral.identifier] = nil
             self.hrvQuality[peripheral.identifier] = nil
 

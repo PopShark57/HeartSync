@@ -144,6 +144,27 @@ struct HealthStoreIngestionTests {
         #expect(store.readings.count == 2)
     }
 
+    @Test("Invalid and future intervals are rejected before storage")
+    func rejectsInvalidDates() {
+        let store = makeStore(sources: ["alpha"])
+        let future = Date(timeIntervalSinceNow: 86_400)
+        let reversed = Reading(
+            sourceID: "alpha",
+            kind: .heartRate,
+            value: 71,
+            start: at(20),
+            end: at(10)
+        )
+        let accepted = store.append(contentsOf: [
+            sample("alpha", 70, at: at(0)),
+            Reading(sourceID: "alpha", kind: .heartRate, value: 72, start: future),
+            reversed,
+        ])
+
+        #expect(accepted.map(\.value) == [70])
+        #expect(store.readings.count == 1)
+    }
+
     @Test("Plausibility is judged per metric, not against one global range")
     func plausibilityIsPerMetric() {
         let store = makeStore()
@@ -435,6 +456,20 @@ struct HealthStoreRemovalTests {
 
         #expect(store.readings.map(\.value) == [71, 72])
         expectSelfConsistent(store, after: "prune at the boundary")
+    }
+
+    @Test("Pruning removes future rows and clamps future source status")
+    func pruneFutureRows() throws {
+        let store = makeStore(sources: ["alpha"])
+        store.append(contentsOf: [
+            sample("alpha", 70, at: at(0)),
+            sample("alpha", 71, at: at(60)),
+        ])
+
+        store.prune(now: anchor)
+
+        #expect(store.readings.map(\.value) == [70])
+        #expect(try #require(store.source(id: "alpha")).lastSeenAt == anchor)
     }
 
     @Test("A prune that empties the store also forgets the ids it held")
@@ -754,6 +789,13 @@ struct HealthStoreLoadStateTests {
         store.retention = day
         store.prune(now: anchor)
         #expect(store.readings.isEmpty)
+    }
+
+    @Test("A nonpersistent store cannot report a durable save")
+    func nonpersistentSaveDoesNotAdvanceDurableWork() async {
+        let store = makeStore()
+
+        #expect(!(await store.saveNow()))
     }
 
     @Test("Nothing is compacted before the archive has been read")

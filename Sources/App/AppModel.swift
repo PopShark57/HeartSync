@@ -36,6 +36,14 @@ final class AppModel {
 
         await settings.loadIfNeeded()
         await store.loadIfNeeded()
+        guard store.loadState == .loaded else {
+            // Do not attach live transports to an inconclusively loaded archive. Their readings
+            // would have nowhere durable to go and could fill memory while the device is locked
+            // or storage is temporarily unavailable. `refresh()` retries `start()` later.
+            logger.error("Archive unavailable; delaying transport startup until it can be read")
+            hasStarted = false
+            return
+        }
         // Builds predating the HealthKit self-source filter may already have persisted a
         // phantom `hk.<our bundle id>` device containing mirrored Bluetooth samples. The
         // query and conversion guards stop new copies; this migration removes the old
@@ -76,6 +84,10 @@ final class AppModel {
         #if DEBUG
         guard !Self.pairwiseDemoEnabled else { return }
         #endif
+        guard hasStarted else {
+            await start()
+            return
+        }
         bluetooth.reconnectKnownDevices()
         if healthKit.availability == .authorized {
             await healthKit.syncAll()

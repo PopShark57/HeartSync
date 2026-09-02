@@ -139,6 +139,20 @@ struct HealthKitSelfSourceTests {
 @MainActor
 struct HealthKitTypeMappingTests {
 
+    @Test("HealthKit synchronization uses finite pages and a finite per-sync budget")
+    func queryWorkIsBounded() {
+        #expect(HealthKitManager.queryBatchLimit > 0)
+        #expect(HealthKitManager.maximumObjectsPerSync >= HealthKitManager.queryBatchLimit)
+        #expect(HealthKitManager.observerBufferLimit == 1)
+        #expect(HealthKitManager.nextQueryLimit(afterProcessed: 0) == HealthKitManager.queryBatchLimit)
+        #expect(HealthKitManager.nextQueryLimit(afterProcessed: HealthKitManager.maximumObjectsPerSync) == nil)
+        #expect(HealthKitManager.shouldContinuePaging(
+            objectCount: HealthKitManager.queryBatchLimit,
+            limit: HealthKitManager.queryBatchLimit
+        ))
+        #expect(!HealthKitManager.shouldContinuePaging(objectCount: 0, limit: HealthKitManager.queryBatchLimit))
+    }
+
     /// A probe expressed in a unit chosen independently of the mapping, so the assertion is
     /// about physical meaning rather than about repeating the mapping's own literal.
     private struct UnitProbe {

@@ -125,23 +125,27 @@ enum PairwiseExporter {
         rows.reserveCapacity(analysis.observations.count + 1)
 
         for observation in analysis.observations {
+            let sourceAName = safeSpreadsheetMetadata(sourceA.name)
+            let sourceAModel = safeSpreadsheetMetadata(sourceA.model)
+            let sourceBName = safeSpreadsheetMetadata(sourceB.name)
+            let sourceBModel = safeSpreadsheetMetadata(sourceB.model)
             let fields = [
                 formatting.iso8601UTC(observation.start),
                 formatting.iso8601UTC(observation.end),
                 analysis.kind.rawValue,
                 analysis.kind.exportUnit,
                 sourceA.id,
-                sourceA.name,
+                sourceAName,
                 sourceA.transportRawValue,
-                sourceA.model,
+                sourceAModel,
                 decimal(observation.sourceA.value),
                 String(observation.sourceA.sampleCount),
                 decimal(observation.sourceA.standardDeviation),
                 observation.sourceA.provenance.rawValue,
                 sourceB.id,
-                sourceB.name,
+                sourceBName,
                 sourceB.transportRawValue,
-                sourceB.model,
+                sourceBModel,
                 decimal(observation.sourceB.value),
                 String(observation.sourceB.sampleCount),
                 decimal(observation.sourceB.standardDeviation),
@@ -170,6 +174,33 @@ enum PairwiseExporter {
         }
         guard needsQuoting else { return field }
         return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
+    /// Makes free-form source metadata literal in spreadsheet applications before RFC 4180
+    /// quoting runs. A leading apostrophe is the portable spreadsheet convention for text; it
+    /// remains part of the CSV cell rather than relying on a viewer-specific formula policy.
+    /// Non-record control characters are replaced with spaces so metadata cannot make the CSV
+    /// non-conforming even when a peripheral or HealthKit writer supplies a tab or C0/C1 byte.
+    private static func safeSpreadsheetMetadata(_ field: String) -> String {
+        let sanitized = field.unicodeScalars.map { scalar -> String in
+            if scalar == "\r" || scalar == "\n" {
+                return String(scalar)
+            }
+            return CharacterSet.controlCharacters.contains(scalar) ? " " : String(scalar)
+        }.joined()
+
+        for scalar in sanitized.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                continue
+            }
+            switch scalar {
+            case "=", "+", "-", "@":
+                return "'" + sanitized
+            default:
+                return sanitized
+            }
+        }
+        return sanitized
     }
 
     // MARK: - Text summary

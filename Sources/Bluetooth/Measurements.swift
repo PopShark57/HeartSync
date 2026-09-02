@@ -130,7 +130,20 @@ struct PulseOximeterMeasurement: Equatable, Sendable {
 
         var result = PulseOximeterMeasurement(spo2Percent: spo2, pulseRateBPM: pulse)
 
-        if flags & 0x01 != 0 { result.timestamp = reader.dateTime() }
+        if flags & 0x01 != 0 {
+            switch reader.dateTimeResult() {
+            case .valid(let timestamp):
+                result.timestamp = timestamp
+            case .unknown:
+                // Year 0 is the SIG-defined "unknown" value. Preserve the manager's
+                // receipt-time fallback for this valid-but-unspecified timestamp.
+                result.timestamp = nil
+            case .invalid:
+                // A flagged field with malformed components is not the same as an unknown
+                // timestamp and must not be converted into a current reading.
+                return nil
+            }
+        }
         if flags & 0x02 != 0 { result.measurementStatus = reader.uint16() }
         if flags & 0x04 != 0 { result.deviceAndSensorStatus = reader.uint24() }
         if flags & 0x08 != 0 { result.pulseAmplitudeIndex = reader.sfloat() }
@@ -156,7 +169,18 @@ struct TemperatureMeasurement: Equatable, Sendable {
         let isFahrenheit = flags & 0x01 != 0
         self.celsius = isFahrenheit ? (raw - 32) * 5.0 / 9.0 : raw
 
-        if flags & 0x02 != 0 { self.timestamp = reader.dateTime() } else { self.timestamp = nil }
+        if flags & 0x02 != 0 {
+            switch reader.dateTimeResult() {
+            case .valid(let timestamp):
+                self.timestamp = timestamp
+            case .unknown:
+                self.timestamp = nil
+            case .invalid:
+                return nil
+            }
+        } else {
+            self.timestamp = nil
+        }
         if flags & 0x04 != 0 { self.temperatureType = reader.uint8() } else { self.temperatureType = nil }
     }
 }

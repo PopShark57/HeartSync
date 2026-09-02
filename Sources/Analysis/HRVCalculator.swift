@@ -229,11 +229,26 @@ struct HRVAccumulator {
     /// HRV values every time a beat arrives.
     var emitInterval: TimeInterval = 60
 
+    /// A five-minute physiological window contains at most 1,000 beats even at the upper
+    /// 200-bpm interval bound. The extra headroom permits packetised notifications while making
+    /// a burst of repeated intervals unable to grow this live buffer without limit.
+    static let maximumBufferedBeats = 2_048
+
     mutating func add(intervals: [Double], at time: Date = .now) {
-        for interval in intervals {
-            samples.append((time, interval))
+        guard !intervals.isEmpty else { return }
+
+        if intervals.count >= Self.maximumBufferedBeats {
+            // Keep only the newest part of an oversized notification. The live HRV window is
+            // already a bounded, lossy rolling view; retaining an attacker-sized packet would
+            // defeat that bound before `prune(before:)` can run.
+            samples = intervals.suffix(Self.maximumBufferedBeats).map { (time, $0) }
+        } else {
+            samples.append(contentsOf: intervals.map { (time, $0) })
         }
         prune(before: time.addingTimeInterval(-window))
+        if samples.count > Self.maximumBufferedBeats {
+            samples.removeFirst(samples.count - Self.maximumBufferedBeats)
+        }
     }
 
     private mutating func prune(before cutoff: Date) {

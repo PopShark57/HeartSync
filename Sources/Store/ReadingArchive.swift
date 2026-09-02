@@ -150,13 +150,16 @@ actor ReadingArchive {
     /// write still fail. That window is survivable only because a failed read is now
     /// reported as `.unreadable` and `HealthStore` refuses to persist over it; do not
     /// reintroduce a caller that maps a failed read to "empty".
-    func write<T: Encodable & Sendable>(_ value: T, to name: String) {
+    @discardableResult
+    func write<T: Encodable & Sendable>(_ value: T, to name: String) -> Bool {
         do {
             let envelope = ArchiveEnvelope(schemaVersion: Self.schemaVersion, payload: value)
             let data = try encoder.encode(envelope)
             try data.write(to: url(name), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            return true
         } catch {
             logger.error("Failed to write \(name, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 

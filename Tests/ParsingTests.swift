@@ -158,6 +158,137 @@ struct ParsingTests {
         #expect(parts.minute == 30)
     }
 
+    @Test("A flagged but malformed Date Time makes the whole BLE frame invalid")
+    func malformedFlaggedTimestampsAreRejected() {
+        let spotCheckWithNoTimestampBytes = Data([
+            0x01,
+            0x61, 0x00,
+            0x48, 0x00,
+        ])
+        let spotCheckWithImpossibleDate = Data([
+            0x01,
+            0x61, 0x00,
+            0x48, 0x00,
+            0xE8, 0x07, 0x02, 0x1F, 0x0E, 0x1E, 0x00,
+        ])
+        let temperatureWithImpossibleDate = Data([
+            0x02,
+            0x70, 0x01, 0x00, 0xFF,
+            0xE8, 0x07, 0x02, 0x1F, 0x0E, 0x1E, 0x00,
+        ])
+
+        #expect(PulseOximeterMeasurement.spotCheck(data: spotCheckWithNoTimestampBytes) == nil)
+        #expect(PulseOximeterMeasurement.spotCheck(data: spotCheckWithImpossibleDate) == nil)
+        #expect(TemperatureMeasurement(data: temperatureWithImpossibleDate) == nil)
+    }
+
+    @Test("GATT Date Time rejects impossible calendar and clock components")
+    func invalidDateTimeComponents() {
+        func dateTime(
+            year: UInt16 = 2024,
+            month: UInt8 = 3,
+            day: UInt8 = 5,
+            hour: UInt8 = 14,
+            minute: UInt8 = 30,
+            second: UInt8 = 0
+        ) -> Date? {
+            var reader = BinaryReader([
+                UInt8(truncatingIfNeeded: year),
+                UInt8(truncatingIfNeeded: year >> 8),
+                month, day, hour, minute, second,
+            ])
+            return reader.dateTime()
+        }
+
+        #expect(dateTime(month: 2, day: 31) == nil)
+        #expect(dateTime(hour: 24) == nil)
+        #expect(dateTime(minute: 60) == nil)
+        #expect(dateTime(second: 60) == nil)
+    }
+
+    @Test("GATT Date Time preserves the SIG unknown-year fallback")
+    func unknownDateTimeFallsBackToReceiptTime() throws {
+        let spotCheck = Data([
+            0x01,
+            0x61, 0x00,
+            0x48, 0x00,
+            0x00, 0x00, 0x03, 0x05, 0x0E, 0x1E, 0x00,
+        ])
+        let temperature = Data([
+            0x02,
+            0x70, 0x01, 0x00, 0xFF,
+            0x00, 0x00, 0x03, 0x05, 0x0E, 0x1E, 0x00,
+        ])
+
+        let spot = try #require(PulseOximeterMeasurement.spotCheck(data: spotCheck))
+        let temp = try #require(TemperatureMeasurement(data: temperature))
+        #expect(spot.timestamp == nil)
+        #expect(temp.timestamp == nil)
+    }
+
+    @Test("Bluetooth timestamps use receipt time or a bounded device time")
+    func bluetoothTimestampAdmission() {
+        let receivedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let recent = receivedAt.addingTimeInterval(-120)
+        let slightlyAhead = receivedAt.addingTimeInterval(120)
+        let tooOld = receivedAt.addingTimeInterval(-31 * 86_400)
+        let tooFarAhead = receivedAt.addingTimeInterval(BluetoothTimestampPolicy.maximumFutureSkew + 1)
+
+        #expect(BluetoothTimestampPolicy.normalized(
+            deviceTimestamp: nil,
+            receivedAt: receivedAt,
+            maximumAge: 30 * 86_400
+        ) == receivedAt)
+        #expect(BluetoothTimestampPolicy.normalized(
+            deviceTimestamp: recent,
+            receivedAt: receivedAt,
+            maximumAge: 30 * 86_400
+        ) == recent)
+        // A clock lead within tolerance is made non-future before it reaches a Reading.
+        #expect(BluetoothTimestampPolicy.normalized(
+            deviceTimestamp: slightlyAhead,
+            receivedAt: receivedAt,
+            maximumAge: 30 * 86_400
+        ) == receivedAt)
+        #expect(BluetoothTimestampPolicy.normalized(
+            deviceTimestamp: tooOld,
+            receivedAt: receivedAt,
+            maximumAge: 30 * 86_400
+        ) == nil)
+        #expect(BluetoothTimestampPolicy.normalized(
+            deviceTimestamp: tooFarAhead,
+            receivedAt: receivedAt,
+            maximumAge: 30 * 86_400
+        ) == nil)
+    }
+
+    @Test("BLE reading admission keeps ordinary 1 Hz data and drops bursts")
+    func bluetoothReadingAdmission() {
+        var admission = BluetoothReadingAdmission()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let initial = admission.accept(sourceID: "a", kind: .heartRate, receivedAt: start)
+        let burst = admission.accept(sourceID: "a", kind: .heartRate, receivedAt: start.addingTimeInterval(0.1))
+        let next = admission.accept(sourceID: "a", kind: .heartRate, receivedAt: start.addingTimeInterval(0.5))
+        let otherMetric = admission.accept(sourceID: "a", kind: .spo2, receivedAt: start.addingTimeInterval(0.1))
+        let otherSource = admission.accept(sourceID: "b", kind: .heartRate, receivedAt: start.addingTimeInterval(0.1))
+        let initialBattery = admission.acceptBattery(sourceID: "a", receivedAt: start)
+        let batteryBurst = admission.acceptBattery(sourceID: "a", receivedAt: start.addingTimeInterval(1))
+        let laterBattery = admission.acceptBattery(
+            sourceID: "a",
+            receivedAt: start.addingTimeInterval(BluetoothReadingAdmission.minimumBatteryInterval)
+        )
+
+        #expect(initial)
+        #expect(!burst)
+        #expect(next)
+        #expect(otherMetric)
+        #expect(otherSource)
+        #expect(initialBattery)
+        #expect(!batteryBurst)
+        #expect(laterBattery)
+    }
+
     // MARK: Thermometer (0x2A1C)
 
     @Test("Celsius temperature parses directly")

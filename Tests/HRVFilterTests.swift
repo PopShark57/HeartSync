@@ -101,6 +101,16 @@ struct HRVArtefactFilterTests {
         #expect(exercising.artefactFraction == 0)
     }
 
+    @Test("The live HRV buffer has a finite beat bound")
+    func accumulatorCapsBurstInput() {
+        var accumulator = HRVAccumulator()
+        let burst = Array(repeating: 800.0, count: HRVAccumulator.maximumBufferedBeats * 2)
+
+        accumulator.add(intervals: burst, at: epoch)
+
+        #expect(accumulator.bufferedBeats == HRVAccumulator.maximumBufferedBeats)
+    }
+
     // MARK: Artefacts the filter must still catch
 
     @Test("A single ectopic beat is rejected, and only that beat")

@@ -91,22 +91,66 @@ struct BinaryReader {
         return Double(mantissa) * pow(10.0, Double(exponent))
     }
 
+    enum DateTimeResult: Sendable {
+        case valid(Date)
+        case unknown
+        case invalid
+    }
+
     /// GATT "Date Time" (0x2A08): 7 bytes \u{2014} uint16 year, then uint8 month, day, hour,
-    /// minute, second. A year of 0 means "unknown", in which case this returns nil and the
-    /// caller falls back to the arrival time.
-    mutating func dateTime() -> Date? {
+    /// minute, second. A year of 0 means "unknown"; malformed components are distinct so a
+    /// flagged timestamp can be rejected without losing the valid receipt-time fallback.
+    mutating func dateTimeResult() -> DateTimeResult {
         guard let year = uint16(),
               let month = uint8(), let day = uint8(),
               let hour = uint8(), let minute = uint8(), let second = uint8()
-        else { return nil }
-        guard year != 0, month >= 1, month <= 12, day >= 1, day <= 31 else { return nil }
-        var components = DateComponents()
-        components.year = Int(year)
-        components.month = Int(month)
-        components.day = Int(day)
-        components.hour = Int(hour)
-        components.minute = Int(minute)
-        components.second = Int(second)
-        return Calendar.current.date(from: components)
+        else { return .invalid }
+        guard month >= 1, month <= 12,
+              day >= 1, day <= 31,
+              hour <= 23,
+              minute <= 59,
+              second <= 59
+        else { return .invalid }
+        guard year != 0 else { return .unknown }
+
+        // GATT Date Time has no timezone field, so keep the device-local interpretation while
+        // making the calendar itself stable across user locale/calendar settings.
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let components = DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: Int(year),
+            month: Int(month),
+            day: Int(day),
+            hour: Int(hour),
+            minute: Int(minute),
+            second: Int(second)
+        )
+        guard let date = calendar.date(from: components) else { return .invalid }
+
+        // `Calendar.date(from:)` can normalise an impossible day such as February 31. A
+        // round-trip comparison rejects that normalisation instead of silently changing the
+        // measurement's date.
+        let roundTrip = calendar.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: date
+        )
+        guard roundTrip.year == Int(year),
+              roundTrip.month == Int(month),
+              roundTrip.day == Int(day),
+              roundTrip.hour == Int(hour),
+              roundTrip.minute == Int(minute),
+              roundTrip.second == Int(second)
+        else { return .invalid }
+
+        return .valid(date)
+    }
+
+    /// Date-only compatibility view. Unknown and malformed values remain `nil`; callers that
+    /// need to distinguish those cases should use `dateTimeResult()`.
+    mutating func dateTime() -> Date? {
+        guard case .valid(let date) = dateTimeResult() else { return nil }
+        return date
     }
 }

@@ -111,6 +111,32 @@ struct PairwiseExportTests {
         #expect(export.csv.hasSuffix("\r\n"))
     }
 
+    @Test("Formula-leading source metadata is exported as literal spreadsheet text")
+    func spreadsheetFormulaMetadataIsNeutralized() throws {
+        let observation = makeObservation(sourceA: "a", sourceB: "b", valueA: 70, valueB: 71)
+        let analysis = makeAnalysis(
+            sourceA: "a",
+            sourceB: "b",
+            observations: [observation],
+            state: .collecting(pairedWindowCount: 1, requiredWindowCount: 5)
+        )
+        let export = PairwiseExporter.makeExport(
+            analysis: analysis,
+            sources: [
+                source(id: "a", name: "=SUM(1,1)", transport: .bluetooth, model: "+model"),
+                source(id: "b", name: "\t-42", transport: .healthKit, model: "\u{0001}@model"),
+            ],
+            appVersion: "1.0",
+            generatedAt: base
+        )
+
+        let rows = try parseRFC4180(export.csv)
+        #expect(rows[1][5] == "'=SUM(1,1)")
+        #expect(rows[1][7] == "'+model")
+        #expect(rows[1][13] == "' -42")
+        #expect(rows[1][15] == "' @model")
+    }
+
     @Test("No-overlap summary explicitly withholds an agreement conclusion")
     func noOverlapSummary() throws {
         let analysis = makeAnalysis(

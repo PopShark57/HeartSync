@@ -99,7 +99,11 @@ final class HealthStore {
         case failed
     }
 
+    /// The trailing debounce preserves the low write rate of the original implementation.
     private var saveTask: Task<Void, Never>?
+    /// A second, non-resettable deadline prevents a continuous stream from postponing all
+    /// maintenance forever. The two tasks are cancelled together by `saveNow()`.
+    private var maximumSaveTask: Task<Void, Never>?
     /// In-flight load, so concurrent callers await the same read instead of racing two.
     private var loadTask: Task<Void, Never>?
     /// Exclusive end of the historical span examined by the previous compaction pass.
@@ -112,6 +116,18 @@ final class HealthStore {
     private var compactionCursor: Date?
     private var hasLoggedSaveRefusal = false
     private let persistenceEnabled: Bool
+
+    /// Persistence cadence controls. The maximum is deliberately longer than the debounce so
+    /// ordinary bursts still coalesce, but short enough to bound unsaved live readings.
+    static let saveDebounce: Duration = .seconds(3)
+    static let maximumSaveLatency: Duration = .seconds(30)
+
+    /// Emergency in-memory ceiling while a protected archive cannot be opened. Normal stores
+    /// are bounded by retention plus compaction; this smaller, fixed ceiling prevents a locked
+    /// or transiently unreadable archive from turning a live transport into an unbounded queue.
+    /// Rows beyond the ceiling are the least recent rows and cannot be persisted until the
+    /// archive becomes readable, so keeping the newest window is the useful failure behavior.
+    static let maximumReadingsWhileArchiveUnavailable = 10_000
 
     private(set) var loadState: LoadState
 
@@ -141,9 +157,12 @@ final class HealthStore {
     func upsert(_ source: DataSource) -> DataSource {
         if let index = sources.firstIndex(where: { $0.id == source.id }) {
             var existing = sources[index]
+            let now = Date.now
             existing.displayName = source.displayName
             existing.model = source.model ?? existing.model
-            existing.lastSeenAt = source.lastSeenAt ?? existing.lastSeenAt
+            existing.lastSeenAt = [existing.lastSeenAt, source.lastSeenAt]
+                .compactMap { boundedLastSeen($0, now: now) }
+                .max()
             existing.bodyLocation = source.bodyLocation ?? existing.bodyLocation
             if let battery = source.batteryPercent { existing.batteryPercent = battery }
             existing.observedMetrics.formUnion(source.observedMetrics)
@@ -152,6 +171,7 @@ final class HealthStore {
             return existing
         }
         var newSource = source
+        newSource.lastSeenAt = boundedLastSeen(source.lastSeenAt)
         newSource.colorIndex = nextColorIndex()
         sources.append(newSource)
         scheduleSave()
@@ -202,6 +222,7 @@ final class HealthStore {
 
     func markSeen(sourceID: String, at date: Date = .now) {
         guard let index = sources.firstIndex(where: { $0.id == sourceID }) else { return }
+        guard let date = boundedLastSeen(date) else { return }
         sources[index].lastSeenAt = date
     }
 
@@ -241,9 +262,14 @@ final class HealthStore {
         var accepted: [Reading] = []
         accepted.reserveCapacity(newReadings.count)
         var seen: Set<UUID> = []
+        let now = Date.now
         for reading in newReadings {
             guard reading.isPlausible else {
                 logger.debug("Rejected implausible \(reading.kind.rawValue, privacy: .public) value \(reading.value)")
+                continue
+            }
+            guard isTemporallyValid(reading, now: now) else {
+                logger.debug("Rejected \(reading.kind.rawValue, privacy: .public) reading with invalid dates")
                 continue
             }
             guard idIndex[reading.id] == nil, seen.insert(reading.id).inserted else { continue }
@@ -259,6 +285,7 @@ final class HealthStore {
 
         rewindCompactionIfNeeded(for: accepted)
         merge(sortedByEnd(accepted))
+        trimUnavailableArchiveBufferIfNeeded()
         noteObserved(accepted)
         scheduleSave()
         return accepted
@@ -282,9 +309,14 @@ final class HealthStore {
         // batch's own order for determinism.
         var latestByID: [UUID: Reading] = [:]
         var orderedIDs: [UUID] = []
+        let now = Date.now
         for reading in newReadings {
             guard reading.isPlausible else {
                 logger.debug("Rejected implausible \(reading.kind.rawValue, privacy: .public) value \(reading.value)")
+                continue
+            }
+            guard isTemporallyValid(reading, now: now) else {
+                logger.debug("Rejected \(reading.kind.rawValue, privacy: .public) reading with invalid dates")
                 continue
             }
             guard idIndex[compactedReadingID(for: reading)] == nil else { continue }
@@ -313,6 +345,7 @@ final class HealthStore {
             rebuildIndexes()
         }
         merge(sortedByEnd(changed))
+        trimUnavailableArchiveBufferIfNeeded()
         noteObserved(changed)
         scheduleSave()
         return changed
@@ -393,6 +426,43 @@ final class HealthStore {
     }
 
     // MARK: - Ordered storage
+
+    private func boundedLastSeen(_ date: Date?, now: Date = .now) -> Date? {
+        guard let date, date.timeIntervalSinceReferenceDate.isFinite else { return nil }
+        return min(date, now)
+    }
+
+    /// Keeps failed-load buffering finite without applying destructive retention/compaction to a
+    /// store whose on-disk contents are not known yet. Once the archive is readable, the normal
+    /// retention and compaction rules resume and this path is inactive.
+    private func trimUnavailableArchiveBufferIfNeeded() {
+        guard persistenceEnabled, loadState == .failed else { return }
+        let excess = readings.count - Self.maximumReadingsWhileArchiveUnavailable
+        guard excess > 0 else { return }
+        readings.removeFirst(excess)
+        rebuildIndexes()
+        compactionCursor = nil
+    }
+
+    /// Stored readings must be finite, ordered intervals whose start is not in the future. BLE
+    /// applies a stricter device-clock age/skew policy before this shared boundary; this guard
+    /// also protects HealthKit/Oura replays and keeps bad rows out of the archive even if another
+    /// transport bypasses its own admission helper. An end after `now` is allowed only for the
+    /// app's current-day estimates or Oura's daily interval, whose exclusive end is at most one
+    /// day ahead.
+    private func isTemporallyValid(_ reading: Reading, now: Date) -> Bool {
+        guard reading.start.timeIntervalSinceReferenceDate.isFinite,
+              reading.end.timeIntervalSinceReferenceDate.isFinite,
+              reading.start <= reading.end,
+              reading.start <= now
+        else { return false }
+
+        guard reading.end > now else { return true }
+        let isCurrentDayAggregate = reading.provenance == .estimated
+            || reading.sourceID == DataSource.ouraSourceID
+        return isCurrentDayAggregate
+            && reading.end.timeIntervalSince(now) <= 86_400
+    }
 
     /// Sorts a batch by `end`, breaking ties by original offset so the result is
     /// deterministic (`Array.sorted` is not a stable sort).
@@ -496,10 +566,13 @@ final class HealthStore {
     private func noteObserved(_ stored: [Reading]) {
         guard !stored.isEmpty else { return }
         var perSource: [String: (metrics: Set<MetricKind>, latest: Date)] = [:]
+        let now = Date.now
         for reading in stored {
             var entry = perSource[reading.sourceID] ?? (metrics: Set<MetricKind>(), latest: Date.distantPast)
             entry.metrics.insert(reading.kind)
-            entry.latest = max(entry.latest, reading.end)
+            // A bad device timestamp must not make a source appear to have been seen in the
+            // future, even during the short interval before the next maintenance pass prunes it.
+            entry.latest = max(entry.latest, min(reading.end, now))
             perSource[reading.sourceID] = entry
         }
         for (sourceID, entry) in perSource {
@@ -511,20 +584,21 @@ final class HealthStore {
 
     // MARK: - Retention and compaction
 
-    /// Drops readings past the retention horizon.
+    /// Drops readings past the retention horizon and readings whose interval starts in the future.
     func prune(now: Date = .now) {
         let cutoff = now.addingTimeInterval(-retention)
-        guard let firstKept = readings.firstIndex(where: { $0.end >= cutoff }) else {
-            if !readings.isEmpty {
-                readings.removeAll()
-                idIndex.removeAll()
-                kindIndex.removeAll()
-            }
-            return
+        let before = readings.count
+        readings.removeAll { reading in
+            !isTemporallyValid(reading, now: now) || reading.end < cutoff
         }
-        guard firstKept > 0 else { return }
-        readings.removeFirst(firstKept)
-        rebuildIndexes()
+        if readings.count != before { rebuildIndexes() }
+        // Archives written by an older build may already contain a future last-seen value. Keep
+        // source status on the same side of the time boundary as the rows that remain.
+        for index in sources.indices {
+            if let lastSeen = sources[index].lastSeenAt, lastSeen > now {
+                sources[index].lastSeenAt = now
+            }
+        }
     }
 
     /// Downsamples history older than `compactionAge` so a long retention window stays
@@ -720,14 +794,38 @@ final class HealthStore {
         guard persistenceEnabled else { return }
         saveTask?.cancel()
         saveTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(3))
+            try? await Task.sleep(for: Self.saveDebounce)
             guard !Task.isCancelled, let self else { return }
             await self.saveNow()
         }
+
+        // Do not reset this task on every append. A live device can therefore keep the useful
+        // three-second trailing debounce while still forcing prune/compact/archive work at a
+        // finite maximum latency.
+        if maximumSaveTask == nil {
+            maximumSaveTask = Task { [weak self] in
+                try? await Task.sleep(for: Self.maximumSaveLatency)
+                guard !Task.isCancelled, let self else { return }
+                await self.saveNow()
+            }
+        }
     }
 
-    func saveNow() async {
-        guard persistenceEnabled else { return }
+    @discardableResult
+    func saveNow() async -> Bool {
+        guard persistenceEnabled else { return false }
+        saveTask?.cancel()
+        saveTask = nil
+        maximumSaveTask?.cancel()
+        maximumSaveTask = nil
+        if loadState == .failed {
+            // There is no safe archive to write yet, but the in-memory emergency buffer still
+            // needs maintenance so a locked-device or transient I/O failure cannot become a
+            // storage DoS while retries are pending. Do not prune/compact an inconclusively
+            // loaded store: its missing history may still replace this session's memory later.
+            trimUnavailableArchiveBufferIfNeeded()
+            return false
+        }
         // The guard that turns an unreadable archive into a retry rather than data loss.
         // Writing from `.notLoaded` or `.failed` would replace the archive with whatever
         // this session happens to hold, which after a locked-device launch is nothing.
@@ -736,14 +834,21 @@ final class HealthStore {
                 hasLoggedSaveRefusal = true
                 logger.error("Refusing to save: archive load has not completed")
             }
-            return
+            return false
         }
         prune()
         compact()
         let readingsSnapshot = readings
         let sourcesSnapshot = sources
-        await ReadingArchive.shared.write(readingsSnapshot, to: ReadingArchive.File.readings)
-        await ReadingArchive.shared.write(sourcesSnapshot, to: ReadingArchive.File.sources)
+        let readingsWritten = await ReadingArchive.shared.write(
+            readingsSnapshot,
+            to: ReadingArchive.File.readings
+        )
+        let sourcesWritten = await ReadingArchive.shared.write(
+            sourcesSnapshot,
+            to: ReadingArchive.File.sources
+        )
+        return readingsWritten && sourcesWritten
     }
 
     /// Removes every stored reading but keeps the configured devices.
