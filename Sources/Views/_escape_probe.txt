@@ -1,2 +1,0 @@
-let parts = examples.map { "\($0.shortTitle) \($0.format($0.agreement.warn))\($0.unit == "%" ? "%" : " \($0.unit)")" }
-return "Tolerances are per metric \u{2014} \(parts.joined(separator: ", ")). ok"
