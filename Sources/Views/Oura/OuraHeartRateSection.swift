@@ -6,10 +6,18 @@ import SwiftUI
 /// This is Oura's processed cloud series, not a live sensor stream: the window is measured
 /// back from the newest cached sample, so the footer says "Last 24 hours in cache" rather
 /// than implying the chart is current.
+///
+/// Every projection the card draws comes from one `OuraHeartRateSeries`, resolved once per
+/// update. Deriving points inside computed properties instead put a full parse-and-sort of
+/// the whole cached collection inside the `Chart` content closure, which Swift Charts runs
+/// once per plotted sample — that is what froze the Oura tab, and why the derivation now
+/// lives in a value the closure only reads stored properties from.
 struct OuraHeartRateSection: View {
     var heartRates: [OuraClient.HeartRatePoint]
 
     var body: some View {
+        let series = OuraHeartRateSeries(heartRates: heartRates)
+
         VStack(alignment: .leading, spacing: 12) {
             OuraSectionHeading(
                 title: "Heart rate",
@@ -18,79 +26,72 @@ struct OuraHeartRateSection: View {
             )
 
             VStack(alignment: .leading, spacing: 12) {
-                if heartChartPoints.isEmpty {
+                if series.points.isEmpty {
                     OuraInlineEmptyState(icon: "heart.slash", text: "No heart-rate samples in the current Oura cache.")
                 } else {
-                    Chart(heartChartPoints) { point in
-                        AreaMark(
-                            x: .value("Time", point.date),
-                            yStart: .value("Baseline", heartChartFloor),
-                            yEnd: .value("Heart rate", point.bpm)
-                        )
-                        .foregroundStyle(
-                            LinearGradient(
-                                colors: [.pink.opacity(0.24), .pink.opacity(0.02)],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .interpolationMethod(.catmullRom)
-
-                        LineMark(
-                            x: .value("Time", point.date),
-                            y: .value("Heart rate", point.bpm)
-                        )
-                        .foregroundStyle(.pink)
-                        .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .interpolationMethod(.catmullRom)
-                    }
-                    .chartYAxis {
-                        AxisMarks(position: .leading)
-                    }
-                    .chartXAxis {
-                        AxisMarks(values: .automatic(desiredCount: 4)) { _ in
-                            AxisGridLine()
-                            AxisValueLabel(format: .dateTime.hour().minute())
-                        }
-                    }
-                    .frame(height: 210)
-
-                    HStack {
-                        if let low = heartChartPoints.map(\.bpm).min(),
-                           let high = heartChartPoints.map(\.bpm).max() {
-                            Label("\(Int(low))–\(Int(high)) bpm", systemImage: "arrow.up.arrow.down")
-                        }
-                        Spacer()
-                        Text("Last 24 hours in cache")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    chart(series)
+                    footer(series)
                 }
             }
             .ouraCard()
         }
     }
 
-    /// Samples whose timestamp Oura could not supply in a parseable form are dropped rather
-    /// than plotted at a guessed time.
-    private var heartChartPoints: [HeartChartPoint] {
-        let all = heartRates.compactMap { point -> HeartChartPoint? in
-            guard let date = OuraClient.parseTimestamp(point.timestamp) else { return nil }
-            return HeartChartPoint(id: "\(point.timestamp)-\(point.bpm)", date: date, bpm: Double(point.bpm))
+    private func chart(_ series: OuraHeartRateSeries) -> some View {
+        Chart(series.points) { point in
+            AreaMark(
+                x: .value("Time", point.date),
+                yStart: .value("Baseline", series.floor),
+                yEnd: .value("Heart rate", point.bpm)
+            )
+            .foregroundStyle(
+                LinearGradient(
+                    colors: [.pink.opacity(0.24), .pink.opacity(0.02)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+            .interpolationMethod(.catmullRom)
+
+            LineMark(
+                x: .value("Time", point.date),
+                y: .value("Heart rate", point.bpm)
+            )
+            .foregroundStyle(.pink)
+            .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
+            .interpolationMethod(.catmullRom)
         }
-        .sorted { $0.date < $1.date }
-        guard let newest = all.last?.date else { return [] }
-        let cutoff = newest.addingTimeInterval(-86_400)
-        return all.filter { $0.date >= cutoff }
+        .chartYAxis {
+            AxisMarks(position: .leading)
+        }
+        .chartXAxis {
+            AxisMarks(values: .automatic(desiredCount: 4)) { _ in
+                AxisGridLine()
+                AxisValueLabel(format: .dateTime.hour().minute())
+            }
+        }
+        .frame(height: 210)
     }
 
-    private var heartChartFloor: Double {
-        max(0, (heartChartPoints.map(\.bpm).min() ?? 40) - 8)
-    }
-}
+    /// The range comes from every sample in the window, not only the drawn ones, and the
+    /// note says outright when the line is a subset. Drawing part of the window silently
+    /// would misstate how much data is behind it.
+    @ViewBuilder
+    private func footer(_ series: OuraHeartRateSeries) -> some View {
+        HStack {
+            if let low = series.lowest, let high = series.highest {
+                Label("\(low)–\(high) bpm", systemImage: "arrow.up.arrow.down")
+            }
+            Spacer()
+            Text("Last 24 hours in cache")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
 
-private struct HeartChartPoint: Identifiable {
-    var id: String
-    var date: Date
-    var bpm: Double
+        if series.isThinned {
+            Text("Showing \(series.points.count) of \(series.sampleCount) cached samples for legibility, including the lowest and the highest.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
 }

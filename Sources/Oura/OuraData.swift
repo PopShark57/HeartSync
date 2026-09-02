@@ -200,11 +200,23 @@ struct OuraSnapshot: Codable, Hashable, Sendable {
             + batteryLevels.count + ringConfigurations.count
     }
 
+    /// Newest cached heart-rate sample.
+    ///
+    /// Parses each timestamp once rather than inside a comparator: `heartRates` is by far
+    /// the largest collection in the snapshot — a fortnight of five-minute samples is
+    /// thousands of records — and `max(by:)` would parse both sides of every comparison,
+    /// on the main thread, each time the dashboard read this. A sample whose timestamp
+    /// cannot be parsed is not evidence of age, so when none parses the first cached
+    /// sample is returned — matching `max(by:)` when every comparison key is
+    /// `.distantPast` (ties keep the earlier element).
     var latestHeartRate: OuraClient.HeartRatePoint? {
-        heartRates.max {
-            (OuraClient.parseTimestamp($0.timestamp) ?? .distantPast)
-                < (OuraClient.parseTimestamp($1.timestamp) ?? .distantPast)
+        var newest: (point: OuraClient.HeartRatePoint, date: Date)?
+        for point in heartRates {
+            guard let date = OuraClient.parseTimestamp(point.timestamp) else { continue }
+            if let current = newest, date <= current.date { continue }
+            newest = (point, date)
         }
+        return newest?.point ?? heartRates.first
     }
 
     var latestActivity: OuraClient.DailyActivity? { activities.max { $0.day < $1.day } }
