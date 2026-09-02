@@ -9,6 +9,7 @@ struct HeartSyncApp: App {
         WindowGroup {
             RootView()
                 .environment(model)
+                .tint(HeartSyncTheme.accent)
                 .task { await model.start() }
         }
         .onChange(of: scenePhase) { _, phase in

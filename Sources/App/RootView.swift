@@ -5,7 +5,7 @@ struct RootView: View {
 
     var body: some View {
         TabView {
-            Tab("Now", systemImage: "waveform.path.ecg.rectangle") {
+            Tab("Now", systemImage: "heart.fill") {
                 DashboardView()
             }
             Tab("Oura", systemImage: "circle.circle.fill") {
@@ -21,6 +21,7 @@ struct RootView: View {
                 SettingsView()
             }
         }
+        .tint(HeartSyncTheme.accent)
     }
 }
 
