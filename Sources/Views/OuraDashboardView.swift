@@ -115,7 +115,11 @@ struct OuraDashboardView: View {
 
     private var dashboard: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 24) {
+            // Eager stack on purpose. This page is a fixed handful of section cards, and a
+            // Swift Charts plot (Heart rate) nested in LazyVStack triggers an unbounded
+            // layout negotiation that freezes scrolling once that chart enters the lazy
+            // viewport - roughly a third of the way down. Lazy loading buys nothing here.
+            VStack(alignment: .leading, spacing: 24) {
                 connectionHeader
 
                 if model.oura.snapshot.hasData {
