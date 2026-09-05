@@ -16,6 +16,7 @@ final class AppModel {
     let bluetooth = BluetoothManager()
     let healthKit = HealthKitManager()
     let oura = OuraManager()
+    private let watchCompanion = WatchCompanionPublisher()
 
     enum StartupState: Equatable, Sendable {
         case loading
@@ -70,6 +71,16 @@ final class AppModel {
         }
         #endif
 
+        watchCompanion.start(store: store) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.watchCompanion.publishNow()
+                // Watch messages may arrive while protected history is still loading.
+                guard self.startupState == .ready else { return }
+                await self.refresh()
+                self.watchCompanion.publishNow()
+            }
+        }
         await settings.loadIfNeeded()
         await store.loadIfNeeded()
         guard store.loadState == .loaded else {
@@ -124,6 +135,7 @@ final class AppModel {
         startDerivedMetrics()
         startOuraSchedule()
         updateStartupPresentation()
+        watchCompanion.publishNow()
     }
 
     func retryStartup() async {
@@ -168,6 +180,7 @@ final class AppModel {
             await oura.sync()
         }
         recomputeDerivedMetrics()
+        watchCompanion.publishNow()
     }
 
     /// Pushes the user's retention preference into the store, and pins the compaction
@@ -198,6 +211,7 @@ final class AppModel {
         bluetooth.stopScan()
         await store.saveNow()
         await settings.saveNow()
+        watchCompanion.publishNow()
     }
 
     enum DataResetMode: Sendable {

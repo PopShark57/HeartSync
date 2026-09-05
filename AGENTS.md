@@ -12,7 +12,7 @@ HeartSync is a SwiftUI iOS 18+ application for collecting and comparing health m
 
 All three paths normalize data into the same `DataSource` and `Reading` model. `AppModel` routes normalized readings into `HealthStore`, optional derived estimates, comparison analysis, and optional HealthKit write-back. The app is deliberately careful to distinguish measured, derived, and estimated data and to represent insufficient comparison evidence honestly.
 
-The repository contains one iOS application module, one hosted Swift Testing bundle, one UI-test bundle, and a separate device-performance test bundle. There is no server, watchOS app, app extension, widget, framework target, or local Swift package.
+The repository contains iOS and watchOS applications, a watchOS WidgetKit complication extension, an iOS hosted Swift Testing bundle, an iOS UI-test bundle, and a separate device-performance test bundle. There is no server, reusable framework target, or local Swift package.
 
 ## High-Level Architecture
 
@@ -48,6 +48,10 @@ HeartSyncApp
 | `Sources/Model` | Canonical metric, reading, source, provenance, user-profile, discrepancy, and evidence value types. |
 | `Sources/Store` | Observable store boundary, transactional indexed SQLite database, small atomic JSON archives, settings, Keychain wrapper, and stable-ID generation. |
 | `Sources/Bluetooth` | CoreBluetooth lifecycle, SIG GATT constants, safe binary reader, and typed measurement parsers. |
+| `Sources/Watch` | iPhone snapshot projection and coalesced WatchConnectivity publication. |
+| `Shared` | Versioned display payload, WatchConnectivity session, and workout presentation values compiled into both apps. |
+| `WatchApp` | Native watchOS SwiftUI dashboard, HealthKit workout manager, resources, and entitlements. |
+| `WatchComplications` | WidgetKit measurement and workout complications, metric intent, resources, and App Group entitlement. |
 | `Sources/Health` | HealthKit authorization, anchored queries, unit/source conversion, background delivery, and measured-value write-back. |
 | `Sources/Oura` | OAuth, Keychain-backed credentials, API transport/DTOs, endpoint status, token-free cache, sync orchestration, and scalar mapping. |
 | `Sources/Analysis` | Comparison/windowing/statistics, HRV, estimators, and pairwise export. These are mostly pure or value-oriented. |
@@ -67,26 +71,32 @@ HeartSyncApp
 
 | Target | Type | Sources | Important identity |
 | --- | --- | --- | --- |
-| `HeartSyncChecker` | iOS application | All of `Sources` and the non-plist contents of `Resources` | Bundle ID `com.heartsync.HeartSyncChecker`; product/executable `HeartSync`; Swift module `HeartSyncChecker` |
+| `HeartSyncChecker` | iOS application | All of `Sources`, `Shared`, and the non-plist contents of `Resources` | Bundle ID `com.heartsync.HeartSyncChecker`; product/executable `HeartSync`; Swift module `HeartSyncChecker` |
+| `HeartSyncWatch` | watchOS application | `WatchApp/Sources`, `Shared`, selected model files | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp`; product/module `HeartSyncWatch`; display name HeartSync |
+| `HeartSyncWatchComplications` | watchOS app extension | `WatchComplications/Sources`, selected shared/model files | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp.complications`; embedded in watch app |
 | `HeartSyncCheckerTests` | Hosted iOS unit-test bundle | All of `Tests` | Imports `@testable import HeartSyncChecker`; explicit host is `HeartSync.app/HeartSync` |
 | `HeartSyncCheckerUITests` | iOS UI-test bundle | All of `UITests` | Drives deterministic Debug-only launch scenarios; targets `HeartSyncChecker` |
 | `HeartSyncCheckerPerformanceTests` | Hosted iOS unit-test bundle | All of `PerformanceTests` | Manual physical-device release workload; explicit host is `HeartSync.app/HeartSync` |
 
-The `HeartSyncChecker` scheme runs the normal unit and UI bundles. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI. Debug and Release configurations are generated.
+The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI. Debug and Release configurations are generated.
 
 The target/product/module naming difference is intentional and fragile: the target, scheme, and module are `HeartSyncChecker`, but the installed bundle and executable are `HeartSync`. Preserve `PRODUCT_NAME`, `PRODUCT_MODULE_NAME`, `TEST_HOST`, and `BUNDLE_LOADER` together.
 
 There are no:
 
-- watchOS, macOS, visionOS, tvOS, or Mac Catalyst targets;
-- app extensions, widgets, notification extensions, or reusable framework targets;
+- macOS, visionOS, tvOS, or Mac Catalyst targets;
+- iOS widget extensions, notification extensions, or reusable framework targets;
 - `Package.swift`, `Package.resolved`, SwiftPM package dependencies, CocoaPods, or Carthage dependencies.
 
-The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, CryptoKit, and SQLite3. Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
+The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, CryptoKit, WatchConnectivity, WatchKit, WidgetKit, AppIntents, and SQLite3. Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
 
 ## Shared Versus Platform-Specific Code
 
-Every file under `Sources` is compiled into the one iOS app module. “Shared” in this repository means logically reusable code, not a separately compiled cross-platform module.
+Every file under `Sources` is compiled into the iOS app module. `Shared` plus `MetricKind`, `DiscrepancySeverity`, and `Provenance` are also compiled directly into the watchOS app. There is no separate shared framework or package. The watch does not compile the iPhone store, transports, or views.
+
+The complication extension compiles only its own sources, the watch snapshot/projection/cache,
+and the selected metric/provenance models. It does not compile `CompanionSession` or workout
+code and does not access HealthKit. App Group sharing is local to the watch, not a phone sync path.
 
 - Mostly value-oriented and reusable: `Sources/Analysis`, most of `Sources/Model`, `OuraClient`/Oura DTOs, `ReadingArchive`, and stable IDs.
 - iOS/UI-specific: `Sources/App` and `Sources/Views`.
@@ -163,7 +173,7 @@ The restoration identifier is `com.heartsync.central`. `UIBackgroundModes = blue
 
 ## HealthKit and Apple Watch Architecture
 
-There is no watchOS app and no WatchConnectivity code. Apple Watch measurements arrive only after HealthKit syncs them to the iPhone. Do not add or imply direct Apple Watch BLE access.
+The native watchOS companion records user-started workouts with `HKWorkoutSession` and `HKLiveWorkoutBuilder`. Its heart-rate samples arrive on iPhone through the existing HealthKit import after system sync. WatchConnectivity carries a display snapshot from iPhone and refresh requests from watch; it never ingests a second copy of workout samples. Do not add or imply direct Apple Watch BLE access.
 
 `HealthKitManager.TypeMapping` owns the HealthKit identifier, metric, unit, and scale. Current reads include heart rate, resting heart rate, SDNN HRV, oxygen saturation, respiratory rate, VO2 max, body temperature, and blood pressure. HealthKit oxygen saturation is a fraction and is multiplied by 100 on ingestion. There is no HealthKit RMSSD mapping.
 
@@ -182,6 +192,50 @@ Authorization and synchronization rules:
 HealthKit readings currently use `hk.<source bundle identifier>` as the source ID and keep the device model as metadata. A nearby model comment describes a more specific identity than the implementation supplies. Treat the implemented ID formula as migration-sensitive; changing it can split or duplicate historical sources.
 
 The manager starts each process with authorization state `.notDetermined`, and startup synchronization depends on current manager state. Relaunch behavior, enabling write-back after prior read-only authorization, and per-type permissions require on-device validation before changing their UI or lifecycle behavior.
+
+## watchOS Companion
+
+`HeartSyncWatch` is a watchOS 11+ application embedded in `HeartSync.app/Watch`, with the
+`HeartSyncWatchComplications` WidgetKit extension in its `PlugIns` directory.
+The watch app can record workouts without a reachable iPhone. Its dashboard requires a
+snapshot from the paired iPhone and always labels measurement time separately from sync time.
+
+- `WatchSnapshotBuilder` uses `HealthStore` indexed queries and `ComparisonEngine`. Only the
+  four most recent sources per metric are displayed, but comparisons include every enabled
+  source. Comparison spans are one hour for fast metrics and seven days for daily metrics.
+- `WatchCompanionPublisher` observes source changes, reading generations, and load state;
+  it coalesces ordinary publications to at most once every 30 seconds while iOS is running.
+  Foreground refresh and WatchConnectivity activation can publish immediately. This is not
+  an always-running background timer or a guaranteed delivery interval.
+- `CompanionSession` uses `updateApplicationContext` for latest-state delivery and reachable
+  messages for user refresh. Its versioned payload is capped at 60 KB, excludes credentials,
+  rejects malformed data, and ignores older contexts after newer resets. The watch restores
+  the OS-managed received context. `WatchComplicationStore` caches one replaceable display
+  snapshot for the extension; there is no second health history database.
+- Complications share `group.com.heartsync.HeartSyncChecker.watch` between the watch app and
+  extension only. Both profiles must include App Groups. The cache is validated, bounded to
+  60 KB, atomic, protected until first unlock, and excluded from backup. Cache writes and
+  timeline reload requests happen before completing WatchConnectivity background tasks.
+- Measurement complications support seven non-estimated metrics in circular, rectangular,
+  inline, and corner families, using the newest displayed source with stable tie-breaking.
+  Preserve derived/median labels, explicit empty/old states, and measurement-time freshness.
+  Schedule a future stale entry; WidgetKit reload timing remains system-controlled. Mark
+  measurement views privacy-sensitive. `heartsync-watch` links open metric details or workout
+  controls and must never start a workout. Preview fixtures must not enter the shared cache.
+- `WatchWorkoutManager` requests only Workouts/Heart Rate, collects heart rate in a genuine
+  user-started workout, supports pause/resume and review/save/discard, retains a failed save
+  for retry, and reconnects a recovered session through `WKApplicationDelegate`.
+- Use HealthKit's builder elapsed time, which excludes pauses. Use the sample timestamp to
+  mark heart rate older than 15 seconds; receipt time does not make an old sample live.
+- Read permission is never inferred from authorization-sheet completion. A workout may
+  contain no accessible heart-rate samples. Discarding the workout does not promise deletion
+  of samples Apple Watch independently collected.
+- The watch's separate App ID needs HealthKit and the same team `7RLDYXQTNX`. Its generated
+  plist declares `WKApplication`, the exact iPhone companion ID, workout processing, and
+  Health privacy text. Do not add HealthKit background delivery or location/route access.
+- `--watch-demo` in Debug displays synthetic dashboard data without activating connectivity.
+  Workout recording still requires an explicit Start action; never start workouts during
+  screenshot-only validation. See `WatchApp/README.md` for build and hardware checks.
 
 ## Oura Networking and OAuth
 
@@ -241,7 +295,8 @@ HealthKit query anchors use `UserDefaults` keys prefixed with `hk.anchor.`. Pair
 
 The version-1 whole-file reading/source archives are migration inputs only. Do not reintroduce a parallel reading persistence path beside SQLite. Compaction bounds old high-frequency history but still sacrifices individual samples, the full within-window distribution, and later corrections; preserve its explicit aggregation metadata and unknown legacy evidence.
 
-There is no Core Data, SwiftData, CloudKit, App Group container, shared Keychain group, or remote database.
+There is no Core Data, SwiftData, CloudKit, shared Keychain group, or remote database. The watch
+App Group holds only the disposable complication display cache; iPhone history remains in SQLite.
 
 ## Analysis and Data-Integrity Invariants
 
@@ -297,14 +352,14 @@ There are no storyboards or XIBs. Do not introduce UIKit architecture for an iso
 
 ## Platform Constraints and Capabilities
 
-- Minimum deployment target: iOS 18.0.
+- Minimum deployment targets: iOS 18.0 and watchOS 11.0.
 - Supported device families: iPhone and iPad.
 - Mac Catalyst is disabled. “Designed for iPhone/iPad” execution on Apple silicon is not a supported native macOS target and does not validate device integrations.
 - iPhone supports portrait and both landscape orientations. iPad declares all four orientations.
 - Real Bluetooth and meaningful HealthKit behavior require a physical iPhone; simulator builds only validate compilation, pure logic, mocked networking, and fixture-driven UI.
 - The app declares base HealthKit and HealthKit background-delivery entitlements; the HealthKit access array is empty. The background-delivery capability and provisioning remain unverified on a signed physical-device build.
 - The shipped plist contains Bluetooth and Health privacy descriptions, the Oura custom URL scheme, and `bluetooth-central` background mode.
-- There are no App Groups, Keychain sharing groups, iCloud/CloudKit containers, widgets, local/push notification code, notification extensions, WatchConnectivity sessions, or background-task registrations.
+- The watch app and its WidgetKit extension share one App Group for complications. There are no iPhone App Groups, Keychain sharing groups, iCloud/CloudKit containers, local/push notification code, notification extensions, or BGTaskScheduler registrations. The watch declares workout processing and uses WatchConnectivity; it has no route/location capability.
 
 Any new capability must be explicitly requested and must update `project.yml`, generated resource files, signing/provisioning, documentation, and validation. Do not infer that a capability exists because a system framework is imported.
 
@@ -388,7 +443,7 @@ The repository currently pins development team `7RLDYXQTNX`. Do not silently rep
 
 ## Tests
 
-The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@Suite`, `@Test`, `#expect`, and `#require`). It currently contains 268 test declarations in 38 suites. The UI bundle uses XCTest/XCUIAutomation, and the separate performance bundle uses Swift Testing:
+The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@Suite`, `@Test`, `#expect`, and `#require`). Watch payload, projection, freshness, and companion HealthKit identity regressions are in `Tests/Watch` and `Tests/HealthKitConversionTests.swift`; count declarations from the current source rather than relying on an older total. The UI bundle uses XCTest/XCUIAutomation, and the separate performance bundle uses Swift Testing:
 
 - `Tests/AnalysisTests.swift`: 53 tests covering HRV, comparison/windowing/statistics/evidence, chart thinning, estimators, Oura mapping, debug fixtures, and stable identifiers.
 - `Tests/ParsingTests.swift`: 22 tests covering binary reads and GATT measurement parsing, including units, optional fields, PLX status fields, and invalid frames.
@@ -497,7 +552,7 @@ When a comment and implementation disagree, document the discrepancy and test ac
 - Do not change the CoreBluetooth queue while retaining `MainActor.assumeIsolated` delegate handling.
 - Do not weaken validity checks or parser units to accommodate one device without representative frames and regression tests.
 - Do not claim proprietary/vendor BLE support. The current implementation supports standards-compliant GATT profiles only.
-- Do not add a watchOS target or WatchConnectivity path merely because Apple Watch data appears in the product; HealthKit is the current architecture.
+- Keep watch workout sample import on HealthKit. Do not duplicate live samples into the iPhone store over WatchConnectivity or treat the wrist display snapshot as new measurements.
 - Do not claim App Groups, CloudKit, Keychain sharing, widgets, notifications, or background tasks that are not configured.
 - Do not use a simulator build as proof that BLE, HealthKit, background delivery, signing, OAuth presentation, or TCC/privacy behavior works.
 - Do not add broad abstractions, dependencies, style rewrites, or unrelated refactors for a narrowly scoped task.

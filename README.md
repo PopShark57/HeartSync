@@ -10,7 +10,7 @@ Three transports, because these devices genuinely do not speak one protocol:
 | Source | Transport | Why |
 |---|---|---|
 | Chest straps, generic rings, pulse oximeters | **Bluetooth LE** | They implement the standard GATT profiles, so they can be read directly and live. |
-| Apple Watch | **HealthKit** | The Watch is not a BLE peripheral third-party apps can connect to. Its data only exists in Health. |
+| Apple Watch | **HealthKit** | Apple Watch readings reach iPhone through HealthKit. The native companion also records live heart-rate workouts on the watch; it is not a BLE peripheral. |
 | Oura Ring | **Oura Cloud API v2** | The ring's Bluetooth protocol is proprietary and undocumented. The Cloud API is the supported route. |
 
 Bluetooth support covers the SIG-standard services:
@@ -85,11 +85,13 @@ Bluetooth spec uses whole percent (97). These are normalised on ingest.
 
 ## Data handling
 
-Everything stays on device. There is no HeartSync account and no server. Oura authentication
+HeartSync's local history stays on your devices; the paired watch receives a display snapshot.
+There is no HeartSync account and no server. Oura authentication
 opens `cloud.ouraring.com`; subsequent read-only requests go to `api.ouraring.com` using an
 OAuth access token stored in the device-only keychain (never synced to iCloud). No Oura
-client secret is embedded in the app. Writing readings back into Apple Health is off by
-default, and only ever writes directly measured values — never an estimate.
+client secret is embedded in the app. The iPhone's optional Bluetooth write-back is off by
+default and only writes directly measured values. The watch separately records user-started
+workouts in Apple Health; estimated values are never written there.
 
 Readings and sources live in one indexed SQLite database under Application Support. Source
 metadata and reading changes commit in the same transaction, and range queries seek by metric,
@@ -157,9 +159,42 @@ provisioning profile to carry both HealthKit and HealthKit Background Delivery c
 **Bluetooth and HealthKit only work on a real device** — the simulator has no BLE radio and
 no Health data.
 
+## Apple Watch companion
+
+HeartSync includes a native **watchOS 11+** app with two screens:
+
+- **Dashboard:** latest readings from your iPhone, source names, measured/derived/estimated
+  badges, timestamps, and comparison evidence. Tap a metric for the available sources and
+  evidence details. Open HeartSync on iPhone to sync; Refresh requests an update when reachable.
+- **Workout:** start Other, Walking, Running, or Cycling; view live heart rate and elapsed
+  time; pause/resume; then review and save to Apple Health or discard. Workout recording works
+  without a connected iPhone. It requires permission on the watch.
+
+Watch faces also offer **HeartSync Measurement** and **HeartSync Workout** complications in
+circular, rectangular, inline, and corner slots. Choose heart rate, resting heart rate, SpO₂,
+RMSSD, SDNN, respiratory rate, or temperature for each measurement slot. Old readings are
+explicitly labelled, estimates are excluded, and tapping opens the corresponding details.
+The workout shortcut opens controls without starting a recording. Rectangular versions also
+support the Smart Stack. Updates use the last iPhone snapshot and watchOS scheduling.
+
+The dashboard is a snapshot, not a live stream from iPhone. Older readings stay labelled;
+missing overlap never becomes agreement. It shows up to four sources per metric and compares
+all enabled sources using the iPhone engine. Fast metrics use the past hour; daily metrics use
+seven days. Full plots and exports remain on iPhone.
+
+Saved watch readings arrive through HealthKit sync and the existing iPhone import. Connect
+Apple Health in HeartSync on iPhone and refresh after system sync. HeartSync does not create a
+second copy over WatchConnectivity. The watch receives no Oura credentials.
+
+Select the **HeartSyncWatch** scheme to run the watch app. The iPhone scheme embeds it.
+The watch App ID needs HealthKit and App Groups provisioning under the existing development
+team. Its embedded complication extension shares `group.com.heartsync.HeartSyncChecker.watch`
+with the watch app. Both profiles must include this group; the extension has no HealthKit access.
+See [Watch setup and validation](WatchApp/README.md) for commands and device checks.
+
 ## Tests
 
-The hosted bundle contains 268 Swift Testing declarations covering GATT/PLX admission,
+The hosted bundle includes Swift Testing coverage for GATT/PLX admission,
 Bluetooth discovery state, transactional SQLite migration and indexed queries, retention and
 compaction provenance, archive/settings recovery, HealthKit outcomes and source relationships,
 real HRV observation intervals, pairwise grades/confidence intervals, exports, estimates, OAuth,
@@ -180,6 +215,7 @@ xcodebuild test -project HeartSyncChecker.xcodeproj -scheme HeartSyncChecker \
 
 ```
 Sources/
+  Watch/       iPhone snapshot builder and coalesced companion publisher
   Model/       MetricKind (units, tolerances), Reading, DataSource, Discrepancy
   Bluetooth/   GATT UUIDs, BinaryReader, measurement parsers, BluetoothManager
   Health/      HealthKitManager — Apple Watch and anything else writing to Health
@@ -187,6 +223,8 @@ Sources/
   Analysis/    ComparisonEngine, pair export, HRVCalculator, Estimators
   Store/       SQLite-backed store, legacy/small JSON archives, keychain, settings
   Views/       Dashboard, Oura explorer, Compare, pair analysis, Devices, Settings
+Shared/        Display payload, WatchConnectivity, workout presentation values
+WatchApp/      watchOS dashboard, live heart-rate workouts, watch resources
 ```
 
 For UI development without physical wearables, launch a Debug build with

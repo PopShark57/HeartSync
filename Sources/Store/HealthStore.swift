@@ -17,6 +17,8 @@ final class HealthStore {
 
     private(set) var sources: [DataSource] = []
     private var dataGeneration = 0
+    /// Observed invalidation token for bounded external display projections.
+    var changeToken: Int { dataGeneration }
     private var unavailableBuffer: [Reading] = []
     private var bufferedIDs: Set<UUID> = []
 
