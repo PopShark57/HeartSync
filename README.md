@@ -91,15 +91,27 @@ OAuth access token stored in the device-only keychain (never synced to iCloud). 
 client secret is embedded in the app. Writing readings back into Apple Health is off by
 default, and only ever writes directly measured values — never an estimate.
 
-Readings, sources, settings, and the token-free Oura cache use versioned, atomic JSON archives
-under Application Support. They are protected until the first device unlock after boot and
-remain eligible for encrypted device backup; a temporarily unreadable archive is never treated
-as empty or overwritten. To bound a long-retention whole-file archive, readings older than 14
-days are irreversibly reduced to one median per source, metric, and comparison window. This
-preserves the comparison value and verdict, but permanently discards individual samples, raw
-counts, within-window spread, and later corrections to those windows.
+Readings and sources live in one indexed SQLite database under Application Support. Source
+metadata and reading changes commit in the same transaction, and range queries seek by metric,
+source, and time instead of decoding the whole history. A first launch after upgrade migrates
+the previous version-1 JSON archives without changing stable IDs. Settings and the token-free
+Oura cache remain small versioned JSON archives.
+
+The database, its write-ahead log, and the remaining archives use file protection until the
+first device unlock after boot and remain eligible for encrypted device backup; a temporarily
+unreadable store is never treated as empty or overwritten. Readings older than 14 days are
+irreversibly reduced to one median per source, metric, and comparison window. New compacted
+rows retain their original sample count and within-window spread; older migrated compacted rows
+show those facts as unknown. Individual samples and later corrections or upstream deletions for
+a compacted window cannot be recovered.
 
 ### Oura OAuth setup
+
+Oura is an **advanced optional integration for personal/developer builds**. The core Bluetooth
+and Apple Health experience works without it. HeartSync does not currently ship a registered
+first-party Oura client identity, so this setup intentionally asks each user who enables Oura
+to create an OAuth application. A consumer distribution would need a separately reviewed
+production client registration and onboarding design.
 
 Personal access tokens were retired by Oura in December 2025. HeartSync uses Oura's
 documented client-side OAuth flow so the app can remain serverless and no client secret has
@@ -147,17 +159,21 @@ no Health data.
 
 ## Tests
 
-The hosted bundle contains 212 Swift Testing declarations covering GATT frame parsing,
-HealthStore ingestion/indexing/retention/compaction, archive and settings safety, HealthKit
-conversion/deletions/self-source filtering, HRV artefact rejection, comparison evidence and
-statistics, export semantics, estimator limits, OAuth, Oura mapping, and incremental Oura sync.
-Bluetooth, HealthKit callbacks, background delivery, and UI behavior still require representative
-hardware or an installed iOS simulator as appropriate; compiling the bundle is not evidence that
-those runtime paths passed.
+The hosted bundle contains 268 Swift Testing declarations covering GATT/PLX admission,
+Bluetooth discovery state, transactional SQLite migration and indexed queries, retention and
+compaction provenance, archive/settings recovery, HealthKit outcomes and source relationships,
+real HRV observation intervals, pairwise grades/confidence intervals, exports, estimates, OAuth,
+and Oura deletion/durability behavior. A 7-flow XCUI suite exercises deterministic recovery,
+empty/error, data-control, evidence, and pseudo-localization states in the normal CI scheme.
+The separate `HeartSyncCheckerPerformance` scheme writes the full fourteen-day 1 Hz workload;
+run it on a representative physical iPhone with Instruments before release.
+
+Bluetooth and HealthKit integration, background delivery, and locked-device behavior still
+require representative hardware. Compiling any bundle is not evidence that its tests ran.
 
 ```bash
 xcodebuild test -project HeartSyncChecker.xcodeproj -scheme HeartSyncChecker \
-  -destination 'platform=iOS Simulator,name=iPhone 17'
+  -destination 'platform=iOS Simulator,id=<simulator UDID>'
 ```
 
 ## Layout
@@ -169,7 +185,7 @@ Sources/
   Health/      HealthKitManager — Apple Watch and anything else writing to Health
   Oura/        OAuth, Cloud API v2 models/client, dashboard cache, document→reading mapping
   Analysis/    ComparisonEngine, pair export, HRVCalculator, Estimators
-  Store/       In-memory store, atomic file persistence, keychain, settings
+  Store/       SQLite-backed store, legacy/small JSON archives, keychain, settings
   Views/       Dashboard, Oura explorer, Compare, pair analysis, Devices, Settings
 ```
 

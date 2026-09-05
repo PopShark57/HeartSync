@@ -57,7 +57,17 @@ final class ReadingArchiveTests: Sendable {
     /// Where that name lands on disk.
     private func url(_ file: String) -> URL { directory.appendingPathComponent(file) }
 
-    private func backupURL(_ file: String) -> URL { url(file).appendingPathExtension("corrupt") }
+    private func backupURL(_ file: String) -> URL {
+        let original = url(file)
+        let prefix = original.lastPathComponent + ".corrupt-"
+        let matches = (try? FileManager.default.contentsOfDirectory(
+            at: original.deletingLastPathComponent(),
+            includingPropertiesForKeys: nil
+        ))?.filter { $0.lastPathComponent.hasPrefix(prefix) }.sorted {
+            $0.lastPathComponent < $1.lastPathComponent
+        } ?? []
+        return matches.last ?? original.appendingPathExtension("corrupt-unavailable")
+    }
 
     private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
 
@@ -160,7 +170,6 @@ final class ReadingArchiveTests: Sendable {
         written.mirrorBluetoothToHealthKit = true
         written.discrepancyThreshold = .major
         written.ouraSyncInterval = 1_800
-        written.profile.sex = .female
         written.profile.birthDate = epoch.addingTimeInterval(-86_400 * 365 * 30)
         written.profile.bpCalibration = .init(
             systolic: 118, diastolic: 76,
@@ -372,6 +381,23 @@ final class ReadingArchiveTests: Sendable {
         // app starts over rather than being locked out of persistence for good.
         #expect(await archive.readOutcome([Reading].self, from: name("readings.json")).value == sampleReadings)
         #expect(exists(backupURL("readings.json")))
+    }
+
+    @Test("Repeated corruptions create distinct timestamped recovery files")
+    func repeatedCorruptionsDoNotOverwriteRecovery() async throws {
+        try writeRaw("first broken generation", to: "readings.json")
+        _ = await archive.readOutcome([Reading].self, from: name("readings.json"))
+        try writeRaw("second broken generation", to: "readings.json")
+        _ = await archive.readOutcome([Reading].self, from: name("readings.json"))
+
+        let prefix = "readings.json.corrupt-"
+        let backups = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix(prefix) }
+        #expect(backups.count == 2)
+        let payloads = try Set(backups.map { String(decoding: try Data(contentsOf: $0), as: UTF8.self) })
+        #expect(payloads == ["first broken generation", "second broken generation"])
     }
 
     @Test("A file that cannot be opened is left exactly where it is")

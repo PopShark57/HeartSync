@@ -67,11 +67,13 @@ struct SourceValue: Identifiable, Hashable, Sendable {
     var value: Double
     /// Number of raw samples that went into `value`. A one-sample average from a device
     /// that should be streaming is weak evidence, and the UI shows this.
-    var sampleCount: Int
+    var sampleCount: Int?
     /// Spread of the samples inside the window. High spread means the device itself is
     /// unstable, which is a different problem from two devices disagreeing.
-    var standardDeviation: Double
+    var standardDeviation: Double?
     var provenance: Provenance
+    var isCompacted: Bool = false
+    var qualityCaveatCount: Int = 0
 
     var id: String { sourceID }
 }
@@ -155,6 +157,26 @@ struct PairwiseSummaryStatistics: Hashable, Sendable {
     var limitsOfAgreement: ClosedRange<Double>
     var severity: DiscrepancySeverity
     var classification: PairwiseDifferenceClassification
+    var meanBiasConfidenceInterval: ClosedRange<Double>? = nil
+    var lowerLimitConfidenceInterval: ClosedRange<Double>? = nil
+    var upperLimitConfidenceInterval: ClosedRange<Double>? = nil
+}
+
+enum PairwiseEvidenceGrade: String, Hashable, Sendable {
+    case limited
+    case weak
+    case moderate
+    case strong
+
+    var title: String { rawValue.capitalized }
+}
+
+struct PairwiseEvidenceAssessment: Hashable, Sendable {
+    var grade: PairwiseEvidenceGrade
+    var hasUnknownSampleDepth: Bool
+    var compactedWindowCount: Int
+    var qualityCaveatCount: Int
+    var reasons: [String]
 }
 
 /// Evidence state for a selected metric and device pair.
@@ -189,9 +211,16 @@ struct PairwiseAnalysis: Identifiable, Hashable, Sendable {
     /// First paired-window start through last paired-window end; nil without overlap.
     var analyzedSpan: DateInterval?
     /// Raw samples from A and B that contributed to paired observations.
-    var rawSampleCountA: Int
-    var rawSampleCountB: Int
+    var rawSampleCountA: Int?
+    var rawSampleCountB: Int?
     var state: PairwiseAnalysisState
+    var evidence: PairwiseEvidenceAssessment = PairwiseEvidenceAssessment(
+        grade: .limited,
+        hasUnknownSampleDepth: false,
+        compactedWindowCount: 0,
+        qualityCaveatCount: 0,
+        reasons: []
+    )
 
     var id: String {
         "\(kind.rawValue)\u{001F}\(sourceA)\u{001F}\(sourceB)\u{001F}\(range.start.timeIntervalSinceReferenceDate.bitPattern)\u{001F}\(range.end.timeIntervalSinceReferenceDate.bitPattern)\u{001F}\(windowSize.bitPattern)"

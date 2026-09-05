@@ -573,6 +573,10 @@ struct HealthStoreCompactionTests {
         let windowStart = ComparisonEngine.floorToWindow(alpha[0].midpoint, size: 60)
         #expect(compactedAlpha.start == windowStart)
         #expect(compactedAlpha.end == windowStart.addingTimeInterval(60))
+        #expect(compactedAlpha.metadata?.aggregation?.originalSampleCount == alpha.count)
+        #expect(compactedBravo.metadata?.aggregation?.originalSampleCount == bravo.count)
+        #expect(compactedAlpha.metadata?.aggregation?.originalStandardDeviation != nil)
+        #expect(compactedAlpha.metadata?.aggregation?.correctionsAreFinal == true)
     }
 
     @Test("A second compaction pass changes nothing")

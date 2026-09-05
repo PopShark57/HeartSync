@@ -11,11 +11,20 @@ final class AppModel {
 
     private let logger = Logger(subsystem: "com.heartsync.HeartSyncChecker", category: "App")
 
-    let store = HealthStore(persistenceEnabled: !AppModel.pairwiseDemoEnabled)
-    let settings = AppSettings()
+    let store = HealthStore(persistenceEnabled: !AppModel.debugDataIsolationEnabled)
+    let settings = AppSettings(persistenceEnabled: !AppModel.debugDataIsolationEnabled)
     let bluetooth = BluetoothManager()
     let healthKit = HealthKitManager()
     let oura = OuraManager()
+
+    enum StartupState: Equatable, Sendable {
+        case loading
+        case ready
+        case temporarilyUnavailable(String)
+    }
+
+    private(set) var startupState: StartupState = .loading
+    private(set) var startupNotice: String?
 
     private var derivedTask: Task<Void, Never>?
     private var ouraTimerTask: Task<Void, Never>?
@@ -26,10 +35,37 @@ final class AppModel {
     func start() async {
         guard !hasStarted else { return }
         hasStarted = true
+        startupState = .loading
 
         #if DEBUG
         if Self.pairwiseDemoEnabled {
             DebugAnalysisFixtures.populate(store: store)
+            startupState = .ready
+            return
+        }
+        if let scenario = Self.uiTestScenario {
+            switch scenario {
+            case .loading:
+                return
+            case .startupUnavailable:
+                startupState = .temporarilyUnavailable("readings: simulated protected-file access failure")
+            case .sourcesUnavailable:
+                startupState = .temporarilyUnavailable("sources: simulated protected-file access failure")
+            case .corruptRecovery:
+                startupNotice = "HeartSync recovered by preserving unreadable health data aside: readings: contents could not be decoded."
+                startupState = .ready
+            case .settingsUnavailable:
+                settings.injectLoadFailureForUITesting("settings: simulated protected-file access failure")
+                updateStartupPresentation()
+            case .empty:
+                startupState = .ready
+            case .devices, .retention:
+                DebugUITestFixtures.populateDevices(store: store, includeHistory: scenario == .retention)
+                startupState = .ready
+            case .ouraPartial:
+                oura.injectPartialFailureForUITesting()
+                startupState = .ready
+            }
             return
         }
         #endif
@@ -42,6 +78,10 @@ final class AppModel {
             // or storage is temporarily unavailable. `refresh()` retries `start()` later.
             logger.error("Archive unavailable; delaying transport startup until it can be read")
             hasStarted = false
+            let detail = store.unavailableCollections.joined(separator: "\n")
+            startupState = .temporarilyUnavailable(
+                detail.isEmpty ? (store.lastPersistenceError ?? "The health history database could not be opened.") : detail
+            )
             return
         }
         // Builds predating the HealthKit self-source filter may already have persisted a
@@ -56,18 +96,24 @@ final class AppModel {
         }
         healthKit.configure(
             store: store,
-            onReadings: { [weak self] readings in
-                self?.ingest(readings)
-            },
-            onDeletedSampleIDs: { [weak self] ids in
-                self?.removeDeletedHealthKitSamples(ids)
+            onReadings: { [weak self] readings, sources, deletedIDs in
+                self?.ingest(
+                    readings,
+                    updatingSources: sources,
+                    removingReadingIDs: deletedIDs
+                ) ?? false
             }
         )
         // Cold start always begins as `.notDetermined`; restore a prior Connect without
         // re-prompting so observers install and the sync below can run.
         await healthKit.restoreSessionIfNeeded()
-        await oura.configure(store: store) { [weak self] readings in
-            self?.ingest(readings, replacingExisting: true)
+        await oura.configure(store: store) { [weak self] readings, sources, withdrawnIDs in
+            self?.ingest(
+                readings,
+                updatingSources: sources,
+                removingReadingIDs: withdrawnIDs,
+                replacingExisting: true
+            ) ?? false
         }
 
         // Re-attach to devices already granted, without prompting again.
@@ -77,6 +123,31 @@ final class AppModel {
 
         startDerivedMetrics()
         startOuraSchedule()
+        updateStartupPresentation()
+    }
+
+    func retryStartup() async {
+        if store.loadState != .loaded {
+            hasStarted = false
+            await start()
+            return
+        }
+        await settings.loadIfNeeded()
+        updateStartupPresentation()
+    }
+
+    private func updateStartupPresentation() {
+        startupState = .ready
+        var notices: [String] = []
+        if !store.recoveredCorruptCollections.isEmpty {
+            notices.append("HeartSync recovered by preserving unreadable health data aside: \(store.recoveredCorruptCollections.joined(separator: "; ")).")
+        }
+        if settings.recoveredCorruptArchive {
+            notices.append("Settings were reset after preserving a corrupt settings archive.")
+        } else if settings.loadState == .failed {
+            notices.append("Settings are temporarily unavailable. Controls are read-only and changes will not be saved until Retry succeeds.")
+        }
+        startupNotice = notices.isEmpty ? nil : notices.joined(separator: " ")
     }
 
     /// Called when the app returns to the foreground.
@@ -105,9 +176,10 @@ final class AppModel {
     /// Retention and compaction are separate knobs: retention decides what is *deleted*,
     /// compaction decides what is *downsampled* while still inside retention. Compacting as
     /// early as the store permits preserves the windowed medians and pairwise verdicts that
-    /// comparison and export consume, while permanently discarding raw sample counts and
-    /// within-window spread. This deliberately asks for the floor rather than scaling with
-    /// retention; the Settings copy discloses that irreversible tradeoff. `HealthStore`
+    /// comparison and export consume. New aggregates retain count and standard deviation,
+    /// while old aggregates report unavailable evidence as unknown; individual samples, the
+    /// full distribution, and later correction remain permanently unavailable. This
+    /// deliberately asks for the floor rather than scaling with retention. `HealthStore`
     /// clamps anything below `HealthStore.minimumCompactionAge`, which exists so a 14-day
     /// Oura resync still lands on raw rows.
     ///
@@ -128,19 +200,61 @@ final class AppModel {
         await settings.saveNow()
     }
 
+    enum DataResetMode: Sendable {
+        case clearForResync
+        case forgetImportedHistory
+    }
+
+    /// Performs one coordinated reset and reports whether the database, settings, and Oura
+    /// cache reached durable storage. Apple Health itself is never deleted.
+    func resetLocalData(_ mode: DataResetMode) async -> Bool {
+        let storeCleared = store.deleteAllReadings()
+        let ouraSaved: Bool
+        switch mode {
+        case .clearForResync:
+            healthKit.resetAnchors()
+            ouraSaved = await oura.clearCachedData(keepingAuthorization: true)
+        case .forgetImportedHistory:
+            // Keeping HealthKit anchors means old imported Health history does not
+            // immediately return; future samples after the committed anchors still do.
+            ouraSaved = await oura.clearCachedData(keepingAuthorization: false)
+        }
+        recomputeDerivedMetrics()
+        let storeSaved = await store.saveNow()
+        let settingsSaved = await settings.saveNow()
+        return storeCleared && ouraSaved && storeSaved && settingsSaved
+    }
+
     // MARK: - Ingest
 
     /// The single routing seam for all three transports.
     ///
     /// Write-back mirrors the readings the store *accepted*, never the input batch: a batch
     /// of ten containing one new reading and nine already-known duplicates must put exactly
-    /// one sample into Apple Health. `append(contentsOf:)`/`upsert(contentsOf:)` return the
-    /// stored subset precisely so this filter can run over it.
-    private func ingest(_ readings: [Reading], replacingExisting: Bool = false) {
-        let accepted = replacingExisting
-            ? store.upsert(contentsOf: readings)
-            : store.append(contentsOf: readings)
-        guard !accepted.isEmpty else { return }
+    /// one sample into Apple Health. The batch result returns the committed subset precisely
+    /// so this filter can run over it while source updates and upstream deletions remain in
+    /// the same transaction.
+    @discardableResult
+    private func ingest(
+        _ readings: [Reading],
+        updatingSources: [DataSource] = [],
+        removingReadingIDs: Set<UUID> = [],
+        replacingExisting: Bool = false
+    ) -> Bool {
+        let result = replacingExisting
+            ? store.upsertBatch(
+                readings: readings,
+                updatingSources: updatingSources,
+                removingReadingIDs: removingReadingIDs
+            )
+            : store.appendBatch(
+                readings: readings,
+                updatingSources: updatingSources,
+                removingReadingIDs: removingReadingIDs
+            )
+        guard result.committed else { return false }
+        let accepted = result.acceptedReadings
+        guard !accepted.isEmpty else { return true }
 
         // Optional write-back into Apple Health, measured Bluetooth values only.
         if settings.snapshot.mirrorBluetoothToHealthKit, healthKit.availability == .authorized {
@@ -148,25 +262,13 @@ final class AppModel {
                 reading.provenance == .measured
                     && store.source(id: reading.sourceID)?.transport == .bluetooth
             }
-            guard !mirrorable.isEmpty else { return }
-            Task { [healthKit] in
-                for reading in mirrorable { await healthKit.write(reading) }
+            if !mirrorable.isEmpty {
+                Task { [healthKit] in
+                    for reading in mirrorable { await healthKit.write(reading) }
+                }
             }
         }
-    }
-
-    /// Drops readings whose HealthKit samples the user deleted in Health.
-    ///
-    /// A HealthKit-sourced `Reading.id` *is* the `HKSample` uuid, and `HKDeletedObject.uuid`
-    /// reports that same value, so deleted ids map onto stored readings directly with no
-    /// lookup table. Deletion is deliberately silent for the user: a sample removed upstream
-    /// must stop contributing to comparisons, but an analysis already exported keeps whatever
-    /// it was exported with.
-    private func removeDeletedHealthKitSamples(_ sampleIDs: [UUID]) {
-        guard !sampleIDs.isEmpty else { return }
-        let removed = store.remove(readingIDs: sampleIDs)
-        guard removed > 0 else { return }
-        logger.info("Removed \(removed, privacy: .public) reading(s) deleted from Apple Health")
+        return true
     }
 
     // MARK: - Derived metrics
@@ -189,11 +291,25 @@ final class AppModel {
     }
 
     func recomputeDerivedMetrics() {
-        var produced: [Reading] = []
-        produced += vo2MaxEstimates()
-        if let bp = bloodPressureEstimateReadings() { produced += bp }
+        let vo2 = vo2MaxEstimates()
+        let bloodPressure = bloodPressureEstimateReadings() ?? []
+        let produced = vo2 + bloodPressure
+
+        let startOfToday = Calendar.current.startOfDay(for: .now)
+        store.reconcileEstimates(
+            kinds: [.vo2Max],
+            keeping: Set(vo2.map(\.id)),
+            currentSince: settings.snapshot.vo2MaxEstimateEnabled ? startOfToday : nil
+        )
+        store.reconcileEstimates(
+            kinds: [.bloodPressureSystolic, .bloodPressureDiastolic],
+            keeping: Set(bloodPressure.map(\.id)),
+            currentSince: settings.canEstimateBloodPressure ? Date.now.addingTimeInterval(-300) : nil
+        )
         guard !produced.isEmpty else { return }
-        store.append(contentsOf: produced)
+        // Estimates are revisable documents, not append-only measurements. Stable IDs make
+        // an identical recomputation a no-op and let new inputs revise the same day/slot.
+        store.upsert(contentsOf: produced)
     }
 
     /// A VO\u{2082} max estimate per source that reports resting heart rate but no measured
@@ -294,9 +410,32 @@ final class AppModel {
     #if DEBUG
     /// Launch with `--pairwise-demo` to exercise every analysis state without touching
     /// the user's archive or starting HealthKit, Bluetooth, or Oura transports.
+    enum UITestScenario: String {
+        case loading
+        case startupUnavailable
+        case sourcesUnavailable
+        case corruptRecovery
+        case settingsUnavailable
+        case empty
+        case devices
+        case retention
+        case ouraPartial
+
+        static var requested: Self? {
+            let prefix = "--ui-test-"
+            guard let argument = ProcessInfo.processInfo.arguments.first(where: {
+                $0.hasPrefix(prefix)
+            }) else { return nil }
+            return Self(rawValue: String(argument.dropFirst(prefix.count)))
+        }
+    }
+
     static let pairwiseDemoEnabled = ProcessInfo.processInfo.arguments.contains("--pairwise-demo")
+    static let uiTestScenario = UITestScenario.requested
+    static let debugDataIsolationEnabled = pairwiseDemoEnabled || uiTestScenario != nil
     #else
     static let pairwiseDemoEnabled = false
+    static let debugDataIsolationEnabled = false
     #endif
 
     func ensureEstimateSourceExists() {
@@ -341,13 +480,12 @@ final class AppModel {
         store.remove(sourceID: source.id)
     }
 
-    /// Pulls age and sex from Health so the estimators have what they need without the
-    /// user re-entering it.
+    /// Pulls date of birth from Health so the age-based estimate can be configured without
+    /// collecting an unrelated sensitive characteristic.
     func importProfileFromHealth() {
-        let characteristics = healthKit.readCharacteristics()
+        let birthDate = healthKit.readDateOfBirth()
         var profile = settings.profile
-        if let birthDate = characteristics.birthDate { profile.birthDate = birthDate }
-        if let sex = characteristics.sex { profile.sex = sex }
+        if let birthDate { profile.birthDate = birthDate }
         settings.profile = profile
     }
 }

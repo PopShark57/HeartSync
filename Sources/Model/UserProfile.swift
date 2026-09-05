@@ -1,22 +1,10 @@
 import Foundation
 
-/// Biometrics the estimators need, plus the cuff calibration that the blood-pressure
-/// feature is anchored to.
+/// Age input the estimator uses, plus the cuff calibration that the blood-pressure feature
+/// is anchored to. Older archives may contain a `sex` key; Codable ignores that unknown key
+/// so they remain readable without continuing to collect or store the unused characteristic.
 struct UserProfile: Codable, Hashable, Sendable {
-    enum BiologicalSex: String, Codable, Sendable, CaseIterable, Identifiable {
-        case female, male, unspecified
-        var id: String { rawValue }
-        var title: String {
-            switch self {
-            case .female: "Female"
-            case .male: "Male"
-            case .unspecified: "Prefer not to say"
-            }
-        }
-    }
-
     var birthDate: Date?
-    var sex: BiologicalSex = .unspecified
     var heightCM: Double?
     var weightKG: Double?
 

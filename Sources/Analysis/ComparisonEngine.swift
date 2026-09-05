@@ -91,12 +91,38 @@ enum ComparisonEngine {
             : samples.contains { $0.provenance == .derived } ? .derived
             : .estimated
 
+        let compacted = samples.filter {
+            $0.metadata?.aggregation != nil || isLegacyCompactedMedian($0)
+        }
+        let sampleCount: Int?
+        let standardDeviation: Double?
+        if samples.count == 1, let aggregation = compacted.first?.metadata?.aggregation {
+            sampleCount = aggregation.originalSampleCount
+            standardDeviation = aggregation.originalStandardDeviation
+        } else if compacted.isEmpty {
+            sampleCount = samples.count
+            standardDeviation = variance.squareRoot()
+        } else {
+            // A mixture of raw and already-compacted rows cannot be recombined honestly from
+            // medians alone. This should only occur in legacy data and remains unknown.
+            sampleCount = nil
+            standardDeviation = nil
+        }
+        let qualityCaveatCount = samples.count { reading in
+            guard let metadata = reading.metadata else { return false }
+            return metadata.quality == .provisional
+                || metadata.quality == .questionable
+                || (metadata.artefactFraction ?? 0) > 0.10
+        }
+
         return SourceValue(
             sourceID: sourceID,
             value: centre,
-            sampleCount: samples.count,
-            standardDeviation: variance.squareRoot(),
-            provenance: provenance
+            sampleCount: sampleCount,
+            standardDeviation: standardDeviation,
+            provenance: provenance,
+            isCompacted: !compacted.isEmpty,
+            qualityCaveatCount: qualityCaveatCount
         )
     }
 
@@ -372,6 +398,17 @@ enum ComparisonEngine {
             )
         }
 
+        let rawSampleCountA = knownSampleTotal(observations.map(\.sourceA))
+        let rawSampleCountB = knownSampleTotal(observations.map(\.sourceB))
+        let assessment = evidenceAssessment(
+            observations: observations,
+            pairedWindowCount: pairedWindowCount,
+            overlapPercentage: overlapPercentage,
+            analyzedSpan: analyzedSpan,
+            windowSize: windowSize,
+            minimumPairedWindows: requiredWindowCount
+        )
+
         return PairwiseAnalysis(
             kind: kind,
             sourceA: pair.a,
@@ -383,9 +420,10 @@ enum ComparisonEngine {
             pairedWindowCount: pairedWindowCount,
             overlapPercentage: overlapPercentage,
             analyzedSpan: analyzedSpan,
-            rawSampleCountA: observations.reduce(0) { $0 + $1.sourceA.sampleCount },
-            rawSampleCountB: observations.reduce(0) { $0 + $1.sourceB.sampleCount },
-            state: state
+            rawSampleCountA: rawSampleCountA,
+            rawSampleCountB: rawSampleCountB,
+            state: state,
+            evidence: assessment
         )
     }
 
@@ -413,13 +451,101 @@ enum ComparisonEngine {
             classification = .measurementNoise
         }
 
+        let confidence = confidenceIntervals(meanBias: meanBias, sd: differenceSD, count: differences.count)
         return PairwiseSummaryStatistics(
             meanBias: meanBias,
             meanAbsoluteDifference: meanAbsoluteDifference,
             differenceSD: differenceSD,
             limitsOfAgreement: limits,
             severity: kind.agreement.severity(forDelta: meanAbsoluteDifference),
-            classification: classification
+            classification: classification,
+            meanBiasConfidenceInterval: confidence?.mean,
+            lowerLimitConfidenceInterval: confidence?.lowerLimit,
+            upperLimitConfidenceInterval: confidence?.upperLimit
+        )
+    }
+
+    private static func knownSampleTotal(_ values: [SourceValue]) -> Int? {
+        var total = 0
+        for value in values {
+            guard let count = value.sampleCount else { return nil }
+            total += count
+        }
+        return total
+    }
+
+    private static func isLegacyCompactedMedian(_ reading: Reading) -> Bool {
+        let start = floorToWindow(reading.midpoint, size: reading.kind.comparisonWindow)
+        let expected = UUID(stableFrom: "compact.\(reading.sourceID).\(reading.kind.rawValue).\(Int(start.timeIntervalSince1970))")
+        return reading.id == expected
+    }
+
+    private static func evidenceAssessment(
+        observations: [PairwiseObservation],
+        pairedWindowCount: Int,
+        overlapPercentage: Double,
+        analyzedSpan: DateInterval?,
+        windowSize: TimeInterval,
+        minimumPairedWindows: Int
+    ) -> PairwiseEvidenceAssessment {
+        let values = observations.flatMap { [$0.sourceA, $0.sourceB] }
+        let unknownDepth = values.contains { $0.sampleCount == nil }
+        let compacted = observations.count { $0.sourceA.isCompacted || $0.sourceB.isCompacted }
+        let caveats = values.reduce(0) { $0 + $1.qualityCaveatCount }
+        let span = analyzedSpan?.duration ?? 0
+        let strongSpan = max(3_600, windowSize * 30)
+        let moderateSpan = max(1_800, windowSize * 10)
+
+        let grade: PairwiseEvidenceGrade
+        if pairedWindowCount < minimumPairedWindows {
+            grade = .limited
+        } else if pairedWindowCount >= 30, overlapPercentage >= 80,
+                  span >= strongSpan, !unknownDepth, compacted == 0, caveats == 0 {
+            grade = .strong
+        } else if pairedWindowCount >= 10, overlapPercentage >= 60,
+                  span >= moderateSpan, caveats == 0 {
+            grade = .moderate
+        } else {
+            grade = .weak
+        }
+
+        var reasons: [String] = []
+        if pairedWindowCount < minimumPairedWindows { reasons.append("Too few paired windows") }
+        if overlapPercentage < 60 { reasons.append("Low time overlap") }
+        if unknownDepth { reasons.append("Some compacted sample counts are unknown") }
+        if compacted > 0 { reasons.append("Includes fixed compacted window medians") }
+        if caveats > 0 { reasons.append("Includes signal-quality caveats") }
+        if reasons.isEmpty { reasons.append("Window count, span, overlap, and sample depth support this grade") }
+
+        return PairwiseEvidenceAssessment(
+            grade: grade,
+            hasUnknownSampleDepth: unknownDepth,
+            compactedWindowCount: compacted,
+            qualityCaveatCount: caveats,
+            reasons: reasons
+        )
+    }
+
+    /// Approximate 95% confidence intervals are exposed only from ten pairs onward. The
+    /// limits use Bland-Altman's standard error approximation; below ten, an interval would
+    /// look more authoritative than the evidence warrants.
+    private static func confidenceIntervals(
+        meanBias: Double,
+        sd: Double,
+        count: Int
+    ) -> (mean: ClosedRange<Double>, lowerLimit: ClosedRange<Double>, upperLimit: ClosedRange<Double>)? {
+        guard count >= 10, sd.isFinite else { return nil }
+        let n = Double(count)
+        let critical = 1.96
+        let meanMargin = critical * sd / n.squareRoot()
+        let lower = meanBias - critical * sd
+        let upper = meanBias + critical * sd
+        let limitSE = sd * (1 / n + critical * critical / (2 * (n - 1))).squareRoot()
+        let limitMargin = critical * limitSE
+        return (
+            (meanBias - meanMargin)...(meanBias + meanMargin),
+            (lower - limitMargin)...(lower + limitMargin),
+            (upper - limitMargin)...(upper + limitMargin)
         )
     }
 

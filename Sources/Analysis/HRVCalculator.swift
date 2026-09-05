@@ -44,9 +44,9 @@ struct HRVMetrics: Equatable, Sendable {
 /// belongs beside any HRV comparison: "this window rejected 22% of beats" changes how the
 /// number should be read.
 ///
-/// This is measurement quality, not a measurement. It is deliberately not a `Reading` and
-/// never reaches `HealthStore`, HealthKit, or an export: it describes one live window from
-/// one device and is replaced on every emission.
+/// This live projection is deliberately replaced on every emission. The same underlying
+/// facts are also copied into `ReadingMetadata`, so history and exports can qualify the HRV
+/// value after this transient UI state is gone.
 struct HRVQuality: Equatable, Sendable {
     /// Intervals that survived artefact rejection in the emitting window.
     var beatCount: Int
@@ -58,6 +58,29 @@ struct HRVQuality: Equatable, Sendable {
     var pnn50: Double
     /// When the window that produced this was emitted.
     var measuredAt: Date
+}
+
+/// One computed HRV window with the interval the sensor actually observed.
+struct HRVEmission: Equatable, Sendable {
+    var metrics: HRVMetrics
+    var observationStart: Date
+    var observationEnd: Date
+    var includesSDNN: Bool
+
+    var observationDuration: TimeInterval {
+        max(0, observationEnd.timeIntervalSince(observationStart))
+    }
+
+    var readingMetadata: ReadingMetadata {
+        ReadingMetadata(
+            quality: .accepted,
+            observationDuration: observationDuration,
+            acceptedBeatCount: metrics.beatCount,
+            artefactFraction: metrics.artefactFraction,
+            pnn50: metrics.pnn50,
+            impliedHeartRate: metrics.meanHeartRate
+        )
+    }
 }
 
 extension HRVQuality {
@@ -229,6 +252,12 @@ struct HRVAccumulator {
     /// HRV values every time a beat arrives.
     var emitInterval: TimeInterval = 60
 
+    /// RMSSD is useful from a validated short capture; twenty seconds prevents a single
+    /// packet of implausibly dense intervals from becoming an instant HRV conclusion.
+    var minimumRMSSDDuration: TimeInterval = 20
+    /// SDNN keeps its conventional five-minute observation requirement.
+    var minimumSDNNDuration: TimeInterval = 300
+
     /// A five-minute physiological window contains at most 1,000 beats even at the upper
     /// 200-bpm interval bound. The extra headroom permits packetised notifications while making
     /// a burst of repeated intervals unable to grow this live buffer without limit.
@@ -237,13 +266,25 @@ struct HRVAccumulator {
     mutating func add(intervals: [Double], at time: Date = .now) {
         guard !intervals.isEmpty else { return }
 
+        // A notification's R–R values are ordered oldest first and each interval describes
+        // real time that elapsed before receipt. Reconstruct their end times backwards so a
+        // first packet carrying many intervals has the correct observed duration instead of
+        // every beat sharing one timestamp.
+        var remainingSeconds = intervals.reduce(0) { $0 + max(0, $1) / 1_000 }
+        let timed = intervals.map { interval -> (time: Date, interval: Double) in
+            let intervalSeconds = max(0, interval) / 1_000
+            remainingSeconds -= intervalSeconds
+            return (time.addingTimeInterval(-remainingSeconds), interval)
+        }
+
         if intervals.count >= Self.maximumBufferedBeats {
             // Keep only the newest part of an oversized notification. The live HRV window is
             // already a bounded, lossy rolling view; retaining an attacker-sized packet would
             // defeat that bound before `prune(before:)` can run.
-            samples = intervals.suffix(Self.maximumBufferedBeats).map { (time, $0) }
+            samples = Array(timed.suffix(Self.maximumBufferedBeats))
         } else {
-            samples.append(contentsOf: intervals.map { (time, $0) })
+            samples.append(contentsOf: timed)
+            samples.sort { $0.time < $1.time }
         }
         prune(before: time.addingTimeInterval(-window))
         if samples.count > Self.maximumBufferedBeats {
@@ -259,21 +300,38 @@ struct HRVAccumulator {
         if firstKept > 0 { samples.removeFirst(firstKept) }
     }
 
-    /// Returns HRV metrics if the window is full enough and enough time has passed since
-    /// the last emission.
-    mutating func emitIfReady(at time: Date = .now) -> HRVMetrics? {
+    /// Returns metrics and the real captured interval when RMSSD is ready. `includesSDNN`
+    /// remains false until the full SDNN duration has actually been observed.
+    mutating func emissionIfReady(at time: Date = .now) -> HRVEmission? {
         if let lastEmit, time.timeIntervalSince(lastEmit) < emitInterval { return nil }
         guard let metrics = HRVCalculator.metrics(from: samples.map(\.interval)),
-              metrics.isReliable
+              metrics.isReliable,
+              let first = samples.first,
+              let last = samples.last
         else { return nil }
+        let start = first.time.addingTimeInterval(-max(0, first.interval) / 1_000)
+        let end = max(last.time, start)
+        let duration = end.timeIntervalSince(start)
+        guard duration >= minimumRMSSDDuration else { return nil }
         lastEmit = time
-        return metrics
+        return HRVEmission(
+            metrics: metrics,
+            observationStart: start,
+            observationEnd: end,
+            includesSDNN: duration >= minimumSDNNDuration
+        )
+    }
+
+    /// Compatibility convenience for pure metric callers. Bluetooth storage uses
+    /// `emissionIfReady` so it cannot invent a five-minute interval.
+    mutating func emitIfReady(at time: Date = .now) -> HRVMetrics? {
+        emissionIfReady(at: time)?.metrics
     }
 
     /// Seconds of data currently buffered, for showing progress towards a first reading.
     var bufferedDuration: TimeInterval {
-        guard let first = samples.first?.time, let last = samples.last?.time else { return 0 }
-        return last.timeIntervalSince(first)
+        guard let first = samples.first, let last = samples.last else { return 0 }
+        return max(0, last.time.timeIntervalSince(first.time) + first.interval / 1_000)
     }
 
     var bufferedBeats: Int { samples.count }

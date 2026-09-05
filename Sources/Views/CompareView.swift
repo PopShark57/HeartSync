@@ -60,6 +60,7 @@ struct CompareView: View {
                 }
             }
             .navigationTitle("Compare")
+            .accessibilityIdentifier("compare.root")
         }
     }
 

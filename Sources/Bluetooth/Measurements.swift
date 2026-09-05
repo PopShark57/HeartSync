@@ -65,6 +65,106 @@ struct HeartRateMeasurement: Equatable, Sendable {
 /// Decoded PLX measurement, from either the continuous (0x2A5F) or spot-check (0x2A5E)
 /// characteristic of the Pulse Oximeter Service.
 struct PulseOximeterMeasurement: Equatable, Sendable {
+    enum SampleType: Sendable {
+        case continuous
+        case spotCheck
+    }
+
+    enum Quality: Equatable, Sendable {
+        case accepted
+        case provisional([QualityReason])
+        case questionable([QualityReason])
+        case invalid([QualityReason])
+
+        var reasons: [QualityReason] {
+            switch self {
+            case .accepted: []
+            case .provisional(let reasons), .questionable(let reasons), .invalid(let reasons): reasons
+            }
+        }
+
+        /// Only fully accepted frames enter history, comparisons, or HealthKit write-back.
+        /// Provisional continuous frames remain useful as a live diagnostic but must mature
+        /// before becoming durable evidence; one-shot provisional/questionable frames cannot.
+        var isDurable: Bool { self == .accepted }
+
+        var title: String {
+            switch self {
+            case .accepted: "Accepted"
+            case .provisional: "Provisional"
+            case .questionable: "Questionable"
+            case .invalid: "Invalid"
+            }
+        }
+
+        var storedQuality: MeasurementQuality? {
+            switch self {
+            case .accepted: .accepted
+            case .provisional: .provisional
+            case .questionable: .questionable
+            case .invalid: nil
+            }
+        }
+    }
+
+    enum QualityReason: String, CaseIterable, Sendable {
+        case measurementOngoing
+        case earlyEstimatedData
+        case dataFromStorage
+        case demonstrationData
+        case testingData
+        case calibrationOngoing
+        case measurementUnavailable
+        case questionableMeasurement
+        case invalidMeasurement
+        case extendedDisplayUpdateOngoing
+        case equipmentMalfunction
+        case signalProcessingIrregularity
+        case inadequateSignal
+        case poorSignal
+        case lowPerfusion
+        case erraticSignal
+        case nonPulsatileSignal
+        case questionablePulse
+        case signalAnalysisOngoing
+        case sensorInterference
+        case sensorUnconnectedFromUser
+        case unknownSensorConnected
+        case sensorDisplaced
+        case sensorMalfunction
+        case sensorDisconnected
+
+        var title: String {
+            switch self {
+            case .measurementOngoing: "measurement ongoing"
+            case .earlyEstimatedData: "early estimate"
+            case .dataFromStorage: "stored historical data"
+            case .demonstrationData: "demonstration data"
+            case .testingData: "testing data"
+            case .calibrationOngoing: "calibration ongoing"
+            case .measurementUnavailable: "measurement unavailable"
+            case .questionableMeasurement: "questionable measurement"
+            case .invalidMeasurement: "invalid measurement"
+            case .extendedDisplayUpdateOngoing: "display update ongoing"
+            case .equipmentMalfunction: "equipment malfunction"
+            case .signalProcessingIrregularity: "signal processing irregularity"
+            case .inadequateSignal: "inadequate signal"
+            case .poorSignal: "poor signal"
+            case .lowPerfusion: "low perfusion"
+            case .erraticSignal: "erratic signal"
+            case .nonPulsatileSignal: "non-pulsatile signal"
+            case .questionablePulse: "questionable pulse"
+            case .signalAnalysisOngoing: "signal analysis ongoing"
+            case .sensorInterference: "sensor interference"
+            case .sensorUnconnectedFromUser: "sensor not on user"
+            case .unknownSensorConnected: "unknown sensor"
+            case .sensorDisplaced: "sensor displaced"
+            case .sensorMalfunction: "sensor malfunction"
+            case .sensorDisconnected: "sensor disconnected"
+            }
+        }
+    }
+
     var spo2Percent: Double?
     var pulseRateBPM: Double?
     /// Perfusion strength, when reported. Low perfusion is the usual reason a finger-worn
@@ -75,20 +175,78 @@ struct PulseOximeterMeasurement: Equatable, Sendable {
     var measurementStatus: UInt16?
     var deviceAndSensorStatus: UInt32?
 
-    /// True when the device's own status bits say the measurement is unreliable
-    /// (bit 5 "Measurement Ongoing" and bit 6 "Early Estimated Data" are fine; the
-    /// validity bits below are not).
-    var isDeviceReportedInvalid: Bool {
-        guard let status = deviceAndSensorStatus else { return false }
-        // Device and Sensor Status bits that mean "do not trust this value":
-        // 0 Extended Display Update Ongoing, 1 Equipment Malfunction,
-        // 2 Signal Processing Irregularity, 3 Inadequate Signal,
-        // 4 Poor Perfusion, 5 Erratic Signal, 6 Nonpulsatile Signal,
-        // 7 Questionable Pulse, 8 Signal Analysis Ongoing, 9 Sensor Interference,
-        // 10 Sensor Unconnected, 11 Unknown Sensor Connected, 12 Sensor Displaced,
-        // 13 Sensor Malfunction, 14 Sensor Disconnected.
-        let invalidMask: UInt32 = 0b0111_1111_1111_1110
-        return status & invalidMask != 0
+    /// Interprets the independent PLX Measurement Status and Device and Sensor Status fields.
+    /// Bit positions follow PLXS 1.0.1 Tables 3.4 and 3.5 exactly.
+    func quality(for sampleType: SampleType) -> Quality {
+        let measurement = measurementStatus ?? 0
+        let device = deviceAndSensorStatus ?? 0
+
+        let invalid = Self.reasons(in: measurement, masks: Self.invalidMeasurementMasks)
+            + Self.reasons(in: device, masks: Self.invalidDeviceMasks)
+        if !invalid.isEmpty { return .invalid(invalid) }
+
+        let questionable = Self.reasons(in: measurement, masks: Self.questionableMeasurementMasks)
+            + Self.reasons(in: device, masks: Self.questionableDeviceMasks)
+        if !questionable.isEmpty { return .questionable(questionable) }
+
+        let provisional = Self.reasons(in: measurement, masks: Self.provisionalMeasurementMasks)
+            + Self.reasons(in: device, masks: Self.provisionalDeviceMasks)
+        if !provisional.isEmpty {
+            // Continuous frames can mature in a later notification; a spot-check cannot.
+            // In both cases this individual early/calibrating/stored frame stays visible only
+            // as a live caveat and never enters durable evidence.
+            switch sampleType {
+            case .continuous, .spotCheck:
+                return .provisional(provisional)
+            }
+        }
+
+        return .accepted
+    }
+
+    private static let provisionalMeasurementMasks: [(UInt16, QualityReason)] = [
+        (1 << 5, .measurementOngoing),
+        (1 << 6, .earlyEstimatedData),
+        (1 << 9, .dataFromStorage),
+        (1 << 12, .calibrationOngoing),
+    ]
+    private static let questionableMeasurementMasks: [(UInt16, QualityReason)] = [
+        (1 << 14, .questionableMeasurement),
+    ]
+    private static let invalidMeasurementMasks: [(UInt16, QualityReason)] = [
+        (1 << 13, .measurementUnavailable),
+        (1 << 10, .demonstrationData),
+        (1 << 11, .testingData),
+        (1 << 15, .invalidMeasurement),
+    ]
+    private static let provisionalDeviceMasks: [(UInt32, QualityReason)] = [
+        (1 << 0, .extendedDisplayUpdateOngoing),
+        (1 << 9, .signalAnalysisOngoing),
+    ]
+    private static let questionableDeviceMasks: [(UInt32, QualityReason)] = [
+        (1 << 2, .signalProcessingIrregularity),
+        (1 << 3, .inadequateSignal),
+        (1 << 4, .poorSignal),
+        (1 << 5, .lowPerfusion),
+        (1 << 6, .erraticSignal),
+        (1 << 7, .nonPulsatileSignal),
+        (1 << 8, .questionablePulse),
+        (1 << 10, .sensorInterference),
+    ]
+    private static let invalidDeviceMasks: [(UInt32, QualityReason)] = [
+        (1 << 1, .equipmentMalfunction),
+        (1 << 11, .sensorUnconnectedFromUser),
+        (1 << 12, .unknownSensorConnected),
+        (1 << 13, .sensorDisplaced),
+        (1 << 14, .sensorMalfunction),
+        (1 << 15, .sensorDisconnected),
+    ]
+
+    private static func reasons<T: BinaryInteger>(
+        in value: T,
+        masks: [(T, QualityReason)]
+    ) -> [QualityReason] {
+        masks.compactMap { mask, reason in value & mask == 0 ? nil : reason }
     }
 
     /// Continuous Measurement (0x2A5F).

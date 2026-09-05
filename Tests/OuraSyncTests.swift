@@ -254,7 +254,7 @@ struct OuraSyncOrchestrationTests {
         seeded.collectionSyncMarks[OuraEndpoint.dailyStress.rawValue] = now.addingTimeInterval(-3_600)
         seeded.collectionSyncMarks[OuraEndpoint.personalInfo.rawValue] = now
 
-        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager in
+        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, _ in
             await manager.sync(days: 14)
 
             let requests = OuraStubServer.shared.requests
@@ -295,7 +295,7 @@ struct OuraSyncOrchestrationTests {
         seeded.collectionSyncMarks[OuraEndpoint.dailyStress.rawValue] = now.addingTimeInterval(-3_600)
         seeded.collectionSyncMarks[OuraEndpoint.personalInfo.rawValue] = now.addingTimeInterval(-3_600)
 
-        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager in
+        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, _ in
             await manager.sync(days: 14)
 
             let requests = OuraStubServer.shared.requests
@@ -350,7 +350,7 @@ struct OuraSyncOrchestrationTests {
             return ouraEmptyCollections(request)
         }
 
-        try await withOuraSyncHarness(seeded: seeded, responding: handler) { manager in
+        try await withOuraSyncHarness(seeded: seeded, responding: handler) { manager, _ in
             await manager.sync(days: 14)
 
             #expect(!OuraStubServer.shared.requests.isEmpty, "URLSession.shared was not intercepted")
@@ -390,11 +390,113 @@ struct OuraSyncOrchestrationTests {
             return ouraEmptyCollections(request)
         }
 
-        try await withOuraSyncHarness(seeded: seeded, responding: handler) { manager in
+        try await withOuraSyncHarness(seeded: seeded, responding: handler) { manager, _ in
             await manager.sync(days: 14)
 
             #expect(manager.snapshot.stress.count == 1)
             #expect(manager.snapshot.stress.first?.day_summary == "restored")
+        }
+    }
+
+    @Test("A complete full-window response removes records withdrawn upstream")
+    func fullWindowReconcilesDeletion() async throws {
+        let now = Date.now
+        let yesterday = ouraUTCDayString(now.addingTimeInterval(-86_400))
+        var seeded = OuraSnapshot()
+        seeded.fetchedAt = now.addingTimeInterval(-25 * 3_600)
+        seeded.lastFullBackfillAt = now.addingTimeInterval(-25 * 3_600)
+        seeded.oxygen = [
+            OuraClient.DailySpO2(
+                id: "withdrawn-oxygen",
+                day: yesterday,
+                spo2_percentage: .init(average: 96.2)
+            ),
+        ]
+
+        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, store in
+            let priorReading = try #require(OuraManager.readings(fromSpO2: seeded.oxygen).first)
+            store.upsert(DataSource(
+                id: DataSource.ouraSourceID,
+                displayName: "Oura Ring",
+                transport: .oura
+            ))
+            #expect(store.upsert(contentsOf: [priorReading]).count == 1)
+            await manager.sync(days: 14)
+
+            #expect(manager.snapshot.oxygen.isEmpty)
+            #expect(OuraManager.readings(fromSpO2: manager.snapshot.oxygen).isEmpty)
+            #expect(store.readings.isEmpty)
+
+            let relaunched = OuraManager()
+            await relaunched.configure(
+                store: HealthStore(persistenceEnabled: false),
+                onReadings: { _, _, _ in true }
+            )
+            #expect(relaunched.snapshot.oxygen.isEmpty)
+        }
+    }
+
+    @Test("A cache write failure leaves the previous Oura generation active")
+    func cacheWriteFailureDoesNotCommit() async throws {
+        let now = Date.now
+        let yesterday = ouraUTCDayString(now.addingTimeInterval(-86_400))
+        var seeded = OuraSnapshot()
+        seeded.fetchedAt = now.addingTimeInterval(-3_600)
+        seeded.oxygen = [
+            OuraClient.DailySpO2(
+                id: "kept-oxygen",
+                day: yesterday,
+                spo2_percentage: .init(average: 96.2)
+            ),
+        ]
+
+        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, _ in
+            await ReadingArchive.shared.injectFailureOnNextWriteForTesting()
+            await manager.sync(days: 14)
+
+            #expect(manager.snapshot.oxygen.map(\.id) == ["kept-oxygen"])
+            #expect(manager.lastSyncSummary?.contains("not committed") == true)
+            if case .error(let message) = manager.status {
+                #expect(message.contains("could not save"))
+            } else {
+                Issue.record("Expected a durability error")
+            }
+        }
+    }
+
+    @Test("A database batch failure restores the previous Oura cache generation")
+    func databaseFailureRollsBackCache() async throws {
+        let now = Date.now
+        let yesterday = ouraUTCDayString(now.addingTimeInterval(-86_400))
+        var seeded = OuraSnapshot()
+        seeded.fetchedAt = now.addingTimeInterval(-25 * 3_600)
+        seeded.lastFullBackfillAt = now.addingTimeInterval(-25 * 3_600)
+        seeded.oxygen = [
+            OuraClient.DailySpO2(
+                id: "rollback-oxygen",
+                day: yesterday,
+                spo2_percentage: .init(average: 97.1)
+            ),
+        ]
+
+        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, store in
+            store.injectDatabaseFailureOnNextCommitForTesting()
+            await manager.sync(days: 14)
+
+            #expect(manager.snapshot.oxygen.map(\.id) == ["rollback-oxygen"])
+            #expect(manager.lastSyncSummary?.contains("not committed") == true)
+            if case .error(let message) = manager.status {
+                #expect(message.contains("previous Oura cache was restored"))
+            } else {
+                Issue.record("Expected a database durability error")
+            }
+
+            let relaunched = OuraManager()
+            await relaunched.configure(
+                store: HealthStore(persistenceEnabled: false),
+                onReadings: { _, _, _ in true }
+            )
+            #expect(relaunched.snapshot.oxygen.map(\.id) == ["rollback-oxygen"])
         }
     }
 
@@ -411,7 +513,7 @@ struct OuraSyncOrchestrationTests {
             return ouraEmptyCollections(request)
         }
 
-        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager in
+        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager, _ in
             await manager.sync(days: 14)
 
             #expect(!OuraStubServer.shared.requests.isEmpty, "URLSession.shared was not intercepted")
@@ -429,7 +531,10 @@ struct OuraSyncOrchestrationTests {
             // A relaunch reads the cache back. If truncation did not persist, the cached
             // prefix would be restored as `available` and quietly become "the collection".
             let relaunched = OuraManager()
-            await relaunched.configure(store: HealthStore(persistenceEnabled: false), onReadings: { _ in })
+            await relaunched.configure(
+                store: HealthStore(persistenceEnabled: false),
+                onReadings: { _, _, _ in true }
+            )
             #expect(!relaunched.state(for: .dailyStress).isComplete)
             #expect(relaunched.state(for: .dailySleep).isComplete)
         }
@@ -445,7 +550,7 @@ struct OuraSyncOrchestrationTests {
             return ouraEmptyCollections(request)
         }
 
-        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager in
+        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager, _ in
             await manager.sync(days: 14)
 
             #expect(!OuraStubServer.shared.requests.isEmpty, "URLSession.shared was not intercepted")
@@ -483,7 +588,7 @@ struct OuraSyncOrchestrationTests {
             return ouraEmptyCollections(request)
         }
 
-        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager in
+        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager, _ in
             await manager.sync(days: 14)
 
             #expect(!OuraStubServer.shared.requests.isEmpty, "URLSession.shared was not intercepted")
@@ -532,7 +637,7 @@ struct OuraSyncOrchestrationTests {
             return ouraEmptyCollections(request)
         }
 
-        try await withOuraSyncHarness(seeded: seeded, responding: handler) { manager in
+        try await withOuraSyncHarness(seeded: seeded, responding: handler) { manager, _ in
             await manager.sync(days: 14)
 
             #expect(ouraIsFailed(manager.state(for: .dailyStress)))
@@ -575,7 +680,7 @@ struct OuraSyncOrchestrationTests {
             ),
         ]
 
-        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager in
+        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, _ in
             await manager.sync(days: 14)
 
             #expect(manager.snapshot.batteryLevels.map(\.level) == [73])
@@ -596,7 +701,7 @@ struct OuraSyncOrchestrationTests {
             return ouraEmptyCollections(request)
         }
 
-        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager in
+        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager, _ in
             let began = Date.now
             await manager.sync(days: 14)
 
@@ -632,7 +737,7 @@ struct OuraSyncOrchestrationTests {
             return ouraEmptyCollections(request)
         }
 
-        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager in
+        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager, _ in
             let began = Date.now
             await manager.sync(days: 14)
 
@@ -646,7 +751,7 @@ struct OuraSyncOrchestrationTests {
 
     @Test("A clean cycle lifts a previous rate-limit backoff")
     func cleanCycleClearsTheBackoff() async throws {
-        try await withOuraSyncHarness(seeded: nil, responding: ouraEmptyCollections) { manager in
+        try await withOuraSyncHarness(seeded: nil, responding: ouraEmptyCollections) { manager, _ in
             await manager.sync(days: 14)
             // Nothing rate-limited this cycle, so nothing may hold off the next one; a
             // backoff that is only ever set is a sync that stops for good.
@@ -775,16 +880,15 @@ private func ouraArchiveURL() -> URL {
 private func withOuraSyncHarness(
     seeded: OuraSnapshot?,
     responding handler: @escaping @Sendable (URLRequest) -> OuraStubReply,
-    _ body: @MainActor (OuraManager) async throws -> Void
+    _ body: @MainActor (OuraManager, HealthStore) async throws -> Void
 ) async throws {
     let archiveURL = ouraArchiveURL()
     let savedCredential = Keychain.get(.ouraOAuthCredentials)
 
-    // Touching the actor first creates the archive directory, so the restore below has
-    // somewhere to put the original file back.
-    await ReadingArchive.shared.delete(ReadingArchive.File.ouraDashboard)
     let savedArchive = try? Data(contentsOf: archiveURL)
-    try? FileManager.default.removeItem(at: archiveURL)
+    // \`ReadingArchive.shared\` has already created its directory. Capture the user's
+    // existing test-host cache before clearing it so the harness never destroys real data.
+    await ReadingArchive.shared.delete(ReadingArchive.File.ouraDashboard)
 
     if let seeded {
         await ReadingArchive.shared.write(seeded, to: ReadingArchive.File.ouraDashboard)
@@ -810,8 +914,18 @@ private func withOuraSyncHarness(
     }
 
     let manager = OuraManager()
-    await manager.configure(store: HealthStore(persistenceEnabled: false), onReadings: { _ in })
-    try await body(manager)
+    let store = HealthStore(persistenceEnabled: false)
+    await manager.configure(
+        store: store,
+        onReadings: { readings, sources, withdrawnIDs in
+            store.upsertBatch(
+                readings: readings,
+                updatingSources: sources,
+                removingReadingIDs: withdrawnIDs
+            ).committed
+        }
+    )
+    try await body(manager, store)
 }
 
 private func ouraQuery(_ url: URL) -> [String: String] {

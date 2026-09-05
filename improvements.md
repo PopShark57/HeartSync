@@ -4,6 +4,23 @@ This is a fresh review of the current repository at commit
 `3e46f364632261225337f840181130c947d50a53` (2026-09-02). It replaces the previous
 resolved backlog rather than carrying old findings forward.
 
+## Implementation status (2026-09-05)
+
+All 16 numbered improvements below have been implemented in the current working tree. The
+implementation includes transactional indexed SQLite storage and legacy migration,
+measurement-quality and HRV interval corrections, estimate and cloud reconciliation,
+truthful startup/HealthKit/Bluetooth states, compaction provenance, staged data controls,
+source relationships, evidence grades and confidence intervals, advanced optional Oura
+onboarding, a String Catalog, simulator CI, focused UI coverage, an isolated physical-device
+performance workload, and `RELEASE_CHECKLIST.md`.
+
+The historical **Current behavior** sections below remain as the evidence that motivated
+each change. They do not describe the post-implementation code. Generic simulator
+compilation verifies that the app and all test bundles build; it does not satisfy the
+physical-device acceptance items. BLE, HealthKit, background/locked-device behavior, OAuth
+return, file protection, migration scale, accessibility, and the fourteen-day workload must
+still be exercised and recorded using `RELEASE_CHECKLIST.md` before a release claim is made.
+
 The review covered the application composition and lifecycle, canonical models, Bluetooth
 parsers and connection flow, HealthKit authorization/sync/write-back, Oura OAuth/API/cache,
 persistence and compaction, analysis/export, SwiftUI screens, `project.yml`, shipped
@@ -470,6 +487,29 @@ Do not embed a client secret in the app or weaken the existing state/callback va
 No test suite was executed, no app UI was launched, and no Bluetooth, HealthKit, Oura,
 background, locked-device, or physical-device behavior was validated. Build success is not
 evidence that those runtime paths work.
+
+## Implementation validation (2026-09-05)
+
+- XcodeGen generation succeeds and exposes the app, hosted unit-test, UI-test, and isolated
+  physical-device performance-test targets through the `HeartSyncChecker` and
+  `HeartSyncCheckerPerformance` schemes.
+- Generic iOS Simulator `build-for-testing` succeeds for the main scheme and the performance
+  scheme, compiling the app and every test bundle together.
+- A disposable host-side database smoke run opens WAL mode, commits a source/reading batch,
+  proves an injected transaction rolls back, checkpoints, reopens, and reads the committed
+  generation. This does not validate iOS file-protection behavior.
+- Localization export succeeds and populates `Resources/Localizable.xcstrings` from the
+  app's localized and SwiftUI string literals.
+- The current test sources contain 268 Swift Testing `@Test` declarations across 38 suites,
+  seven XCTest UI flows, and one isolated fourteen-day performance workload.
+- `.github/workflows/ios.yml` generates the project, chooses an installed iPhone simulator,
+  runs the complete main scheme on pushes and pull requests, and retains the `.xcresult`.
+
+No local runtime suite was executed because this host has no installed concrete iOS
+Simulator runtime. The connected physical iPhone was deliberately not used for automated
+tests because installing a test build could replace the user's app and affect its local
+health data. The release checklist remains the acceptance gate for all hardware and
+signed-build behavior.
 
 ## Existing strengths to preserve while implementing these changes
 

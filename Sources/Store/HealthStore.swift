@@ -2,159 +2,113 @@ import Foundation
 import Observation
 import OSLog
 
-/// Identifies one (source, comparison window) cell during compaction.
-///
-/// File scope rather than nested inside `HealthStore` so it stays outside the store's
-/// `@MainActor` isolation: it is a plain value used only as a dictionary key.
 private struct CompactionBucket: Hashable {
     let start: Date
     let sourceID: String
 }
 
-/// The app's single in-memory record of every reading from every source, plus the list of
-/// configured sources.
-///
-/// Main-actor and `@Observable` so SwiftUI can bind to it directly. `readings` is kept
-/// sorted by `end` ascending at all times, and two side indexes are maintained alongside it:
-/// one from reading id to position, so identity lookups during de-duplication and upsert are
-/// O(1) instead of a linear scan, and one from metric to positions, so `readings(kind:in:)`
-/// costs O(matching) instead of O(total). Both are rebuilt wholesale by
-/// `rebuildIndexes()` whenever a mutation can shift positions; the only mutation that
-/// updates them incrementally is appending past the tail, where nothing moves. That choice
-/// is deliberate — a partial index that has to be patched through insert, remove, prune and
-/// compact is exactly the kind of thing that silently goes wrong.
-///
-/// Persistence is one atomic JSON file per collection, coalesced so a 1 Hz stream does not
-/// write every second, and `compact(now:)` downsamples ageing history so the file cannot
-/// grow without bound. If retention grows past what whole-file JSON can carry, this is the
-/// seam where SwiftData or SQLite would go: the public API here (`append`,
-/// `readings(kind:in:)`, `prune`, `compact`) is deliberately query-shaped so callers would
-/// not change.
+/// The app's single source/readings boundary, backed by one transactional indexed SQLite
+/// database. The public query shape is preserved so transport and analysis code do not own
+/// persistence details.
 @MainActor
 @Observable
 final class HealthStore {
-
     private let logger = Logger(subsystem: "com.heartsync.HeartSyncChecker", category: "Store")
 
-    private(set) var readings: [Reading] = []
     private(set) var sources: [DataSource] = []
+    private var dataGeneration = 0
+    private var unavailableBuffer: [Reading] = []
+    private var bufferedIDs: Set<UUID> = []
 
-    /// How long readings are kept. Older ones are pruned on launch and after each save.
     var retention: TimeInterval = 30 * 86_400
-
-    /// Readings may never be compacted before they are this old.
-    ///
-    /// Fourteen days is not a round number picked for taste. The Oura sync window is 14 days
-    /// and the HealthKit anchored-query window is 30 days, so anything newer than the Oura
-    /// window would be re-inserted in raw form by the very next sync, immediately after
-    /// compaction replaced it — churn with no storage benefit.
     static let minimumCompactionAge: TimeInterval = 14 * 86_400
-
-    /// How much history one `compact(now:)` pass may work through.
-    ///
-    /// Bounds the main-actor cost of the first pass over a large existing archive: without
-    /// it, a device that has been streaming at 1 Hz for a fortnight would collapse its
-    /// entire backlog inside a single save. Compaction resumes from the new oldest reading
-    /// on the next save, so the backlog still drains — just in bounded steps.
-    ///
-    /// The floor is the largest comparison window, and that is an invariant rather than
-    /// caution: `compact(now:)` only collapses windows that fit wholly inside the pass, so a
-    /// span shorter than one window would let the oldest window fail to fit on every pass
-    /// and compaction would stall forever.
     static let compactionSpanPerPass: TimeInterval = max(
         3 * 86_400,
-        MetricKind.allCases.map(\.comparisonWindow).max() ?? 0,
+        MetricKind.allCases.map(\.comparisonWindow).max() ?? 0
     )
-
-    private var compactionAgeStorage: TimeInterval = HealthStore.minimumCompactionAge
-
-    /// How old a reading must be before `compact(now:)` may collapse it. Clamped so it can
-    /// never drop below `minimumCompactionAge`.
+    private var compactionAgeStorage: TimeInterval = minimumCompactionAge
     var compactionAge: TimeInterval {
         get { compactionAgeStorage }
         set { compactionAgeStorage = max(Self.minimumCompactionAge, newValue) }
     }
 
-    /// Reading id to its position in `readings`. Also serves as the membership set that
-    /// makes ingestion idempotent.
-    private var idIndex: [UUID: Int] = [:]
-    /// Metric to the positions in `readings` holding it, ascending — which, because
-    /// `readings` is sorted by `end`, is also time order.
-    private var kindIndex: [MetricKind: [Int]] = [:]
+    enum LoadState: Sendable, Equatable { case notLoaded, loaded, failed }
+    private(set) var loadState: LoadState
+    private(set) var unavailableCollections: [String] = []
+    private(set) var recoveredCorruptCollections: [String] = []
+    private(set) var lastPersistenceError: String?
 
-    /// Whether the archive has been read successfully yet.
-    ///
-    /// Tri-state, not a Bool, because "we have not read the archive" and "we tried and
-    /// could not" have to be told apart. `HealthStore` is the in-memory *copy* of the
-    /// archive, so writing it back is only ever safe once we know what the archive
-    /// contained. Persisting from `.notLoaded` or `.failed` would replace the user's entire
-    /// history with whatever this session happens to hold.
-    enum LoadState: Sendable, Equatable {
-        /// No load has completed yet. A load may or may not be in flight.
-        case notLoaded
-        /// The archive's contents are known — decoded, genuinely absent, or preserved aside
-        /// as `.corrupt`. Only in this state may the store be written back.
-        case loaded
-        /// The archive exists and could not be read. The data is intact on disk; retry.
-        case failed
-    }
-
-    /// The trailing debounce preserves the low write rate of the original implementation.
-    private var saveTask: Task<Void, Never>?
-    /// A second, non-resettable deadline prevents a continuous stream from postponing all
-    /// maintenance forever. The two tasks are cancelled together by `saveNow()`.
-    private var maximumSaveTask: Task<Void, Never>?
-    /// In-flight load, so concurrent callers await the same read instead of racing two.
-    private var loadTask: Task<Void, Never>?
-    /// Exclusive end of the historical span examined by the previous compaction pass.
-    ///
-    /// A compacted window still occupies its original place in `readings`, so deriving the
-    /// next pass from `readings.first` would revisit the same span forever. This in-memory
-    /// cursor lets later saves walk forward. Historical ingestion rewinds it through
-    /// `rewindCompactionIfNeeded(for:)`, so an anchor reset or cloud correction behind the
-    /// cursor is examined again instead of escaping compaction.
-    private var compactionCursor: Date?
-    private var hasLoggedSaveRefusal = false
     private let persistenceEnabled: Bool
+    private let archive: ReadingArchive
+    private let configuredDatabaseURL: URL?
+    private var database: HealthDatabase?
+    private var needsLegacyMigration: Bool
+    private var loadTask: Task<Void, Never>?
+    private var compactionCursor: Date?
 
-    /// Persistence cadence controls. The maximum is deliberately longer than the debounce so
-    /// ordinary bursts still coalesce, but short enough to bound unsaved live readings.
-    static let saveDebounce: Duration = .seconds(3)
-    static let maximumSaveLatency: Duration = .seconds(30)
-
-    /// Emergency in-memory ceiling while a protected archive cannot be opened. Normal stores
-    /// are bounded by retention plus compaction; this smaller, fixed ceiling prevents a locked
-    /// or transiently unreadable archive from turning a live transport into an unbounded queue.
-    /// Rows beyond the ceiling are the least recent rows and cannot be persisted until the
-    /// archive becomes readable, so keeping the newest window is the useful failure behavior.
     static let maximumReadingsWhileArchiveUnavailable = 10_000
 
-    private(set) var loadState: LoadState
-
-    init(persistenceEnabled: Bool = true) {
+    init(
+        persistenceEnabled: Bool = true,
+        databaseURL: URL? = nil,
+        archive: ReadingArchive = .shared
+    ) {
         self.persistenceEnabled = persistenceEnabled
-        // A store with persistence off has no archive to lose and nothing to read, so it is
-        // trivially loaded. Unit tests and the `--pairwise-demo` fixtures rely on this:
-        // without it every retention/compaction path would refuse to run.
-        self.loadState = persistenceEnabled ? .notLoaded : .loaded
+        self.archive = archive
+        self.configuredDatabaseURL = databaseURL
+        do {
+            let url: URL?
+            if persistenceEnabled {
+                url = try databaseURL ?? HealthDatabase.defaultURL()
+            } else {
+                url = nil
+            }
+            let database = try HealthDatabase(url: url)
+            self.database = database
+            self.needsLegacyMigration = persistenceEnabled && database.requiresLegacyMigration
+            self.loadState = persistenceEnabled ? .notLoaded : .loaded
+        } catch {
+            self.database = nil
+            self.needsLegacyMigration = false
+            self.loadState = persistenceEnabled ? .failed : .loaded
+            self.lastPersistenceError = error.localizedDescription
+        }
+    }
+
+    /// Compatibility access for tests and explicit whole-history export only. App screens
+    /// use indexed range queries; ordinary rendering never materializes the full database.
+    var readings: [Reading] {
+        _ = dataGeneration
+        if persistenceEnabled, loadState != .loaded { return unavailableBuffer }
+        return (try? database?.allReadings()) ?? []
+    }
+
+    var readingCount: Int {
+        _ = dataGeneration
+        if persistenceEnabled, loadState != .loaded { return unavailableBuffer.count }
+        return (try? database?.readingCount()) ?? 0
     }
 
     // MARK: - Sources
 
-    func source(id: String) -> DataSource? {
-        sources.first { $0.id == id }
-    }
-
-    func displayName(forSource id: String) -> String {
-        source(id: id)?.displayName ?? "Unknown device"
-    }
-
+    func source(id: String) -> DataSource? { sources.first { $0.id == id } }
+    func displayName(forSource id: String) -> String { source(id: id)?.displayName ?? "Unknown device" }
     var enabledSources: [DataSource] { sources.filter(\.isEnabled) }
 
-    /// Adds a source, or refreshes the display name and model of one already known.
-    /// Returns the stored source so callers can read back the assigned colour.
     @discardableResult
     func upsert(_ source: DataSource) -> DataSource {
+        let before = sources
+        let stored = merge(source)
+        guard sources != before else { return stored }
+        persistSourcesIfReady([stored])
+        dataGeneration &+= 1
+        return stored
+    }
+
+    /// Merges source metadata in memory. Batch ingestion uses this without writing first so
+    /// source descriptors, readings, and upstream deletions share one SQLite transaction.
+    private func merge(_ source: DataSource) -> DataSource {
+        let stored: DataSource
         if let index = sources.firstIndex(where: { $0.id == source.id }) {
             var existing = sources[index]
             let now = Date.now
@@ -164,66 +118,81 @@ final class HealthStore {
                 .compactMap { boundedLastSeen($0, now: now) }
                 .max()
             existing.bodyLocation = source.bodyLocation ?? existing.bodyLocation
+            existing.sensingTechnology = source.sensingTechnology ?? existing.sensingTechnology
+            if let models = source.observedDeviceModels {
+                var known = existing.observedDeviceModels ?? []
+                known.formUnion(models)
+                existing.observedDeviceModels = known
+                existing.model = known.count > 1
+                    ? "Multiple reported devices: \(known.sorted().joined(separator: ", "))"
+                    : known.first ?? existing.model
+            }
+            existing.upstreamDeviceRelationshipID = source.upstreamDeviceRelationshipID
+                ?? existing.upstreamDeviceRelationshipID
+            existing.identifiesHealthKitWriter = source.identifiesHealthKitWriter
+                ?? existing.identifiesHealthKitWriter
             if let battery = source.batteryPercent { existing.batteryPercent = battery }
             existing.observedMetrics.formUnion(source.observedMetrics)
             sources[index] = existing
-            scheduleSave()
-            return existing
+            stored = existing
+        } else {
+            var newSource = source
+            newSource.lastSeenAt = boundedLastSeen(source.lastSeenAt)
+            newSource.colorIndex = nextColorIndex()
+            sources.append(newSource)
+            stored = newSource
         }
-        var newSource = source
-        newSource.lastSeenAt = boundedLastSeen(source.lastSeenAt)
-        newSource.colorIndex = nextColorIndex()
-        sources.append(newSource)
-        scheduleSave()
-        return newSource
+        return stored
     }
 
     @discardableResult
     func remove(sourceID: String) -> Bool {
         let sourceCount = sources.count
         sources.removeAll { $0.id == sourceID }
-        let before = readings.count
-        readings.removeAll { $0.sourceID == sourceID }
-        if readings.count != before { rebuildIndexes() }
-        guard sources.count != sourceCount || readings.count != before else { return false }
-        scheduleSave()
+        let bufferedCount = unavailableBuffer.count
+        unavailableBuffer.removeAll { $0.sourceID == sourceID }
+        bufferedIDs = Set(unavailableBuffer.map(\.id))
+        let existedInDatabase = ((try? database?.readings(sourceID: sourceID, limit: 1)) ?? []).isEmpty == false
+        guard sourceCount != sources.count || bufferedCount != unavailableBuffer.count || existedInDatabase else { return false }
+        if isReadyToPersist {
+            do { try database?.removeSource(id: sourceID) }
+            catch { record(error) }
+        }
+        dataGeneration &+= 1
         return true
     }
 
     func setEnabled(_ enabled: Bool, forSource id: String) {
-        guard let index = sources.firstIndex(where: { $0.id == id }) else { return }
-        sources[index].isEnabled = enabled
-        scheduleSave()
+        mutateSource(id) { $0.isEnabled = enabled }
     }
 
     func rename(sourceID: String, to name: String) {
-        guard let index = sources.firstIndex(where: { $0.id == sourceID }) else { return }
-        sources[index].displayName = name
-        scheduleSave()
+        mutateSource(sourceID) { $0.displayName = name }
     }
 
     func updateBattery(_ percent: Int, forSource id: String) {
-        guard let index = sources.firstIndex(where: { $0.id == id }) else { return }
-        sources[index].batteryPercent = percent
-        sources[index].lastSeenAt = .now
-        scheduleSave()
+        mutateSource(id) {
+            $0.batteryPercent = percent
+            $0.lastSeenAt = .now
+        }
     }
 
-    /// Records where on the body a sensor sits, as reported by Body Sensor Location
-    /// (0x2A38). Interpreting a discrepancy depends on this: an optical (PPG) ring and an
-    /// electrical (ECG) chest strap are not measuring the same signal, so a gap between
-    /// them is expected rather than a fault in either device.
     func setBodyLocation(_ location: BodySensorLocation, forSource id: String) {
-        guard let index = sources.firstIndex(where: { $0.id == id }) else { return }
-        guard sources[index].bodyLocation != location else { return }
-        sources[index].bodyLocation = location
-        scheduleSave()
+        mutateSource(id) { $0.bodyLocation = location }
     }
 
     func markSeen(sourceID: String, at date: Date = .now) {
-        guard let index = sources.firstIndex(where: { $0.id == sourceID }) else { return }
         guard let date = boundedLastSeen(date) else { return }
-        sources[index].lastSeenAt = date
+        mutateSource(sourceID) { $0.lastSeenAt = date }
+    }
+
+    private func mutateSource(_ id: String, mutation: (inout DataSource) -> Void) {
+        guard let index = sources.firstIndex(where: { $0.id == id }) else { return }
+        let before = sources[index]
+        mutation(&sources[index])
+        guard sources[index] != before else { return }
+        persistSourcesIfReady([sources[index]])
+        dataGeneration &+= 1
     }
 
     private func nextColorIndex() -> Int {
@@ -234,463 +203,299 @@ final class HealthStore {
 
     // MARK: - Readings
 
-    /// Appends a reading, ignoring implausible values and anything already stored.
-    ///
-    /// Convenience over the batch path, which owns the actual validation, merge and save
-    /// scheduling. Returns whether the reading was stored.
     @discardableResult
     func append(_ reading: Reading) -> Bool {
         !append(contentsOf: [reading]).isEmpty
     }
 
-    /// Appends a batch idempotently and returns exactly the readings that were stored.
-    ///
-    /// De-duplication matters more than it sounds: HealthKit anchored queries re-deliver
-    /// samples when an anchor is reset, and the Oura API returns overlapping ranges at page
-    /// boundaries. Without this, a re-sync would double every value and then the comparison
-    /// engine would report the resulting artefacts as real disagreements.
-    ///
-    /// The whole batch is validated and de-duplicated in one pass, merged into the sorted
-    /// array with a single linear merge, and followed by exactly one `scheduleSave()`.
-    /// Callers get the accepted subset back so that downstream mirroring (HealthKit
-    /// write-back) reflects what was actually stored rather than what was offered — writing
-    /// the rejected duplicates into the user's health record would silently corrupt it.
     @discardableResult
-    func append(contentsOf newReadings: [Reading]) -> [Reading] {
-        guard !newReadings.isEmpty else { return [] }
-
-        var accepted: [Reading] = []
-        accepted.reserveCapacity(newReadings.count)
-        var seen: Set<UUID> = []
-        let now = Date.now
-        for reading in newReadings {
-            guard reading.isPlausible else {
-                logger.debug("Rejected implausible \(reading.kind.rawValue, privacy: .public) value \(reading.value)")
-                continue
-            }
-            guard isTemporallyValid(reading, now: now) else {
-                logger.debug("Rejected \(reading.kind.rawValue, privacy: .public) reading with invalid dates")
-                continue
-            }
-            guard idIndex[reading.id] == nil, seen.insert(reading.id).inserted else { continue }
-            // Compaction is intentionally lossy. Once a window has been reduced to its
-            // stable aggregate, a late HealthKit re-delivery cannot be combined back into
-            // the original median without the discarded raw distribution. Ignoring that
-            // late row preserves the already-established aggregate; accepting it would
-            // produce a median-of-a-median on the next pass and silently drift history.
-            guard idIndex[compactedReadingID(for: reading)] == nil else { continue }
-            accepted.append(reading)
-        }
-        guard !accepted.isEmpty else { return [] }
-
-        rewindCompactionIfNeeded(for: accepted)
-        merge(sortedByEnd(accepted))
-        trimUnavailableArchiveBufferIfNeeded()
-        noteObserved(accepted)
-        scheduleSave()
-        return accepted
+    func append(contentsOf candidates: [Reading]) -> [Reading] {
+        store(candidates, mode: .append).acceptedReadings
     }
 
-    /// Inserts new records and replaces an existing record with the same stable id when a
-    /// cloud provider revises it. Live Bluetooth remains append-only; Oura uses this path
-    /// because sleep and daily documents can be recalculated after their first publication.
-    ///
-    /// Returns the readings that actually changed the store — new records plus genuine
-    /// revisions. A resend of an identical document changes nothing and returns nothing, so
-    /// a caller can treat a non-empty result as "there is new data" without re-diffing.
-    ///
-    /// A revision may move a reading in time, so revised records are lifted out of the array
-    /// and merged back in with the insertions rather than overwritten in place.
     @discardableResult
-    func upsert(contentsOf newReadings: [Reading]) -> [Reading] {
-        guard !newReadings.isEmpty else { return [] }
-
-        // Collapse duplicate ids inside the batch, last write winning, while keeping the
-        // batch's own order for determinism.
-        var latestByID: [UUID: Reading] = [:]
-        var orderedIDs: [UUID] = []
-        let now = Date.now
-        for reading in newReadings {
-            guard reading.isPlausible else {
-                logger.debug("Rejected implausible \(reading.kind.rawValue, privacy: .public) value \(reading.value)")
-                continue
-            }
-            guard isTemporallyValid(reading, now: now) else {
-                logger.debug("Rejected \(reading.kind.rawValue, privacy: .public) reading with invalid dates")
-                continue
-            }
-            guard idIndex[compactedReadingID(for: reading)] == nil else { continue }
-            if latestByID.updateValue(reading, forKey: reading.id) == nil {
-                orderedIDs.append(reading.id)
-            }
-        }
-        guard !orderedIDs.isEmpty else { return [] }
-
-        var changed: [Reading] = []
-        changed.reserveCapacity(orderedIDs.count)
-        var revisedIDs: Set<UUID> = []
-        for id in orderedIDs {
-            guard let reading = latestByID[id] else { continue }
-            if let position = idIndex[id] {
-                guard readings[position] != reading else { continue }
-                revisedIDs.insert(id)
-            }
-            changed.append(reading)
-        }
-        guard !changed.isEmpty else { return [] }
-
-        rewindCompactionIfNeeded(for: changed)
-        if !revisedIDs.isEmpty {
-            readings.removeAll { revisedIDs.contains($0.id) }
-            rebuildIndexes()
-        }
-        merge(sortedByEnd(changed))
-        trimUnavailableArchiveBufferIfNeeded()
-        noteObserved(changed)
-        scheduleSave()
-        return changed
+    func upsert(contentsOf candidates: [Reading]) -> [Reading] {
+        store(candidates, mode: .upsert).acceptedReadings
     }
 
-    /// Removes readings by id and reports how many were actually present.
-    ///
-    /// Exists so an upstream deletion can be honoured — a sample the user deletes in Apple
-    /// Health must stop contributing to comparisons here too. `observedMetrics` is
-    /// deliberately *not* recomputed: a source that once reported a metric still did, and
-    /// re-deriving capability from surviving rows would make the device list flicker as
-    /// history ages out.
+    struct BatchCommitResult: Sendable {
+        var acceptedReadings: [Reading]
+        /// True for a committed database transaction, including an idempotent replay whose
+        /// readings were already present. False means an upstream anchor/cache must not advance.
+        var committed: Bool
+    }
+
+    func appendBatch(
+        readings: [Reading],
+        updatingSources: [DataSource] = [],
+        removingReadingIDs: Set<UUID> = []
+    ) -> BatchCommitResult {
+        store(
+            readings,
+            mode: .append,
+            updatingSources: updatingSources,
+            removingReadingIDs: removingReadingIDs
+        )
+    }
+
+    func upsertBatch(
+        readings: [Reading],
+        updatingSources: [DataSource] = [],
+        removingReadingIDs: Set<UUID> = []
+    ) -> BatchCommitResult {
+        store(
+            readings,
+            mode: .upsert,
+            updatingSources: updatingSources,
+            removingReadingIDs: removingReadingIDs
+        )
+    }
+
+    private func store(
+        _ candidates: [Reading],
+        mode: HealthDatabase.WriteMode,
+        updatingSources sourceUpdates: [DataSource] = [],
+        removingReadingIDs: Set<UUID> = []
+    ) -> BatchCommitResult {
+        guard !candidates.isEmpty || !sourceUpdates.isEmpty || !removingReadingIDs.isEmpty else {
+            return BatchCommitResult(acceptedReadings: [], committed: true)
+        }
+        let sourcesBeforeCommit = sources
+        for source in sourceUpdates { _ = merge(source) }
+        let sourcesChanged = sources != sourcesBeforeCommit
+
+        var latest: [UUID: Reading] = [:]
+        var order: [UUID] = []
+        let now = Date.now
+        for reading in candidates {
+            guard reading.isPlausible, isTemporallyValid(reading, now: now) else { continue }
+            if mode == .append, latest[reading.id] != nil { continue }
+            if latest.updateValue(reading, forKey: reading.id) == nil { order.append(reading.id) }
+        }
+        var valid = order.compactMap { latest[$0] }
+
+        if persistenceEnabled, loadState != .loaded {
+            var changed: [Reading] = []
+            for reading in valid {
+                if mode == .append, bufferedIDs.contains(reading.id) { continue }
+                if let index = unavailableBuffer.firstIndex(where: { $0.id == reading.id }) {
+                    guard mode == .upsert, unavailableBuffer[index] != reading else { continue }
+                    unavailableBuffer[index] = reading
+                } else {
+                    unavailableBuffer.append(reading)
+                    bufferedIDs.insert(reading.id)
+                }
+                changed.append(reading)
+            }
+            unavailableBuffer.sort { $0.end < $1.end }
+            trimUnavailableArchiveBufferIfNeeded()
+            dataGeneration &+= changed.isEmpty && !sourcesChanged ? 0 : 1
+            return BatchCommitResult(acceptedReadings: changed, committed: false)
+        }
+
+        guard let database else {
+            sources = sourcesBeforeCommit
+            return BatchCommitResult(acceptedReadings: [], committed: false)
+        }
+        valid.removeAll { reading in
+            (try? database.contains(readingID: compactedReadingID(for: reading))) == true
+                && reading.id != compactedReadingID(for: reading)
+        }
+        do {
+            let changed = try database.changedReadings(valid, mode: mode)
+            guard !changed.isEmpty || sourcesChanged || !removingReadingIDs.isEmpty else {
+                return BatchCommitResult(acceptedReadings: [], committed: true)
+            }
+            noteObserved(changed)
+            do {
+                let removed = try database.commit(
+                    readings: changed,
+                    mode: mode,
+                    sources: sources,
+                    removingReadingIDs: removingReadingIDs
+                )
+                rewindCompactionIfNeeded(for: changed)
+                dataGeneration &+= (!changed.isEmpty || sourcesChanged || removed > 0) ? 1 : 0
+                return BatchCommitResult(acceptedReadings: changed, committed: true)
+            } catch {
+                sources = sourcesBeforeCommit
+                throw error
+            }
+        } catch {
+            sources = sourcesBeforeCommit
+            record(error)
+            return BatchCommitResult(acceptedReadings: [], committed: false)
+        }
+    }
+
     @discardableResult
     func remove(readingIDs: some Sequence<UUID>) -> Int {
-        let targets = Set(readingIDs)
-        guard !targets.isEmpty else { return 0 }
-        let before = readings.count
-        readings.removeAll { targets.contains($0.id) }
-        let removed = before - readings.count
-        guard removed > 0 else { return 0 }
-        rebuildIndexes()
-        scheduleSave()
-        return removed
+        let ids = Set(readingIDs)
+        guard !ids.isEmpty else { return 0 }
+        if persistenceEnabled, loadState != .loaded {
+            let before = unavailableBuffer.count
+            unavailableBuffer.removeAll { ids.contains($0.id) }
+            bufferedIDs = Set(unavailableBuffer.map(\.id))
+            return before - unavailableBuffer.count
+        }
+        do {
+            let removed = try database?.removeReadingIDs(ids) ?? 0
+            dataGeneration &+= removed > 0 ? 1 : 0
+            return removed
+        } catch {
+            record(error)
+            return 0
+        }
     }
 
-    /// Readings for one metric, optionally clamped to a time range, from enabled sources only.
-    ///
-    /// Served from `kindIndex`, so the cost is proportional to the readings of that metric
-    /// rather than to the whole archive. Results stay in ascending `end` order.
-    func readings(kind: MetricKind, in range: DateInterval? = nil, enabledOnly: Bool = true) -> [Reading] {
-        guard let positions = kindIndex[kind] else { return [] }
-        let enabled: Set<String>? = enabledOnly ? Set(enabledSources.map(\.id)) : nil
-        var result: [Reading] = []
-        result.reserveCapacity(positions.count)
-        for position in positions {
-            let reading = readings[position]
-            if let enabled, !enabled.contains(reading.sourceID) { continue }
-            if let range, !range.contains(reading.midpoint) { continue }
-            result.append(reading)
+    @discardableResult
+    func reconcileEstimates(
+        kinds: Set<MetricKind>,
+        keeping validIDs: Set<UUID>,
+        currentSince: Date? = nil
+    ) -> Int {
+        guard isReadyToPersist || !persistenceEnabled else { return 0 }
+        do {
+            let removed = try database?.removeEstimates(
+                kinds: kinds,
+                keeping: validIDs,
+                currentSince: currentSince
+            ) ?? 0
+            dataGeneration &+= removed > 0 ? 1 : 0
+            return removed
+        } catch {
+            record(error)
+            return 0
         }
-        return result
+    }
+
+    func readings(kind: MetricKind, in range: DateInterval? = nil, enabledOnly: Bool = true) -> [Reading] {
+        _ = dataGeneration
+        guard loadState == .loaded else { return unavailableBuffer.filter { $0.kind == kind } }
+        let enabled = enabledOnly ? Set(enabledSources.map(\.id)) : nil
+        let rows = (try? database?.readings(kind: kind, range: range)) ?? []
+        return enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows
     }
 
     func readings(in range: DateInterval, enabledOnly: Bool = true) -> [Reading] {
-        let enabled = Set(enabledSources.map(\.id))
-        return readings.filter { reading in
-            if enabledOnly, !enabled.contains(reading.sourceID) { return false }
-            return range.contains(reading.midpoint)
-        }
+        _ = dataGeneration
+        guard loadState == .loaded else { return unavailableBuffer.filter { range.contains($0.midpoint) } }
+        let enabled = enabledOnly ? Set(enabledSources.map(\.id)) : nil
+        let rows = (try? database?.readings(range: range)) ?? []
+        return enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows
+    }
+
+    func readingsPage(
+        kind: MetricKind? = nil,
+        in range: DateInterval? = nil,
+        limit: Int = 1_000,
+        offset: Int = 0
+    ) -> [Reading] {
+        _ = dataGeneration
+        return (try? database?.readings(kind: kind, range: range, limit: limit, offset: offset)) ?? []
     }
 
     func latest(kind: MetricKind, sourceID: String) -> Reading? {
-        guard let positions = kindIndex[kind] else { return nil }
-        for position in positions.reversed() where readings[position].sourceID == sourceID {
-            return readings[position]
-        }
-        return nil
+        _ = dataGeneration
+        return try? database?.latest(kind: kind, sourceID: sourceID)
     }
 
-    /// Most recent reading for a source across all metrics, used to show "last data" in
-    /// the device list.
     func lastDataDate(sourceID: String) -> Date? {
-        readings.last { $0.sourceID == sourceID }?.end
+        _ = dataGeneration
+        return try? database?.lastDataDate(sourceID: sourceID)
     }
 
-    /// Metrics that at least one enabled source has actually produced.
     var availableMetrics: [MetricKind] {
         let observed = Set(enabledSources.flatMap(\.observedMetrics))
         return MetricKind.allCases.filter { observed.contains($0) }
     }
 
-    /// Metrics for which two or more enabled sources have data — the ones worth comparing.
     func comparableMetrics(in range: DateInterval) -> [MetricKind] {
-        MetricKind.allCases.filter { kind in
-            let sourceIDs = Set(readings(kind: kind, in: range).map(\.sourceID))
-            return sourceIDs.count >= 2
-        }
-    }
-
-    // MARK: - Ordered storage
-
-    private func boundedLastSeen(_ date: Date?, now: Date = .now) -> Date? {
-        guard let date, date.timeIntervalSinceReferenceDate.isFinite else { return nil }
-        return min(date, now)
-    }
-
-    /// Keeps failed-load buffering finite without applying destructive retention/compaction to a
-    /// store whose on-disk contents are not known yet. Once the archive is readable, the normal
-    /// retention and compaction rules resume and this path is inactive.
-    private func trimUnavailableArchiveBufferIfNeeded() {
-        guard persistenceEnabled, loadState == .failed else { return }
-        let excess = readings.count - Self.maximumReadingsWhileArchiveUnavailable
-        guard excess > 0 else { return }
-        readings.removeFirst(excess)
-        rebuildIndexes()
-        compactionCursor = nil
-    }
-
-    /// Stored readings must be finite, ordered intervals whose start is not in the future. BLE
-    /// applies a stricter device-clock age/skew policy before this shared boundary; this guard
-    /// also protects HealthKit/Oura replays and keeps bad rows out of the archive even if another
-    /// transport bypasses its own admission helper. An end after `now` is allowed only for the
-    /// app's current-day estimates or Oura's daily interval, whose exclusive end is at most one
-    /// day ahead.
-    private func isTemporallyValid(_ reading: Reading, now: Date) -> Bool {
-        guard reading.start.timeIntervalSinceReferenceDate.isFinite,
-              reading.end.timeIntervalSinceReferenceDate.isFinite,
-              reading.start <= reading.end,
-              reading.start <= now
-        else { return false }
-
-        guard reading.end > now else { return true }
-        let isCurrentDayAggregate = reading.provenance == .estimated
-            || reading.sourceID == DataSource.ouraSourceID
-        return isCurrentDayAggregate
-            && reading.end.timeIntervalSince(now) <= 86_400
-    }
-
-    /// Sorts a batch by `end`, breaking ties by original offset so the result is
-    /// deterministic (`Array.sorted` is not a stable sort).
-    private func sortedByEnd(_ batch: [Reading]) -> [Reading] {
-        batch.enumerated()
-            .sorted { lhs, rhs in
-                lhs.element.end == rhs.element.end
-                    ? lhs.offset < rhs.offset
-                    : lhs.element.end < rhs.element.end
-            }
-            .map(\.element)
-    }
-
-    /// Merges an already-sorted, already-validated batch into `readings` in one linear pass.
-    ///
-    /// Equal `end` values keep existing readings ahead of incoming ones, matching the
-    /// insertion order the previous per-reading path produced.
-    private func merge(_ incoming: [Reading]) {
-        guard !incoming.isEmpty else { return }
-
-        // Fast path: the batch lands entirely past the tail, so no existing position moves
-        // and both indexes can be extended in place. This is the live 1 Hz stream.
-        if readings.isEmpty || readings[readings.count - 1].end <= incoming[0].end {
-            appendPastTail(incoming)
-            return
-        }
-
-        var merged: [Reading] = []
-        merged.reserveCapacity(readings.count + incoming.count)
-        var existingIndex = readings.startIndex
-        var incomingIndex = incoming.startIndex
-        while existingIndex < readings.endIndex, incomingIndex < incoming.endIndex {
-            if incoming[incomingIndex].end < readings[existingIndex].end {
-                merged.append(incoming[incomingIndex])
-                incomingIndex += 1
-            } else {
-                merged.append(readings[existingIndex])
-                existingIndex += 1
-            }
-        }
-        merged.append(contentsOf: readings[existingIndex...])
-        merged.append(contentsOf: incoming[incomingIndex...])
-        readings = merged
-        rebuildIndexes()
-    }
-
-    private func appendPastTail(_ incoming: [Reading]) {
-        readings.reserveCapacity(readings.count + incoming.count)
-        for reading in incoming {
-            readings.append(reading)
-            let position = readings.count - 1
-            idIndex[reading.id] = position
-            kindIndex[reading.kind, default: []].append(position)
-        }
-    }
-
-    /// Recomputes both indexes from scratch. Called after any mutation that can move an
-    /// existing reading's position: merge into the middle, removal, prune, compaction, load.
-    private func rebuildIndexes() {
-        idIndex.removeAll(keepingCapacity: true)
-        kindIndex.removeAll(keepingCapacity: true)
-        idIndex.reserveCapacity(readings.count)
-        for (position, reading) in readings.enumerated() {
-            idIndex[reading.id] = position
-            kindIndex[reading.kind, default: []].append(position)
-        }
-    }
-
-    /// Reopens an already-examined historical span when new or revised rows land inside it.
-    private func rewindCompactionIfNeeded(for changed: [Reading]) {
-        guard let cursor = compactionCursor,
-              let earliest = changed.map(\.end).min(),
-              earliest < cursor
-        else { return }
-        compactionCursor = earliest
-    }
-
-    /// Stable identity of the compacted cell an ordinary reading belongs to.
-    private func compactedReadingID(for reading: Reading) -> UUID {
-        let start = ComparisonEngine.floorToWindow(
-            reading.midpoint,
-            size: reading.kind.comparisonWindow
-        )
-        return compactedReadingID(
-            sourceID: reading.sourceID,
-            kind: reading.kind,
-            windowStart: start
-        )
-    }
-
-    private func compactedReadingID(
-        sourceID: String,
-        kind: MetricKind,
-        windowStart: Date
-    ) -> UUID {
-        UUID(stableFrom: "compact.\(sourceID).\(kind.rawValue).\(Int(windowStart.timeIntervalSince1970))")
-    }
-
-    /// Records that these sources produced these metrics, and how recently, in one pass over
-    /// the batch rather than one source lookup per reading.
-    private func noteObserved(_ stored: [Reading]) {
-        guard !stored.isEmpty else { return }
-        var perSource: [String: (metrics: Set<MetricKind>, latest: Date)] = [:]
-        let now = Date.now
-        for reading in stored {
-            var entry = perSource[reading.sourceID] ?? (metrics: Set<MetricKind>(), latest: Date.distantPast)
-            entry.metrics.insert(reading.kind)
-            // A bad device timestamp must not make a source appear to have been seen in the
-            // future, even during the short interval before the next maintenance pass prunes it.
-            entry.latest = max(entry.latest, min(reading.end, now))
-            perSource[reading.sourceID] = entry
-        }
-        for (sourceID, entry) in perSource {
-            guard let index = sources.firstIndex(where: { $0.id == sourceID }) else { continue }
-            sources[index].observedMetrics.formUnion(entry.metrics)
-            sources[index].lastSeenAt = max(sources[index].lastSeenAt ?? .distantPast, entry.latest)
-        }
+        MetricKind.allCases.filter { Set(readings(kind: $0, in: range).map(\.sourceID)).count >= 2 }
     }
 
     // MARK: - Retention and compaction
 
-    /// Drops readings past the retention horizon and readings whose interval starts in the future.
-    func prune(now: Date = .now) {
+    struct RetentionImpact: Equatable, Sendable {
+        var cutoff: Date
+        var readingsDeleted: Int
+        var readingsEligibleForCompaction: Int
+    }
+
+    func retentionImpact(days: Int, now: Date = .now) -> RetentionImpact {
+        let cutoff = now.addingTimeInterval(-TimeInterval(days) * 86_400)
+        let all = readings
+        return RetentionImpact(
+            cutoff: cutoff,
+            readingsDeleted: all.count { $0.end < cutoff },
+            readingsEligibleForCompaction: all.count {
+                $0.end >= cutoff && $0.end < now.addingTimeInterval(-compactionAge)
+                    && $0.metadata?.aggregation == nil
+            }
+        )
+    }
+
+    @discardableResult
+    func prune(now: Date = .now) -> Bool {
+        guard loadState == .loaded, let database else { return false }
         let cutoff = now.addingTimeInterval(-retention)
-        let before = readings.count
-        readings.removeAll { reading in
-            !isTemporallyValid(reading, now: now) || reading.end < cutoff
-        }
-        if readings.count != before { rebuildIndexes() }
-        // Archives written by an older build may already contain a future last-seen value. Keep
-        // source status on the same side of the time boundary as the rows that remain.
-        for index in sources.indices {
-            if let lastSeen = sources[index].lastSeenAt, lastSeen > now {
+        let originalSources = sources
+        do {
+            for index in sources.indices where (sources[index].lastSeenAt ?? .distantPast) > now {
                 sources[index].lastSeenAt = now
             }
+            let removed = try database.prune(cutoff: cutoff, now: now, sources: sources)
+            dataGeneration &+= removed > 0 ? 1 : 0
+            return true
+        } catch {
+            sources = originalSources
+            record(error)
+            return false
         }
     }
 
-    /// Downsamples history older than `compactionAge` so a long retention window stays
-    /// within what a whole-file JSON archive can carry.
-    ///
-    /// Every reading older than the cutoff collapses to **one reading per (source, metric,
-    /// comparison window)**, valued at the median of that window. The windowing and the
-    /// aggregation both come from `ComparisonEngine` — `floorToWindow`, `windows` and
-    /// `aggregate` — precisely so compaction and comparison can never drift apart: what is
-    /// stored after compaction is what the comparison engine would have computed from the
-    /// raw rows anyway.
-    ///
-    /// The compacted reading spans its window (`start` is the window start, `end` the window
-    /// end), keeps its source, and keeps the strongest provenance present in the window
-    /// (measured beats derived beats estimated, matching `ComparisonEngine.aggregate`). Its
-    /// id is derived with `UUID(stableFrom:)` from source, metric and window start, so
-    /// running compaction twice produces the same id and is idempotent.
-    ///
-    /// A window that already holds exactly one reading is left completely untouched, which
-    /// makes this a no-op on sparse data — daily summaries, Oura documents, resting heart
-    /// rate — and only bites on a streaming sensor.
-    ///
-    /// The 14-day floor on `compactionAge` is load-bearing. Oura syncs a rolling 14-day
-    /// window and HealthKit's anchored queries request 30 days, so compacting anything
-    /// newer than the Oura window would let the very next sync offer the raw rows
-    /// compaction just replaced. HealthKit can likewise re-deliver rows between 14 and 30
-    /// days old after an anchor reset. Ingestion recognises a cell's stable compacted id and
-    /// drops those late rows: the original distribution no longer exists, so folding a new
-    /// raw value into its median would create a biased median-of-a-median. This preserves
-    /// history honestly at the cost already implied by lossy compaction: a compacted window
-    /// is final and cannot incorporate a later correction.
-    ///
-    /// Lossy by design: raw sample counts and within-window spread for old data are gone
-    /// after a pass. What survives is the windowed median every analysis and every export
-    /// actually consumes.
-    ///
-    /// Only windows that lie *entirely* older than the cutoff are collapsed. A window
-    /// straddling the cutoff still has rows arriving into it, and collapsing its aged half
-    /// now would mean re-collapsing a median-of-medians next pass — the value would drift
-    /// on every run instead of converging. Deferring it by one pass costs nothing.
-    ///
-    /// Each pass is bounded to `compactionSpanPerPass` of history starting at the oldest
-    /// reading, so the first pass over a large existing archive cannot stall the main actor
-    /// for the length of the whole backlog; subsequent saves walk forward until the backlog
-    /// is gone. Within that span the whole aged prefix is re-examined, which is what keeps
-    /// re-delivered rows from escaping collapse.
-    ///
-    /// Runs only once `loadState == .loaded`. Compacting a store that does not yet hold the
-    /// archive's contents would be wasted work at best, and at worst would rewrite ids for
-    /// windows whose other members are still on disk.
-    func compact(now: Date = .now) {
-        guard loadState == .loaded else { return }
-        guard let oldest = readings.first?.end else { return }
+    @discardableResult
+    func compact(now: Date = .now) -> Bool {
+        guard loadState == .loaded, let database else { return false }
+        let oldest: Date
+        do {
+            guard let first = try database.readings(limit: 1).first else { return true }
+            oldest = first.end
+        } catch {
+            record(error)
+            return false
+        }
         let ageCutoff = now.addingTimeInterval(-compactionAge)
         let passStart = max(compactionCursor ?? oldest, oldest)
-        guard passStart < ageCutoff else { return }
-        let cutoff = min(
-            ageCutoff,
-            passStart.addingTimeInterval(Self.compactionSpanPerPass)
-        )
-        let boundary = readings.firstIndex { $0.end >= cutoff } ?? readings.count
-        // Advance even when this span contains only sparse, already-compacted, or no rows;
-        // otherwise a gap before dense history would wedge the cursor just as surely as a
-        // compacted first window did.
-        compactionCursor = cutoff
-        guard boundary > 0 else { return }
-        let aged = Array(readings[..<boundary])
+        guard passStart < ageCutoff else { return true }
+        let cutoff = min(ageCutoff, passStart.addingTimeInterval(Self.compactionSpanPerPass))
+        let aged: [Reading]
+        do {
+            aged = try database.readings(range: DateInterval(start: .distantPast, end: cutoff))
+        } catch {
+            record(error)
+            return false
+        }
+        guard !aged.isEmpty else {
+            compactionCursor = cutoff
+            return true
+        }
 
         var replacements: [Reading] = []
         var supersededIDs: Set<UUID> = []
-
         for (kind, group) in Dictionary(grouping: aged, by: \.kind) {
-            let size = kind.comparisonWindow
-            guard size > 0 else { continue }
-
-            // Membership mirrors ComparisonEngine.windows' own filter exactly, so the rows
-            // removed here are precisely the rows that produced the aggregate below.
             var members: [CompactionBucket: [Reading]] = [:]
             for reading in group where reading.isPlausible {
-                let start = ComparisonEngine.floorToWindow(reading.midpoint, size: size)
+                let start = ComparisonEngine.floorToWindow(reading.midpoint, size: kind.comparisonWindow)
                 members[CompactionBucket(start: start, sourceID: reading.sourceID), default: []].append(reading)
             }
-
             let windows = ComparisonEngine.windows(
                 from: group,
                 kind: kind,
-                windowSize: size,
+                windowSize: kind.comparisonWindow,
                 includeEstimated: true
             )
-            for window in windows {
-                // Whole windows only — see the note on drift above.
-                guard window.end <= cutoff else { continue }
+            for window in windows where window.end <= cutoff {
                 for value in window.values {
                     let bucket = CompactionBucket(start: window.start, sourceID: value.sourceID)
                     guard let collapsed = members[bucket], collapsed.count > 1 else { continue }
@@ -700,13 +505,7 @@ final class HealthStore {
                         windowStart: window.start
                     )
                     if collapsed.contains(where: { $0.id == aggregateID }) {
-                        // A build predating the ingest guard may already have accepted raw
-                        // rows after this cell was compacted. Keep the established median
-                        // and discard only those late rows; re-aggregating the aggregate as
-                        // if it were one raw sample would bias the value.
-                        supersededIDs.formUnion(
-                            collapsed.lazy.filter { $0.id != aggregateID }.map(\.id)
-                        )
+                        supersededIDs.formUnion(collapsed.filter { $0.id != aggregateID }.map(\.id))
                         continue
                     }
                     supersededIDs.formUnion(collapsed.map(\.id))
@@ -717,39 +516,36 @@ final class HealthStore {
                         value: value.value,
                         start: window.start,
                         end: window.end,
-                        provenance: value.provenance
+                        provenance: value.provenance,
+                        metadata: ReadingMetadata(aggregation: AggregationMetadata(
+                            originalSampleCount: value.sampleCount,
+                            originalStandardDeviation: value.standardDeviation
+                        ))
                     ))
                 }
             }
         }
-
-        guard !supersededIDs.isEmpty else { return }
-        readings.removeAll { supersededIDs.contains($0.id) }
-        rebuildIndexes()
-        if !replacements.isEmpty { merge(sortedByEnd(replacements)) }
-        logger.info("Compacted \(supersededIDs.count) readings into \(replacements.count)")
+        guard !supersededIDs.isEmpty else {
+            compactionCursor = cutoff
+            return true
+        }
+        do {
+            try database.replaceReadings(removing: supersededIDs, with: replacements)
+            compactionCursor = cutoff
+            dataGeneration &+= 1
+            logger.info("Compacted \(supersededIDs.count) readings into \(replacements.count)")
+            return true
+        } catch {
+            record(error)
+            return false
+        }
     }
 
-    // MARK: - Persistence
+    // MARK: - Persistence and migration
 
-    /// Reads the archive into memory, once.
-    ///
-    /// A failed read leaves `loadState == .failed` instead of latching a "loaded" flag, so a
-    /// later call retries. That distinction is the whole point: the failure is transient.
-    /// With a file protection class set, a CoreBluetooth state-restoration relaunch before
-    /// the device's first unlock cannot open the archive at all, and the previous code
-    /// treated that as "no data" — after which the next coalesced save replaced the user's
-    /// entire history with an empty store.
     func loadIfNeeded() async {
-        guard persistenceEnabled else { return }
-        guard loadState != .loaded else { return }
-
-        // Two callers racing would each read the archive, and the slower one would overwrite
-        // whatever the faster one had already ingested. Share the in-flight read instead.
-        if let loadTask {
-            await loadTask.value
-            return
-        }
+        guard persistenceEnabled, loadState != .loaded else { return }
+        if let loadTask { await loadTask.value; return }
         let task = Task { [weak self] in
             guard let self else { return }
             await self.performLoad()
@@ -760,111 +556,220 @@ final class HealthStore {
     }
 
     private func performLoad() async {
-        let sourcesOutcome = await ReadingArchive.shared.readOutcome(
-            [DataSource].self,
-            from: ReadingArchive.File.sources
-        )
-        let readingsOutcome = await ReadingArchive.shared.readOutcome(
-            [Reading].self,
-            from: ReadingArchive.File.readings
-        )
-
-        // Both files must be conclusive before the in-memory store may ever be written back.
-        // A readable sources.json beside an unreadable readings.json is the dangerous case:
-        // adopting it looks exactly like "this user has devices but no history", and saving
-        // that is indistinguishable from deleting their history.
-        guard sourcesOutcome.isConclusive, readingsOutcome.isConclusive else {
-            loadState = .failed
-            logger.error("Archive unreadable; refusing to persist until a load succeeds")
-            return
-        }
-
-        sources = sourcesOutcome.value ?? []
-        readings = (readingsOutcome.value ?? []).sorted { $0.end < $1.end }
-        rebuildIndexes()
-        compactionCursor = nil
-        loadState = .loaded
-        hasLoggedSaveRefusal = false
-        prune()
-        logger.info("Loaded \(self.readings.count) readings across \(self.sources.count) sources")
-    }
-
-    /// Coalesces saves so a 1 Hz stream does not trigger a file write every second.
-    private func scheduleSave() {
-        guard persistenceEnabled else { return }
-        saveTask?.cancel()
-        saveTask = Task { [weak self] in
-            try? await Task.sleep(for: Self.saveDebounce)
-            guard !Task.isCancelled, let self else { return }
-            await self.saveNow()
-        }
-
-        // Do not reset this task on every append. A live device can therefore keep the useful
-        // three-second trailing debounce while still forcing prune/compact/archive work at a
-        // finite maximum latency.
-        if maximumSaveTask == nil {
-            maximumSaveTask = Task { [weak self] in
-                try? await Task.sleep(for: Self.maximumSaveLatency)
-                guard !Task.isCancelled, let self else { return }
-                await self.saveNow()
+        if database == nil {
+            do {
+                let url = try configuredDatabaseURL ?? HealthDatabase.defaultURL()
+                let reopened = try HealthDatabase(url: url)
+                database = reopened
+                needsLegacyMigration = reopened.requiresLegacyMigration
+                lastPersistenceError = nil
+            } catch {
+                loadState = .failed
+                lastPersistenceError = error.localizedDescription
+                unavailableCollections = ["health.sqlite3: \(error.localizedDescription)"]
+                return
             }
+        }
+        guard let database else { return }
+        unavailableCollections.removeAll()
+        recoveredCorruptCollections.removeAll()
+        do {
+            if needsLegacyMigration {
+                let sourcesOutcome = await archive.readOutcome([DataSource].self, from: ReadingArchive.File.sources)
+                let readingsOutcome = await archive.readOutcome([Reading].self, from: ReadingArchive.File.readings)
+                noteOutcome(sourcesOutcome, collection: ReadingArchive.File.sources)
+                noteOutcome(readingsOutcome, collection: ReadingArchive.File.readings)
+                guard sourcesOutcome.isConclusive, readingsOutcome.isConclusive else {
+                    loadState = .failed
+                    return
+                }
+                sources = sourcesOutcome.value ?? []
+                var migratedReadings = readingsOutcome.value ?? []
+                migratedReadings.append(contentsOf: unavailableBuffer)
+                migratedReadings = deduplicated(migratedReadings)
+                noteObserved(migratedReadings)
+                try database.replaceAll(
+                    readings: migratedReadings,
+                    sources: sources,
+                    completingLegacyMigration: true
+                )
+                needsLegacyMigration = false
+            } else {
+                sources = try database.allSources()
+                if !unavailableBuffer.isEmpty {
+                    let changed = try database.changedReadings(unavailableBuffer, mode: .append)
+                    noteObserved(changed)
+                    try database.commit(readings: changed, mode: .append, sources: sources)
+                }
+            }
+            unavailableBuffer.removeAll()
+            bufferedIDs.removeAll()
+            loadState = .loaded
+            lastPersistenceError = nil
+            compactionCursor = nil
+            dataGeneration &+= 1
+            prune()
+            logger.info("Loaded \(self.readingCount) readings across \(self.sources.count) sources")
+        } catch {
+            loadState = .failed
+            record(error)
         }
     }
 
     @discardableResult
     func saveNow() async -> Bool {
-        guard persistenceEnabled else { return false }
-        saveTask?.cancel()
-        saveTask = nil
-        maximumSaveTask?.cancel()
-        maximumSaveTask = nil
-        if loadState == .failed {
-            // There is no safe archive to write yet, but the in-memory emergency buffer still
-            // needs maintenance so a locked-device or transient I/O failure cannot become a
-            // storage DoS while retries are pending. Do not prune/compact an inconclusively
-            // loaded store: its missing history may still replace this session's memory later.
-            trimUnavailableArchiveBufferIfNeeded()
+        guard persistenceEnabled, loadState == .loaded, let database else { return false }
+        guard prune(), compact() else { return false }
+        do {
+            try database.checkpoint()
+            return true
+        } catch {
+            record(error)
             return false
         }
-        // The guard that turns an unreadable archive into a retry rather than data loss.
-        // Writing from `.notLoaded` or `.failed` would replace the archive with whatever
-        // this session happens to hold, which after a locked-device launch is nothing.
-        guard loadState == .loaded else {
-            if !hasLoggedSaveRefusal {
-                hasLoggedSaveRefusal = true
-                logger.error("Refusing to save: archive load has not completed")
-            }
-            return false
-        }
-        prune()
-        compact()
-        let readingsSnapshot = readings
-        let sourcesSnapshot = sources
-        let readingsWritten = await ReadingArchive.shared.write(
-            readingsSnapshot,
-            to: ReadingArchive.File.readings
-        )
-        let sourcesWritten = await ReadingArchive.shared.write(
-            sourcesSnapshot,
-            to: ReadingArchive.File.sources
-        )
-        return readingsWritten && sourcesWritten
     }
 
-    /// Removes every stored reading but keeps the configured devices.
-    ///
-    /// `lastSeenAt` is cleared alongside `observedMetrics`: a source whose history has just
-    /// been wiped has no evidence left for a recent sighting, and leaving the timestamp in
-    /// place made the device list claim data the store no longer holds.
-    func deleteAllReadings() {
-        readings.removeAll()
-        idIndex.removeAll()
-        kindIndex.removeAll()
-        compactionCursor = nil
+    @discardableResult
+    func deleteAllReadings() -> Bool {
+        let originalSources = sources
+        let originalBuffer = unavailableBuffer
+        let originalBufferedIDs = bufferedIDs
         for index in sources.indices {
             sources[index].observedMetrics.removeAll()
             sources[index].lastSeenAt = nil
         }
-        scheduleSave()
+        unavailableBuffer.removeAll()
+        bufferedIDs.removeAll()
+        compactionCursor = nil
+        guard loadState == .loaded else {
+            sources = originalSources
+            unavailableBuffer = originalBuffer
+            bufferedIDs = originalBufferedIDs
+            return false
+        }
+        do {
+            try database?.deleteAllReadings(sources: sources)
+            dataGeneration &+= 1
+            return true
+        } catch {
+            sources = originalSources
+            unavailableBuffer = originalBuffer
+            bufferedIDs = originalBufferedIDs
+            record(error)
+            return false
+        }
+    }
+
+    func exportCSV() -> String {
+        var rows = ["id,source_id,metric,value,start_utc,end_utc,provenance,aggregation"]
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        for reading in readings {
+            let aggregation = reading.metadata?.aggregation == nil ? "raw" : "compacted_window_median"
+            rows.append([
+                reading.id.uuidString, reading.sourceID, reading.kind.rawValue,
+                String(format: "%.15g", locale: Locale(identifier: "en_US_POSIX"), reading.value),
+                formatter.string(from: reading.start), formatter.string(from: reading.end),
+                reading.provenance.rawValue, aggregation,
+            ].map(Self.csvEscape).joined(separator: ","))
+        }
+        return rows.joined(separator: "\r\n") + "\r\n"
+    }
+
+    func injectDatabaseFailureOnNextCommitForTesting() {
+        database?.injectFailureOnNextCommitForTesting()
+    }
+
+    // MARK: - Helpers
+
+    private var isReadyToPersist: Bool { !persistenceEnabled || loadState == .loaded }
+
+    private func persistSourcesIfReady(_ changed: [DataSource]) {
+        guard isReadyToPersist else { return }
+        do { try database?.saveSources(changed) }
+        catch { record(error) }
+    }
+
+    private func noteObserved(_ stored: [Reading]) {
+        var perSource: [String: (metrics: Set<MetricKind>, latest: Date)] = [:]
+        let now = Date.now
+        for reading in stored {
+            var entry = perSource[reading.sourceID] ?? ([], .distantPast)
+            entry.metrics.insert(reading.kind)
+            entry.latest = max(entry.latest, min(reading.end, now))
+            perSource[reading.sourceID] = entry
+        }
+        for (sourceID, entry) in perSource {
+            guard let index = sources.firstIndex(where: { $0.id == sourceID }) else { continue }
+            sources[index].observedMetrics.formUnion(entry.metrics)
+            sources[index].lastSeenAt = max(sources[index].lastSeenAt ?? .distantPast, entry.latest)
+        }
+    }
+
+    private func boundedLastSeen(_ date: Date?, now: Date = .now) -> Date? {
+        guard let date, date.timeIntervalSinceReferenceDate.isFinite else { return nil }
+        return min(date, now)
+    }
+
+    private func isTemporallyValid(_ reading: Reading, now: Date) -> Bool {
+        guard reading.start.timeIntervalSinceReferenceDate.isFinite,
+              reading.end.timeIntervalSinceReferenceDate.isFinite,
+              reading.start <= reading.end,
+              reading.start <= now
+        else { return false }
+        guard reading.end > now else { return true }
+        let aggregate = reading.provenance == .estimated || reading.sourceID == DataSource.ouraSourceID
+        return aggregate && reading.end.timeIntervalSince(now) <= 86_400
+    }
+
+    private func compactedReadingID(for reading: Reading) -> UUID {
+        compactedReadingID(
+            sourceID: reading.sourceID,
+            kind: reading.kind,
+            windowStart: ComparisonEngine.floorToWindow(reading.midpoint, size: reading.kind.comparisonWindow)
+        )
+    }
+
+    private func compactedReadingID(sourceID: String, kind: MetricKind, windowStart: Date) -> UUID {
+        UUID(stableFrom: "compact.\(sourceID).\(kind.rawValue).\(Int(windowStart.timeIntervalSince1970))")
+    }
+
+    private func rewindCompactionIfNeeded(for changed: [Reading]) {
+        guard let cursor = compactionCursor, let earliest = changed.map(\.end).min(), earliest < cursor else { return }
+        compactionCursor = earliest
+    }
+
+    private func trimUnavailableArchiveBufferIfNeeded() {
+        let excess = unavailableBuffer.count - Self.maximumReadingsWhileArchiveUnavailable
+        guard excess > 0 else { return }
+        unavailableBuffer.removeFirst(excess)
+        bufferedIDs = Set(unavailableBuffer.map(\.id))
+    }
+
+    private func deduplicated(_ input: [Reading]) -> [Reading] {
+        var byID: [UUID: Reading] = [:]
+        for reading in input where reading.isPlausible { byID[reading.id] = reading }
+        return byID.values.sorted { $0.end < $1.end }
+    }
+
+    private func noteOutcome<T: Sendable>(_ outcome: ReadingArchive.ReadOutcome<T>, collection: String) {
+        switch outcome {
+        case .unreadable(let reason):
+            unavailableCollections.append("\(collection): \(reason)")
+        case .corrupt(let reason):
+            recoveredCorruptCollections.append("\(collection): \(reason)")
+        case .missing, .value:
+            break
+        }
+    }
+
+    private func record(_ error: any Error) {
+        lastPersistenceError = error.localizedDescription
+        logger.error("Persistence failed: \(error.localizedDescription, privacy: .public)")
+    }
+
+    private static func csvEscape(_ field: String) -> String {
+        guard field.contains(",") || field.contains("\"") || field.contains("\r") || field.contains("\n") else { return field }
+        return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 }

@@ -400,10 +400,11 @@ struct ComparisonEngineTests {
 
         #expect(observation.sourceA.value == 70)
         #expect(observation.sourceA.sampleCount == 3)
-        #expect(abs(observation.sourceA.standardDeviation - sqrt(200.0 / 3.0)) < 1e-9)
+        let sourceASpread = try #require(observation.sourceA.standardDeviation)
+        #expect(abs(sourceASpread - sqrt(200.0 / 3.0)) < 1e-9)
         #expect(observation.sourceB.value == 73)
         #expect(observation.sourceB.sampleCount == 4)
-        #expect(observation.sourceB.standardDeviation > 0)
+        #expect(try #require(observation.sourceB.standardDeviation) > 0)
         #expect(analysis.rawSampleCountA == 3)
         #expect(analysis.rawSampleCountB == 4)
         #expect(observation.signedDifference == -3)

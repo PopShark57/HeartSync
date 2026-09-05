@@ -12,7 +12,7 @@ HeartSync is a SwiftUI iOS 18+ application for collecting and comparing health m
 
 All three paths normalize data into the same `DataSource` and `Reading` model. `AppModel` routes normalized readings into `HealthStore`, optional derived estimates, comparison analysis, and optional HealthKit write-back. The app is deliberately careful to distinguish measured, derived, and estimated data and to represent insufficient comparison evidence honestly.
 
-The repository contains one iOS application module and one hosted unit-test bundle. There is no server, watchOS app, app extension, widget, framework target, or local Swift package.
+The repository contains one iOS application module, one hosted Swift Testing bundle, one UI-test bundle, and a separate device-performance test bundle. There is no server, watchOS app, app extension, widget, framework target, or local Swift package.
 
 ## High-Level Architecture
 
@@ -23,7 +23,7 @@ HeartSyncApp
   -> AppModel (composition root and lifecycle coordinator)
        -> BluetoothManager -- GATT parsers ----\
        -> HealthKitManager -- type mappings ----> Reading + DataSource -> HealthStore
-       -> OuraManager ------ OuraClient --------/                       -> ReadingArchive
+       -> OuraManager ------ OuraClient --------/                       -> HealthDatabase
        -> derived estimators / HRV                                      -> ComparisonEngine
                                                                         -> SwiftUI views/export
 ```
@@ -46,7 +46,7 @@ HeartSyncApp
 | `Resources/Assets.xcassets` | Universal iOS app icon asset catalog. |
 | `Sources/App` | App entry point, root tabs, lifecycle, service construction, ingestion, timers, and derived-metric orchestration. |
 | `Sources/Model` | Canonical metric, reading, source, provenance, user-profile, discrepancy, and evidence value types. |
-| `Sources/Store` | Observable in-memory store, atomic JSON archive, settings, Keychain wrapper, and stable-ID generation. |
+| `Sources/Store` | Observable store boundary, transactional indexed SQLite database, small atomic JSON archives, settings, Keychain wrapper, and stable-ID generation. |
 | `Sources/Bluetooth` | CoreBluetooth lifecycle, SIG GATT constants, safe binary reader, and typed measurement parsers. |
 | `Sources/Health` | HealthKit authorization, anchored queries, unit/source conversion, background delivery, and measured-value write-back. |
 | `Sources/Oura` | OAuth, Keychain-backed credentials, API transport/DTOs, endpoint status, token-free cache, sync orchestration, and scalar mapping. |
@@ -54,6 +54,8 @@ HeartSyncApp
 | `Sources/Views` | SwiftUI screens and reusable components, Charts usage, plus the narrow UIKit share-sheet bridge. |
 | `Sources/Debug` | Deterministic pairwise demo fixtures guarded by `#if DEBUG`. |
 | `Tests` | Swift Testing suites for parsers, analysis, OAuth/API behavior, stable IDs, and export. |
+| `UITests` | Deterministic UI recovery, data-control, comparison, Oura failure, and pseudo-localization flows. |
+| `PerformanceTests` | Separate physical-device 14-day, 1 Hz indexed-store release workload. |
 | `HeartSyncChecker.xcodeproj` | Ignored XcodeGen output. Regenerate it; do not treat it as source. |
 | `build`, `DerivedData`, `*.xcresult` | Ignored generated build/test artifacts. Never edit or commit them as implementation. |
 
@@ -67,18 +69,20 @@ HeartSyncApp
 | --- | --- | --- | --- |
 | `HeartSyncChecker` | iOS application | All of `Sources` and the non-plist contents of `Resources` | Bundle ID `com.heartsync.HeartSyncChecker`; product/executable `HeartSync`; Swift module `HeartSyncChecker` |
 | `HeartSyncCheckerTests` | Hosted iOS unit-test bundle | All of `Tests` | Imports `@testable import HeartSyncChecker`; explicit host is `HeartSync.app/HeartSync` |
+| `HeartSyncCheckerUITests` | iOS UI-test bundle | All of `UITests` | Drives deterministic Debug-only launch scenarios; targets `HeartSyncChecker` |
+| `HeartSyncCheckerPerformanceTests` | Hosted iOS unit-test bundle | All of `PerformanceTests` | Manual physical-device release workload; explicit host is `HeartSync.app/HeartSync` |
 
-There is one shared scheme, `HeartSyncChecker`, with the app in all build actions and `HeartSyncCheckerTests` in the test action. Debug and Release configurations are generated.
+The `HeartSyncChecker` scheme runs the normal unit and UI bundles. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI. Debug and Release configurations are generated.
 
 The target/product/module naming difference is intentional and fragile: the target, scheme, and module are `HeartSyncChecker`, but the installed bundle and executable are `HeartSync`. Preserve `PRODUCT_NAME`, `PRODUCT_MODULE_NAME`, `TEST_HOST`, and `BUNDLE_LOADER` together.
 
 There are no:
 
 - watchOS, macOS, visionOS, tvOS, or Mac Catalyst targets;
-- app extensions, widgets, notification extensions, UI-test targets, or reusable framework targets;
+- app extensions, widgets, notification extensions, or reusable framework targets;
 - `Package.swift`, `Package.resolved`, SwiftPM package dependencies, CocoaPods, or Carthage dependencies.
 
-The app uses only Apple system frameworks: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, and CryptoKit. Tests use Foundation and Swift Testing.
+The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, CryptoKit, and SQLite3. Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
 
 ## Shared Versus Platform-Specific Code
 
@@ -165,13 +169,14 @@ There is no watchOS app and no WatchConnectivity code. Apple Watch measurements 
 
 Authorization and synchronization rules:
 
-- Read types include the supported measurements plus birth date and biological sex.
+- Read types include the supported measurements plus birth date. Biological sex is not
+  requested or retained because no current feature uses it.
 - Share types are restricted to directly measurable BLE-compatible metrics: heart rate, oxygen saturation, SDNN, and body temperature.
 - Completion of the HealthKit authorization sheet does not prove that each read permission was granted. Do not make the UI claim otherwise.
 - Anchored queries request a recent 30-day window and then install update handlers. Local retention settings do not imply a one-year HealthKit backfill.
 - Background delivery is requested hourly. There are no `BGTaskScheduler` identifiers or task handlers.
 - The committed entitlements declare `com.apple.developer.healthkit.background-delivery`, and the code requests hourly delivery. The capability still needs to be enabled for the App ID/provisioning profile and exercised with a signed build on a physical device; do not describe background wake behavior as guaranteed until that validation succeeds.
-- Anchored queries apply HealthKit deletions: `HealthKitManager.deletedReadingIDs` maps each `HKDeletedObject.uuid` to a reading id (the same sample UUID used at ingest), `AppModel.removeDeletedHealthKitSamples` receives them, and `HealthStore.remove(readingIDs:)` drops matching rows. Unknown ids are a no-op. Remaining limits: an already-exported pairwise analysis is unchanged; after compaction, raw sample UUIDs are gone so an upstream deletion cannot remove the stable window median that replaced them.
+- Anchored queries apply HealthKit deletions: `HealthKitManager.deletedReadingIDs` maps each `HKDeletedObject.uuid` to a reading id (the same sample UUID used at ingest), and `AppModel.ingest` commits source updates, readings, and deletions from one anchor page through `HealthStore` in a single transaction. Unknown ids are a no-op. Remaining limits: an already-exported pairwise analysis is unchanged; after compaction, raw sample UUIDs are gone so an upstream deletion cannot remove the stable window median that replaced them.
 - Optional write-back is allowed only for `.measured` readings from Bluetooth sources. Estimated or HealthKit/Oura-originating values must never be written back.
 
 HealthKit readings currently use `hk.<source bundle identifier>` as the source ID and keep the device model as metadata. A nearby model comment describes a more specific identity than the implementation supplies. Treat the implemented ID formula as migration-sensitive; changing it can split or duplicate historical sources.
@@ -209,24 +214,24 @@ Permission handling is deliberately server-authoritative:
 
 ## Persistence and Data Storage
 
-`HealthStore` is the single in-memory, sorted repository for sources and readings. It rejects implausible values, de-duplicates known reading IDs, updates observed source metrics, offers query-shaped read APIs, and schedules persistence.
+`HealthStore` is the single observed repository boundary. It keeps the small source list in memory and stores readings in one local SQLite database. It rejects implausible values, de-duplicates known reading IDs, updates observed source metrics, and offers indexed, range-shaped and paged read APIs.
 
 - Bluetooth and HealthKit records are appended idempotently.
 - Oura records are upserted because a stable cloud record can be corrected.
 - Stable identity comes from framework sample IDs or `UUID(stableFrom:)` recipes. Identity changes require migration analysis; otherwise a refresh can duplicate or orphan history.
-- Store persistence is coalesced for three seconds. Settings persistence is coalesced for one second. Both stores refuse to overwrite an archive until its initial read has reached a conclusive state; an unreadable protected file is retried rather than treated as empty.
-- Default reading retention is 30 days and can be configured by the existing settings model. Before pruning, readings at least 14 days old are irreversibly compacted to one median per source/comparison window. A compacted window is final: late rows and cloud revisions for it are rejected because the discarded distribution cannot be recombined without median-of-medians bias.
+- Reading and source mutations commit transactionally and incrementally. The database indexes stable ID, metric/time, source/time, and end time. Settings persistence remains one-second coalesced. Startup refuses to attach transports until the database and any pending legacy migration are conclusive; an unavailable protected file is retried rather than treated as empty.
+- Default reading retention is 30 days and can be configured by the existing settings model. Before pruning, readings at least 14 days old are irreversibly compacted to one median per source/comparison window. New compacted rows preserve original count and standard deviation; migrated legacy medians represent unavailable facts as unknown. A compacted window is final: late rows and cloud revisions for it are rejected because the discarded distribution cannot be recombined without median-of-medians bias.
 
-`ReadingArchive` serializes ISO-8601 JSON atomically under Application Support in the `HeartSync` directory:
+`HealthDatabase` stores `health.sqlite3` plus its WAL/SHM companions under Application Support in the `HeartSync` directory. A durable metadata marker makes the version-1 JSON migration retry across process termination. `ReadingArchive` continues to serialize the small ISO-8601 JSON archives atomically and supplies the legacy migration inputs:
 
 - `readings.json`
 - `sources.json`
 - `settings.json`
 - `oura-dashboard-v1.json`
 
-Every write uses a versioned envelope and reads retain compatibility with the earlier bare-payload format. If a file can be opened but cannot be decoded, the actor preserves it as a `.corrupt` backup instead of silently deleting it. If it exists but cannot be opened, the actor leaves it untouched and reports it as unreadable. There is no general payload schema-migration layer. Adding or changing non-optional `Codable` fields, enum raw values, or stable-ID formulas can invalidate or duplicate user history and needs an explicit compatibility plan plus tests.
+JSON writes use a versioned envelope and reads retain compatibility with the earlier bare-payload format. If a file can be opened but cannot be decoded, the actor preserves it under a unique timestamped `.corrupt-*` name instead of silently deleting it. If it exists but cannot be opened, the actor leaves it untouched and reports it as unreadable. Beyond the explicit JSON-to-SQLite reading/source migration there is no general payload schema-migration layer. Adding or changing non-optional `Codable` fields, enum raw values, or stable-ID formulas can invalidate or duplicate user history and needs an explicit compatibility plan plus tests.
 
-Archive writes explicitly use complete file protection until first user authentication. This keeps files usable while locked after the first unlock, which is necessary for ordinary Bluetooth background collection. The boot-to-first-unlock gap remains; the unreadable-load guards are what prevent that gap from overwriting history. Do not change this to complete protection or complete-unless-open without re-evaluating the background path. Archive files remain eligible for encrypted device backups so Bluetooth-only history can be restored; the bearer credential remains device-only in Keychain.
+The database, WAL/SHM files, and JSON writes explicitly use complete file protection until first user authentication. This keeps them usable while locked after the first unlock, which is necessary for ordinary Bluetooth background collection. The boot-to-first-unlock gap remains; retryable startup guards are what prevent that gap from overwriting history. Do not change this to complete protection or complete-unless-open without re-evaluating the background path. Files remain eligible for encrypted device backups so Bluetooth-only history can be restored; the bearer credential remains device-only in Keychain.
 
 The Oura snapshot is schema-versioned and token-free. Its `schemaVersion` is recorded but there is no implemented general migration mechanism.
 
@@ -234,7 +239,7 @@ OAuth credentials are encoded as one Keychain generic-password value using `kSec
 
 HealthKit query anchors use `UserDefaults` keys prefixed with `hk.anchor.`. Pairwise exports use per-export temporary directories and remove them after the share sheet is dismissed.
 
-The compacted whole-file JSON store is a deliberate small V1 design. Compaction bounds old high-frequency history but sacrifices raw samples, counts, within-window spread, and later corrections. If storage is migrated to SQLite or SwiftData, preserve the existing `HealthStore` query/append/upsert boundary and provide a tested data migration. Do not bolt a second persistence path alongside it.
+The version-1 whole-file reading/source archives are migration inputs only. Do not reintroduce a parallel reading persistence path beside SQLite. Compaction bounds old high-frequency history but still sacrifices individual samples, the full within-window distribution, and later corrections; preserve its explicit aggregation metadata and unknown legacy evidence.
 
 There is no Core Data, SwiftData, CloudKit, App Group container, shared Keychain group, or remote database.
 
@@ -383,21 +388,24 @@ The repository currently pins development team `7RLDYXQTNX`. Do not silently rep
 
 ## Tests
 
-Tests use Apple's Swift Testing package (`import Testing`, `@Suite`, `@Test`, `#expect`, and `#require`), not `XCTestCase`. The hosted test bundle currently contains 212 test declarations in 27 suites:
+The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@Suite`, `@Test`, `#expect`, and `#require`). It currently contains 268 test declarations in 38 suites. The UI bundle uses XCTest/XCUIAutomation, and the separate performance bundle uses Swift Testing:
 
 - `Tests/AnalysisTests.swift`: 53 tests covering HRV, comparison/windowing/statistics/evidence, chart thinning, estimators, Oura mapping, debug fixtures, and stable identifiers.
-- `Tests/ParsingTests.swift`: 17 tests covering binary reads and GATT measurement parsing, including units, optional fields, and invalid frames.
+- `Tests/ParsingTests.swift`: 22 tests covering binary reads and GATT measurement parsing, including units, optional fields, PLX status fields, and invalid frames.
 - `Tests/OuraOAuthTests.swift`: 13 tests covering exact authorization URL/scopes, callback/state/token metadata, scope-related 401 behavior, expiry, and compatibility behavior.
 - `Tests/OuraDataTests.swift`: 14 tests covering decoding, snapshot/upsert behavior, injected-`URLProtocol` request/error behavior, and the Oura heart-rate chart series (window anchoring, unparseable timestamps, and plot thinning).
-- `Tests/PairwiseExportTests.swift`: 8 tests covering stable schemas, canonical A/B semantics, RFC escaping, evidence language, metadata isolation, UTC, and fallback output.
-- `Tests/HealthStoreTests.swift`: 35 tests covering validation, indexing, batch ingestion, deletion, persistence safety, retention, and bounded compaction.
-- `Tests/ReadingArchiveTests.swift`: 19 tests covering envelopes, legacy payloads, corrupt preservation, unreadable-file handling, and Oura cache compatibility.
-- `Tests/HealthKitConversionTests.swift`: 18 tests covering type mappings, self-source rejection and cleanup, source identity, scaling, and deletion conversion.
-- `Tests/OuraSyncTests.swift`: 20 tests covering endpoint isolation, pagination, scope failures, cache preservation, truncation, and battery timestamps.
-- `Tests/HRVFilterTests.swift`: 19 tests covering artefact filtering, body-location metadata, accumulator thresholds, and rate limiting.
+- `Tests/PairwiseExportTests.swift`: 10 tests covering stable schemas, canonical A/B semantics, aggregation evidence, RFC escaping, evidence language, metadata isolation, UTC, and fallback output.
+- `Tests/HealthStoreTests.swift`: 38 tests covering validation, indexed queries, batch ingestion, deletion, persistence safety, retention, and bounded compaction.
+- `Tests/ReadingArchiveTests.swift`: 20 tests covering envelopes, legacy payloads, unique corrupt preservation, unreadable-file handling, and Oura cache compatibility.
+- `Tests/HealthKitConversionTests.swift`: 19 tests covering type mappings, minimal read scope, self-source rejection and cleanup, writer identity, scaling, and deletion conversion.
+- `Tests/OuraSyncTests.swift`: 23 tests covering endpoint isolation, pagination, scope failures, cache preservation, deletion reconciliation, cache/database failure rollback, truncation, and battery timestamps.
+- `Tests/HRVFilterTests.swift`: 20 tests covering artefact filtering, body-location versus technology metadata, accumulator thresholds, and rate limiting.
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
+- `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
+- `UITests/HeartSyncCheckerUITests.swift`: 7 deterministic recovery, settings, device-action, retention, evidence, Oura-partial, and pseudo-localization flows.
+- `PerformanceTests/HealthStorePerformanceTests.swift`: the manual physical-iPhone fourteen-day 1 Hz indexed persistence workload.
 
-There is no UI-test target, snapshot-test target, live Oura test, Bluetooth integration-test target, or HealthKit integration-test target.
+There is no snapshot-test target, live Oura test, Bluetooth hardware integration-test target, or HealthKit integration-test target.
 
 Do not use `swift test`; this is a hosted Xcode unit-test bundle in an XcodeGen iOS project, not a SwiftPM package.
 
@@ -462,7 +470,8 @@ Exercise extra caution around:
 - Stable reading/source IDs and enum raw values that persist across launches.
 - HealthKit source identity, authorization ambiguity, deletion sync to the store (exports and compacted aggregates may not reverse), fixed 30-day query window, and measured-only write-back.
 - Oura endpoint path casing, pagination limit, sequential orchestration, cross-file scope mappings, nuanced 401 handling, and preservation of cached collections after partial failures.
-- Whole-file JSON archives with no general migration layer and potentially large 1 Hz histories.
+- SQLite transaction/migration markers, indexed query semantics, file protection for the
+  database/WAL, and the separate representative-device 1 Hz performance gate.
 - Metric unit normalization and the RMSSD/SDNN and absolute/deviation distinctions.
 - Comparison evidence thresholds, epoch windowing, sample-variance statistics, canonical sign, and the rule that insufficient evidence is never green.
 - Estimate provenance/disclaimers and exclusion from device agreement.

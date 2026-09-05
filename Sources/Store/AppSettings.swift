@@ -50,6 +50,8 @@ final class AppSettings {
     }
 
     private(set) var loadState: LoadState
+    private(set) var loadIssue: String?
+    private(set) var recoveredCorruptArchive = false
     /// True only while `loadIfNeeded` is assigning the archived snapshot, so `didSet` can
     /// tell "the user changed something" from "we just read this off disk".
     private var isHydrating = false
@@ -99,8 +101,15 @@ final class AppSettings {
         let outcome = await ReadingArchive.shared.readOutcome(SettingsSnapshot.self, from: archiveName)
         guard outcome.isConclusive else {
             loadState = .failed
+            if case .unreadable(let reason) = outcome { loadIssue = reason }
             logger.error("Settings archive unreadable; refusing to persist until a load succeeds")
             return
+        }
+        if case .corrupt(let reason) = outcome {
+            recoveredCorruptArchive = true
+            loadIssue = reason
+        } else {
+            loadIssue = nil
         }
         if let loaded = outcome.value { hydrate(loaded) }
         loadState = .loaded
@@ -128,15 +137,23 @@ final class AppSettings {
         }
     }
 
-    func saveNow() async {
-        guard persistenceEnabled else { return }
+    @discardableResult
+    func saveNow() async -> Bool {
+        guard persistenceEnabled else { return false }
         guard loadState == .loaded else {
             if !hasLoggedSaveRefusal {
                 hasLoggedSaveRefusal = true
                 logger.error("Refusing to save: settings archive load has not completed")
             }
-            return
+            return false
         }
-        await ReadingArchive.shared.write(snapshot, to: archiveName)
+        return await ReadingArchive.shared.write(snapshot, to: archiveName)
     }
+
+    #if DEBUG
+    func injectLoadFailureForUITesting(_ reason: String) {
+        loadIssue = reason
+        loadState = .failed
+    }
+    #endif
 }

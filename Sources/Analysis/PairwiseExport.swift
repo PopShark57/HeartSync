@@ -52,6 +52,7 @@ enum PairwiseExporter {
         "source_a_sample_count",
         "source_a_within_window_sd",
         "source_a_provenance",
+        "source_a_aggregation",
         "source_b_id",
         "source_b_name",
         "source_b_transport",
@@ -60,6 +61,7 @@ enum PairwiseExporter {
         "source_b_sample_count",
         "source_b_within_window_sd",
         "source_b_provenance",
+        "source_b_aggregation",
         "paired_mean",
         "signed_difference_a_minus_b",
         "absolute_difference",
@@ -139,17 +141,19 @@ enum PairwiseExporter {
                 sourceA.transportRawValue,
                 sourceAModel,
                 decimal(observation.sourceA.value),
-                String(observation.sourceA.sampleCount),
-                decimal(observation.sourceA.standardDeviation),
+                observation.sourceA.sampleCount.map(String.init) ?? "",
+                observation.sourceA.standardDeviation.map(decimal) ?? "",
                 observation.sourceA.provenance.rawValue,
+                observation.sourceA.isCompacted ? "compacted_window_median" : "raw",
                 sourceB.id,
                 sourceBName,
                 sourceB.transportRawValue,
                 sourceBModel,
                 decimal(observation.sourceB.value),
-                String(observation.sourceB.sampleCount),
-                decimal(observation.sourceB.standardDeviation),
+                observation.sourceB.sampleCount.map(String.init) ?? "",
+                observation.sourceB.standardDeviation.map(decimal) ?? "",
                 observation.sourceB.provenance.rawValue,
+                observation.sourceB.isCompacted ? "compacted_window_median" : "raw",
                 decimal(observation.pairedMean),
                 decimal(observation.signedDifference),
                 decimal(observation.absoluteDifference),
@@ -237,9 +241,19 @@ enum PairwiseExporter {
             "Candidate windows: \(analysis.candidateWindowCount)",
             "Paired windows: \(analysis.pairedWindowCount)",
             "Overlap: \(decimal(analysis.overlapPercentage))%",
-            "Raw samples contributing: A \(analysis.rawSampleCountA), B \(analysis.rawSampleCountB)",
+            "Original samples contributing: A \(countDescription(analysis.rawSampleCountA)), B \(countDescription(analysis.rawSampleCountB))",
+            "Evidence grade: \(analysis.evidence.grade.title)",
+            "Evidence caveats: \(analysis.evidence.reasons.joined(separator: "; "))",
             "Analyzed span (UTC): \(spanDescription(analysis.analyzedSpan, formatting: formatting))",
         ]
+        if let relationshipA = sourceA.relationshipID,
+           relationshipA == sourceB.relationshipID {
+            let evidenceIndex = lines.firstIndex(of: "Evidence") ?? lines.count
+            lines.insert(
+                "Source relationship: both paths likely describe the same upstream device; agreement is not independent corroboration.",
+                at: evidenceIndex
+            )
+        }
 
         switch analysis.state {
         case .noOverlap:
@@ -267,6 +281,14 @@ enum PairwiseExporter {
                 "Pattern classification: \(classificationTitle(statistics.classification))",
                 "Interpretation: \(interpretation(for: statistics, kind: analysis.kind))",
             ]
+            if let interval = statistics.meanBiasConfidenceInterval {
+                lines.append("95% confidence interval for mean bias: \(decimal(interval.lowerBound)) to \(decimal(interval.upperBound)) \(analysis.kind.exportUnit)")
+            }
+            if let lower = statistics.lowerLimitConfidenceInterval,
+               let upper = statistics.upperLimitConfidenceInterval {
+                lines.append("95% confidence interval for lower agreement limit: \(decimal(lower.lowerBound)) to \(decimal(lower.upperBound)) \(analysis.kind.exportUnit)")
+                lines.append("95% confidence interval for upper agreement limit: \(decimal(upper.lowerBound)) to \(decimal(upper.upperBound)) \(analysis.kind.exportUnit)")
+            }
         }
 
         lines += [
@@ -276,10 +298,10 @@ enum PairwiseExporter {
             "Major gap: absolute difference at or above \(decimal(analysis.kind.agreement.alert)) \(analysis.kind.exportUnit)",
             "",
             "Methodology",
-            "Readings are placed into Unix-epoch-aligned windows. Each source is represented by the median of its non-estimated, plausible samples in a window. Only windows containing both ordered sources are paired. The signed difference is A minus B. Ready analyses use the sample standard deviation (n - 1); 95% limits of agreement are mean bias plus or minus 1.96 times that standard deviation.",
+            "Readings are placed into Unix-epoch-aligned windows. Each source is represented by the median of its non-estimated, plausible samples in a window. A compacted_window_median row is a fixed historical aggregate, not one raw sample; blank count or spread means the older archive did not retain that fact. Only windows containing both ordered sources are paired. The signed difference is A minus B. Ready analyses use the sample standard deviation (n - 1); 95% limits of agreement are mean bias plus or minus 1.96 times that standard deviation.",
             "",
             "Limitations",
-            "This is a descriptive device comparison, not a test of statistical significance. Neither source is treated as a medical reference or identified as correct. Sampling schedules, sensor placement, motion, vendor processing, and a small number of paired windows can all affect the result. HeartSync is not a medical device; do not use this export to diagnose or treat a condition.",
+            "This is a descriptive device comparison, not a test of statistical significance. Neither source is treated as a medical reference or identified as correct. Compacted windows are final: discarded raw samples cannot accept later corrections or upstream deletions. Sampling schedules, sensor placement, motion, vendor processing, and a small number of paired windows can all affect the result. HeartSync is not a medical device; do not use this export to diagnose or treat a condition.",
         ]
 
         return lines.joined(separator: "\n") + "\n"
@@ -323,7 +345,8 @@ enum PairwiseExporter {
                 name: sourceID,
                 transportRawValue: "",
                 transportTitle: "Unknown",
-                model: ""
+                model: "",
+                relationshipID: nil
             )
         }
         return SourceDescriptor(
@@ -331,7 +354,8 @@ enum PairwiseExporter {
             name: source.displayName,
             transportRawValue: source.transport.rawValue,
             transportTitle: source.transport.exportTitle,
-            model: source.model ?? ""
+            model: source.model ?? "",
+            relationshipID: source.upstreamDeviceRelationshipID
         )
     }
 
@@ -347,6 +371,10 @@ enum PairwiseExporter {
         guard value.isFinite else { return "" }
         if value == 0 { return "0" } // Normalise negative zero.
         return String(format: "%.15g", locale: Locale(identifier: "en_US_POSIX"), value)
+    }
+
+    private static func countDescription(_ value: Int?) -> String {
+        value.map(String.init) ?? "unknown (compacted history)"
     }
 
     private static func durationDescription(_ duration: TimeInterval) -> String {
@@ -412,6 +440,7 @@ private struct SourceDescriptor {
     /// rest of the summary; `PairwiseExportTests` pins the fallback as "Transport: Unknown".
     let transportTitle: String
     let model: String
+    let relationshipID: String?
 
     var summaryName: String { PairwiseExporter.singleLine(name) }
     var summaryModel: String {

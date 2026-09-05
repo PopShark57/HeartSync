@@ -3,7 +3,10 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var showingCalibration = false
-    @State private var showingDeleteConfirmation = false
+    @State private var retentionSelection = 30
+    @State private var retentionProposal: RetentionProposal?
+    @State private var resetProposal: ResetProposal?
+    @State private var persistenceResult: String?
     @State private var mirrorWriteAlert: MirrorWriteAlert?
 
     var body: some View {
@@ -11,6 +14,16 @@ struct SettingsView: View {
 
         NavigationStack {
             Form {
+                if model.settings.loadState == .failed {
+                    Section {
+                        Label("Settings are temporarily read-only", systemImage: "lock.trianglebadge.exclamationmark")
+                            .foregroundStyle(.orange)
+                        Text(model.settings.loadIssue ?? "The settings archive is unavailable. Existing bytes were preserved.")
+                            .font(.caption)
+                        Button("Retry settings") { Task { await model.retryStartup() } }
+                    }
+                    .accessibilityIdentifier("settings.unavailable")
+                }
                 Section {
                     NavigationLink {
                         ProfileView()
@@ -24,6 +37,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Age is used only for the age-predicted maximum heart rate that the VO\u{2082} max estimate depends on.")
                 }
+                .disabled(settingsUnavailable)
 
                 Section {
                     Toggle("Estimate VO\u{2082} max", isOn: $settings.snapshot.vo2MaxEstimateEnabled)
@@ -32,8 +46,10 @@ struct SettingsView: View {
                 } footer: {
                     Text("For devices that report resting heart rate but not VO\u{2082} max, HeartSync estimates it as 15.3 \u{00D7} (max HR \u{00F7} resting HR), the Uth\u{2013}S\u{00F8}rensen formula. Its error is roughly 10\u{2013}15%, far wider than the difference between two real measurements, so estimates are marked as such and left out of disagreement analysis.")
                 }
+                .disabled(settingsUnavailable)
 
                 bloodPressureSection
+                    .disabled(settingsUnavailable)
 
                 Section {
                     Picker("Flag disagreements at", selection: $settings.snapshot.discrepancyThreshold) {
@@ -46,6 +62,7 @@ struct SettingsView: View {
                 } footer: {
                     Text(toleranceSummary)
                 }
+                .disabled(settingsUnavailable)
 
                 Section {
                     Toggle("Auto-sync Oura", isOn: $settings.snapshot.autoSyncOura)
@@ -55,49 +72,66 @@ struct SettingsView: View {
                 } footer: {
                     Text("Writing to Health shares readings from your Bluetooth sensors with your other apps. Only directly measured values are written \u{2014} nothing HeartSync estimated ever enters your health record.")
                 }
+                .disabled(settingsUnavailable)
 
                 Section {
-                    Picker("Keep readings for", selection: $settings.snapshot.retentionDays) {
+                    Picker("Keep readings for", selection: Binding(
+                        get: { retentionSelection },
+                        set: { proposeRetention($0) }
+                    )) {
                         Text("7 days").tag(7)
                         Text("30 days").tag(30)
                         Text("90 days").tag(90)
                         Text("1 year").tag(365)
                     }
                     LabeledContent("Stored readings") {
-                        Text("\(model.store.readings.count)").foregroundStyle(.secondary)
+                        Text("\(model.store.readingCount)").foregroundStyle(.secondary)
                     }
                     .accessibilityElement(children: .combine)
-                    Button("Delete all readings", role: .destructive) {
-                        showingDeleteConfirmation = true
+                    Button("Clear local cache; data may resync", role: .destructive) {
+                        resetProposal = .clearForResync
                     }
-                    .accessibilityHint("Asks for confirmation first. Configured devices and anything already written to Apple Health are kept.")
+                    .accessibilityIdentifier("data.clearForResync")
+                    Button("Forget imported history", role: .destructive) {
+                        resetProposal = .forgetImportedHistory
+                    }
+                    .accessibilityIdentifier("data.forgetHistory")
                 } header: {
                     Text("Data")
                 } footer: {
                     Text(retentionFooter)
                 }
+                .disabled(settingsUnavailable)
 
                 Section {
                     NavigationLink("How each metric is obtained") { MetricSourcesView() }
                     NavigationLink("Limitations and disclaimers") { DisclaimerView() }
                 }
+                .disabled(settingsUnavailable)
             }
             .navigationTitle("Settings")
             .sheet(isPresented: $showingCalibration) { BPCalibrationView() }
-            .confirmationDialog(
-                "Delete all readings?",
-                isPresented: $showingDeleteConfirmation,
-                titleVisibility: .visible
-            ) {
-                Button("Delete", role: .destructive) { model.store.deleteAllReadings() }
+            .sheet(item: $retentionProposal) { proposal in
+                RetentionConfirmationView(proposal: proposal) {
+                    applyRetention(proposal)
+                }
+            }
+            .confirmationDialog(resetProposal?.title ?? "Clear data?", isPresented: Binding(
+                get: { resetProposal != nil },
+                set: { if !$0 { resetProposal = nil } }
+            ), titleVisibility: .visible) {
+                if let proposal = resetProposal {
+                    Button(proposal.actionTitle, role: .destructive) { performReset(proposal) }
+                }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Your configured devices are kept. Readings already written to Apple Health are not affected.")
+                Text(resetProposal?.message ?? "")
             }
-            .onChange(of: settings.snapshot.retentionDays) { _, days in
-                model.store.retention = TimeInterval(days) * 86_400
-                model.store.prune()
-            }
+            .alert("Storage result", isPresented: Binding(
+                get: { persistenceResult != nil },
+                set: { if !$0 { persistenceResult = nil } }
+            )) { Button("OK", role: .cancel) {} } message: { Text(persistenceResult ?? "") }
+            .onAppear { retentionSelection = settings.snapshot.retentionDays }
             .onChange(of: settings.snapshot.mirrorBluetoothToHealthKit) { _, enabled in
                 guard enabled else { return }
                 Task {
@@ -129,6 +163,48 @@ struct SettingsView: View {
             } message: {
                 Text(mirrorWriteAlert?.message ?? "")
             }
+        }
+    }
+
+    private var settingsUnavailable: Bool {
+        model.settings.loadState == .failed
+    }
+
+    private func proposeRetention(_ days: Int) {
+        guard days != model.settings.snapshot.retentionDays else { return }
+        if days < model.settings.snapshot.retentionDays {
+            retentionProposal = RetentionProposal(
+                days: days,
+                impact: model.store.retentionImpact(days: days)
+            )
+        } else {
+            applyRetention(RetentionProposal(days: days, impact: model.store.retentionImpact(days: days)))
+        }
+    }
+
+    private func applyRetention(_ proposal: RetentionProposal) {
+        model.settings.snapshot.retentionDays = proposal.days
+        retentionSelection = proposal.days
+        model.applyRetentionSettings()
+        model.store.prune()
+        retentionProposal = nil
+        Task {
+            let storeSaved = await model.store.saveNow()
+            let settingsSaved = await model.settings.saveNow()
+            let saved = storeSaved && settingsSaved
+            persistenceResult = saved
+                ? "The retention change was saved."
+                : "The retention change is in memory but could not be confirmed on disk. Retry before relying on it."
+        }
+    }
+
+    private func performReset(_ proposal: ResetProposal) {
+        resetProposal = nil
+        Task {
+            let saved = await model.resetLocalData(proposal.mode)
+            persistenceResult = saved
+                ? proposal.successMessage
+                : "The clear operation could not be fully confirmed on disk. No Apple Health data was deleted."
         }
     }
 
@@ -177,9 +253,9 @@ struct SettingsView: View {
     /// `compactionAge` down to one median per device per `ComparisonEngine` window — the
     /// same windowed median the Compare tab and every export already consume — so a year of
     /// retention is a year of windowed medians, not a year of raw one-per-second samples.
-    /// The comparison median and verdict survive, but raw counts, within-window spread, and
-    /// the ability to incorporate a late correction do not; a user picking "1 year" deserves
-    /// to read that here rather than discover it from a thinning chart.
+    /// The comparison median and verdict survive. New aggregates preserve original count and
+    /// standard deviation; legacy aggregates report those facts as unknown. Individual rows,
+    /// the full distribution, and later correction do not survive.
     /// The age is read from the store rather than hard-coded so the two cannot drift apart.
     private var retentionFooter: String {
         let days = max(1, Int((model.store.compactionAge / 86_400).rounded()))
@@ -189,8 +265,9 @@ struct SettingsView: View {
 
         Readings older than \(days) days are permanently compacted: each device's samples \
         within a comparison window are replaced by that window's median. This preserves the \
-        comparison value and verdict, but discards individual samples, raw sample counts, \
-        within-window variation, and later corrections to that window. A longer retention \
+        comparison value and verdict. New medians retain their original sample count and \
+        standard deviation; older migrated medians show those facts as unknown. Individual \
+        samples, the full distribution, and later corrections are lost. A longer retention \
         therefore keeps a longer history of fixed windowed medians, not every raw sample.
         """
     }
@@ -205,6 +282,95 @@ struct SettingsView: View {
         let examples: [MetricKind] = [.heartRate, .spo2, .hrvRMSSD]
         let parts = examples.map { "\($0.shortTitle) \($0.format($0.agreement.warn))\($0.unit == "%" ? "%" : " \($0.unit)")" }
         return "Tolerances are per metric \u{2014} \(parts.joined(separator: ", ")). They reflect each metric's real-world measurement error, so a gap only gets flagged when it exceeds what both devices' own accuracy would explain."
+    }
+}
+
+private struct RetentionProposal: Identifiable {
+    var id: Int { days }
+    var days: Int
+    var impact: HealthStore.RetentionImpact
+}
+
+private enum ResetProposal: Identifiable {
+    case clearForResync
+    case forgetImportedHistory
+
+    var id: String { actionTitle }
+    var mode: AppModel.DataResetMode {
+        switch self {
+        case .clearForResync: .clearForResync
+        case .forgetImportedHistory: .forgetImportedHistory
+        }
+    }
+    var title: String {
+        switch self {
+        case .clearForResync: "Clear the resyncable cache?"
+        case .forgetImportedHistory: "Forget imported history?"
+        }
+    }
+    var actionTitle: String {
+        switch self {
+        case .clearForResync: "Clear cache"
+        case .forgetImportedHistory: "Forget history"
+        }
+    }
+    var message: String {
+        switch self {
+        case .clearForResync:
+            "Clears local readings and the Oura dashboard, resets HealthKit anchors, and keeps connections. Apple Health and Oura can repopulate their data on the next sync."
+        case .forgetImportedHistory:
+            "Clears local readings, disconnects Oura, and keeps HealthKit anchors so older Health history does not immediately return. Future Bluetooth and Health samples can still appear. Apple Health itself is not deleted."
+        }
+    }
+    var successMessage: String {
+        switch self {
+        case .clearForResync: "The local cache was cleared and saved. Connected sources may resync."
+        case .forgetImportedHistory: "Imported history was forgotten and saved. Apple Health itself was not changed."
+        }
+    }
+}
+
+private struct RetentionConfirmationView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let proposal: RetentionProposal
+    let apply: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    LabeledContent("New cutoff") {
+                        Text(proposal.impact.cutoff, format: .dateTime.year().month().day())
+                    }
+                    LabeledContent("Readings deleted") { Text("\(proposal.impact.readingsDeleted)") }
+                    LabeledContent("Older rows eligible for compaction") {
+                        Text("\(proposal.impact.readingsEligibleForCompaction)")
+                    }
+                } header: {
+                    Text("Shorter retention")
+                } footer: {
+                    Text("Deletion and compaction are irreversible. Compacted medians retain known original counts and spread, but individual rows and later corrections are lost.")
+                }
+                Section {
+                    ShareLink(item: model.store.exportCSV()) {
+                        Label("Export readings before changing", systemImage: "square.and.arrow.up")
+                    }
+                    .accessibilityIdentifier("retention.export")
+                }
+            }
+            .navigationTitle("Confirm retention")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Apply", role: .destructive) { apply() }
+                        .accessibilityIdentifier("retention.apply")
+                }
+            }
+        }
+        .accessibilityIdentifier("retention.confirmation")
     }
 }
 
@@ -260,9 +426,6 @@ private struct ProfileView: View {
                 Toggle("Set date of birth", isOn: $hasBirthDate)
                 if hasBirthDate {
                     DatePicker("Date of birth", selection: $birthDate, in: ...Date.now, displayedComponents: .date)
-                }
-                Picker("Biological sex", selection: $settings.snapshot.profile.sex) {
-                    ForEach(UserProfile.BiologicalSex.allCases) { Text($0.title).tag($0) }
                 }
             } footer: {
                 if let maxHR = settings.profile.estimatedMaxHeartRate {

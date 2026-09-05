@@ -274,15 +274,14 @@ struct HRVArtefactFilterTests {
     }
 }
 
-/// Body Sensor Location decides how the pairwise screen explains a disagreement: an optical
-/// ring and an electrical chest strap reading different HRV is expected physics, not a
-/// faulty device. It is also persisted inside `sources.json`, which makes its raw values a
-/// storage contract rather than an implementation detail.
+/// Body Sensor Location is placement evidence only. Sensor technology is an independent,
+/// optional fact and must never be inferred from these values. The location is persisted in
+/// source metadata, which makes its raw values a storage contract rather than an
+/// implementation detail.
 @Suite("Body sensor location")
 struct BodySensorLocationTests {
 
-    /// Mirrors `ReadingArchive`'s coders, so a round-trip here is the round-trip the app
-    /// actually performs against `sources.json`.
+    /// Mirrors the legacy archive coders used during SQLite migration.
     private var archiveEncoder: JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -295,17 +294,26 @@ struct BodySensorLocationTests {
         return decoder
     }
 
-    @Test("Only a chest sensor is electrical; everything else is treated as optical")
-    func opticalVersusElectrical() {
-        #expect(BodySensorLocation.finger.isOptical)
-        #expect(BodySensorLocation.wrist.isOptical)
-        #expect(!BodySensorLocation.chest.isOptical)
+    @Test("Placement and sensor technology remain independent")
+    func placementDoesNotImplyTechnology() {
+        let chestSource = DataSource(
+            id: "chest",
+            displayName: "Chest sensor",
+            transport: .bluetooth,
+            bodyLocation: .chest
+        )
+        let knownOptical = DataSource(
+            id: "finger",
+            displayName: "Finger sensor",
+            transport: .bluetooth,
+            bodyLocation: .finger,
+            sensingTechnology: .opticalPPG
+        )
 
-        // A device that declines to say where it is worn must not be promoted to ECG:
-        // claiming a stronger sensing technology than the device reported would let the
-        // interpretation text dismiss a genuine disagreement as an expected one.
-        #expect(BodySensorLocation.other.isOptical)
-        #expect(BodySensorLocation.allCases.filter { !$0.isOptical } == [.chest])
+        #expect(chestSource.bodyLocation == .chest)
+        #expect(chestSource.sensingTechnology == nil)
+        #expect(knownOptical.bodyLocation == .finger)
+        #expect(knownOptical.sensingTechnology == .opticalPPG)
     }
 
     @Test("Location raw values are the SIG numbers stored sources depend on")
@@ -427,8 +435,8 @@ struct BodySensorLocationTests {
     @MainActor
     func reconnectPreservesBodyLocation() throws {
         // On every reconnect the Bluetooth manager upserts the peripheral again, from an
-        // advertisement that carries no body location. Losing the field there would drop
-        // the pairwise screen's explanation of the disagreement on each reconnect.
+        // advertisement that carries no body location. Losing the field there would discard
+        // reported placement evidence on each reconnect.
         let store = HealthStore(persistenceEnabled: false)
         store.upsert(DataSource(id: "device-a", displayName: "Chest Strap", transport: .bluetooth))
         store.setBodyLocation(.chest, forSource: "device-a")

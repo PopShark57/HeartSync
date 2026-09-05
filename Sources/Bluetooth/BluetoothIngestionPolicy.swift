@@ -125,3 +125,46 @@ enum BluetoothTimestampPolicy {
         return min(deviceTimestamp, receivedAt)
     }
 }
+
+/// Converts a parsed PLX frame into the only scalar values allowed to cross the manager's
+/// durable-ingestion seam. Keeping the quality gate pure makes it testable without a
+/// `CBPeripheral` and guarantees a rejected frame cannot accidentally feed either
+/// `HealthStore` or the later HealthKit write-back path.
+enum PulseOximeterIngestionPolicy {
+    struct Value: Equatable, Sendable {
+        var kind: MetricKind
+        var channel: BluetoothReadingAdmission.NotificationChannel
+        var value: Double
+        var metadata: ReadingMetadata
+    }
+
+    static func durableValues(
+        from measurement: PulseOximeterMeasurement,
+        sampleType: PulseOximeterMeasurement.SampleType
+    ) -> [Value] {
+        let quality = measurement.quality(for: sampleType)
+        guard quality.isDurable else { return [] }
+        let metadata = ReadingMetadata(
+            quality: quality.storedQuality,
+            pulseAmplitudeIndex: measurement.pulseAmplitudeIndex
+        )
+        var values: [Value] = []
+        if let spo2 = measurement.spo2Percent {
+            values.append(Value(
+                kind: .spo2,
+                channel: .pulseOximeterSpO2,
+                value: spo2,
+                metadata: metadata
+            ))
+        }
+        if let pulse = measurement.pulseRateBPM {
+            values.append(Value(
+                kind: .heartRate,
+                channel: .pulseOximeterPulse,
+                value: pulse,
+                metadata: metadata
+            ))
+        }
+        return values
+    }
+}

@@ -93,7 +93,9 @@ struct OuraSetupView: View {
         NavigationStack {
             Form {
                 Section {
-                    Text("HeartSync connects through Oura OAuth. You sign in on Oura's site and choose which read-only data to share; HeartSync never sees your password.")
+                    Text("This build treats Oura as an advanced optional integration for personal/developer use. Bluetooth and Apple Health remain fully usable without it. HeartSync does not ship a shared production Oura client identity, so setup requires your own Oura OAuth application.")
+                        .font(.subheadline.weight(.medium))
+                    Text("You sign in on Oura's site and choose which read-only data to share; HeartSync never sees your password.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }

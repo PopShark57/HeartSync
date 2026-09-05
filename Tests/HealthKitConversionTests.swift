@@ -286,16 +286,16 @@ struct HealthKitTypeMappingTests {
         #expect(Set(identifiers).count == identifiers.count)
     }
 
-    @Test("Read access is asked for every mapped metric plus the two profile characteristics")
+    @Test("Read access is asked for every mapped metric plus birth date only")
     func readTypesCoverEveryMapping() {
         let readIdentifiers = Set(HealthKitManager.readTypes.map(\.identifier))
         for mapping in HealthKitManager.mappings {
             #expect(readIdentifiers.contains(mapping.identifier.rawValue))
         }
-        // Age and biological sex feed the VO2 max estimator; nothing else is requested.
+        // The estimate uses age. Unused biological sex is deliberately not requested.
         #expect(readIdentifiers.contains(HKCharacteristicTypeIdentifier.dateOfBirth.rawValue))
-        #expect(readIdentifiers.contains(HKCharacteristicTypeIdentifier.biologicalSex.rawValue))
-        #expect(readIdentifiers.count == HealthKitManager.mappings.count + 2)
+        #expect(!readIdentifiers.contains(HKCharacteristicTypeIdentifier.biologicalSex.rawValue))
+        #expect(readIdentifiers.count == HealthKitManager.mappings.count + 1)
     }
 }
 

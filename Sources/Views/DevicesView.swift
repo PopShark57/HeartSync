@@ -61,8 +61,9 @@ struct DevicesView: View {
                     statusText: source.isEnabled ? state.title : "Paused",
                     statusColor: statusColor(for: state, enabled: source.isEnabled),
                     battery: source.batteryPercent,
-                    hrvProgress: hrvProgressText(for: source)
+                    hrvProgress: bluetoothDetailText(for: source)
                 )
+                .accessibilityIdentifier("source.\(source.id)")
                 .swipeActions(edge: .trailing) {
                     Button(role: .destructive) {
                         model.removeSource(source)
@@ -113,10 +114,12 @@ struct DevicesView: View {
     private func statusColor(for state: PeripheralConnectionState, enabled: Bool) -> Color {
         guard enabled else { return .secondary }
         switch state {
-        case .streaming:                       return .green
-        case .connecting, .discoveringServices:return .orange
-        case .failed:                          return .red
-        case .disconnected:                    return .secondary
+        case .streaming:                                              return .green
+        case .connecting, .linkConnected, .discoveringServices,
+             .enablingNotifications, .ready:                          return .orange
+        case .unsupported, .subscriptionFailed, .streamStalled,
+             .failed:                                                 return .red
+        case .disconnected:                                           return .secondary
         }
     }
 
@@ -128,6 +131,28 @@ struct DevicesView: View {
               !source.observedMetrics.contains(.hrvRMSSD)
         else { return nil }
         return "Collecting beats for HRV \u{2014} \(progress.beats) of \(HRVMetrics.minimumBeats)"
+    }
+
+    private func bluetoothDetailText(for source: DataSource) -> String? {
+        var details: [String] = []
+        if let hrvProgress = hrvProgressText(for: source) {
+            details.append(hrvProgress)
+        }
+        if let uuid = UUID(uuidString: source.id),
+           let pulseOx = model.bluetooth.pulseOximeterQuality[uuid] {
+            var quality = "Pulse ox: \(pulseOx.quality.title)"
+            if !pulseOx.quality.reasons.isEmpty {
+                quality += " (\(pulseOx.quality.reasons.map(\.title).joined(separator: ", ")))"
+            }
+            if let pai = pulseOx.pulseAmplitudeIndex {
+                quality += " \u{00B7} perfusion index \(pai.formatted(.number.precision(.fractionLength(0...2))))"
+            }
+            if !pulseOx.quality.isDurable {
+                quality += " \u{00B7} not saved"
+            }
+            details.append(quality)
+        }
+        return details.isEmpty ? nil : details.joined(separator: "\n")
     }
 
     // MARK: Apple Health
@@ -166,7 +191,7 @@ struct DevicesView: View {
                 ForEach(healthSources) { source in
                     SourceRow(
                         source: source,
-                        statusText: source.model ?? "Via Apple Health",
+                        statusText: healthSourceStatus(source),
                         statusColor: .secondary
                     )
                     .swipeActions(edge: .trailing) {
@@ -187,16 +212,58 @@ struct DevicesView: View {
                 }
                 .accessibilityHint("Re-reads recent samples from Apple Health")
                 if let last = model.healthKit.lastSyncedAt {
-                    Text("Last synced \(last, format: .relative(presentation: .named))")
+                    Text("Last complete sync \(last, format: .relative(presentation: .named))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .accessibilityElement(children: .combine)
+                }
+                if let summary = model.healthKit.syncSummary {
+                    Label(healthSyncStatus(summary), systemImage: healthSyncIcon(summary.outcome))
+                        .font(.caption)
+                        .foregroundStyle(summary.outcome == .complete ? .green : .orange)
+                        .accessibilityIdentifier("healthkit.sync.status")
+                    let details = summary.results.compactMap(\.userDetail)
+                    if !details.isEmpty {
+                        DisclosureGroup("Sync details") {
+                            ForEach(Array(details.enumerated()), id: \.offset) { _, detail in
+                                Text(detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                 }
             }
         } header: {
             Text("Apple Health")
         } footer: {
-            Text("Apple Watch data reaches HeartSync through Health \u{2014} the Watch is not a Bluetooth peripheral other apps can connect to. Every app or device writing to Health appears here as its own separate source, so nothing is silently merged.")
+            Text("Apple Watch data reaches HeartSync through Health. A Health source identifies its writing app when physical-device identity is unavailable; multiple reported device models are called out rather than silently treated as one instrument.")
+        }
+    }
+
+    private func healthSourceStatus(_ source: DataSource) -> String {
+        if source.hasMultipleReportedDevices {
+            return source.model ?? "HealthKit writer with multiple reported devices"
+        }
+        if let model = source.model { return "HealthKit writer · \(model)" }
+        return "HealthKit writer · physical device unknown"
+    }
+
+    private func healthSyncStatus(_ summary: HealthKitManager.HealthKitSyncSummary) -> String {
+        switch summary.outcome {
+        case .complete: "Complete"
+        case .partial: "Partial: some data types were unavailable"
+        case .failed: "Failed: no data type completed"
+        case .permissionUnknown: "Permission unknown: Apple does not reveal read access"
+        case .budgetDeferred: "More history remains; sync again to continue"
+        }
+    }
+
+    private func healthSyncIcon(_ outcome: HealthKitManager.HealthKitSyncSummary.Outcome) -> String {
+        switch outcome {
+        case .complete: "checkmark.circle.fill"
+        case .partial, .permissionUnknown, .budgetDeferred: "exclamationmark.triangle.fill"
+        case .failed: "xmark.circle.fill"
         }
     }
 
@@ -352,18 +419,11 @@ private struct SourceRow: View {
         MetricKind.allCases.filter { source.observedMetrics.contains($0) }
     }
 
-    /// Where the sensor sits and what technology that implies, when the device reported
-    /// Body Sensor Location (0x2A38).
-    ///
-    /// Shown because it is the field that explains *why* two devices disagree rather than
-    /// just that they do: an optical (PPG) ring and an electrical (ECG) chest strap are not
-    /// measuring the same signal, so an HRV gap between them is expected rather than a
-    /// fault. Nil for every source that does not report the characteristic — which is most
-    /// of them, including everything arriving via Apple Health or the Oura Cloud API — and
-    /// the row simply omits the line in that case rather than guessing a placement.
+    /// Placement and independently known technology are separate facts. Body Sensor
+    /// Location never proves PPG or ECG.
     private var placementText: String? {
-        guard let location = source.bodyLocation else { return nil }
-        return "\(location.title) \u{00B7} \(location.sensingTechnology)"
+        let facts = [source.bodyLocation?.title, source.sensingTechnology?.title].compactMap { $0 }
+        return facts.isEmpty ? nil : facts.joined(separator: " · ")
     }
 
     /// One VoiceOver element for the whole row.
@@ -379,7 +439,10 @@ private struct SourceRow: View {
         var parts: [String] = [source.displayName, statusText]
         if let battery { parts.append("Battery \(battery) percent") }
         if let location = source.bodyLocation {
-            parts.append("Worn on the \(location.title.lowercased()), \(location.sensingTechnology) sensor")
+            parts.append("Reported placement \(location.title.lowercased())")
+        }
+        if let technology = source.sensingTechnology {
+            parts.append("Reported technology \(technology.title)")
         }
         if !orderedMetrics.isEmpty {
             parts.append("Reports \(orderedMetrics.map(\.title).joined(separator: ", "))")

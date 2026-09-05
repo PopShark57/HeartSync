@@ -94,6 +94,7 @@ actor ReadingArchive {
     }
 
     private let logger = Logger(subsystem: "com.heartsync.HeartSyncChecker", category: "Archive")
+    private var failNextWriteForTesting = false
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.dateEncodingStrategy = .iso8601
@@ -110,12 +111,16 @@ actor ReadingArchive {
     /// `ReadingArchive.shared` is a lazy global, so the directory is created the first time
     /// anything touches the archive and never again — the previous computed property issued
     /// a `createDirectory` syscall for every single read and write.
-    private let directory: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("HeartSync", isDirectory: true)
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        return base
-    }()
+    private let directory: URL
+
+    init(directory: URL? = nil) {
+        let resolved = directory ?? FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0].appendingPathComponent("HeartSync", isDirectory: true)
+        try? FileManager.default.createDirectory(at: resolved, withIntermediateDirectories: true)
+        self.directory = resolved
+    }
 
     private func url(_ name: String) -> URL {
         directory.appendingPathComponent(name)
@@ -152,6 +157,10 @@ actor ReadingArchive {
     /// reintroduce a caller that maps a failed read to "empty".
     @discardableResult
     func write<T: Encodable & Sendable>(_ value: T, to name: String) -> Bool {
+        if failNextWriteForTesting {
+            failNextWriteForTesting = false
+            return false
+        }
         do {
             let envelope = ArchiveEnvelope(schemaVersion: Self.schemaVersion, payload: value)
             let data = try encoder.encode(envelope)
@@ -161,6 +170,10 @@ actor ReadingArchive {
             logger.error("Failed to write \(name, privacy: .public): \(error.localizedDescription, privacy: .public)")
             return false
         }
+    }
+
+    func injectFailureOnNextWriteForTesting() {
+        failNextWriteForTesting = true
     }
 
     /// Reads `name`, accepting the current envelope or a bare legacy payload, and reports
@@ -226,14 +239,24 @@ actor ReadingArchive {
         readOutcome(type, from: name).value
     }
 
-    func delete(_ name: String) {
-        try? FileManager.default.removeItem(at: url(name))
+    @discardableResult
+    func delete(_ name: String) -> Bool {
+        let target = url(name)
+        guard FileManager.default.fileExists(atPath: target.path) else { return true }
+        do {
+            try FileManager.default.removeItem(at: target)
+            return true
+        } catch {
+            logger.error("Failed to delete \(name, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return false
+        }
     }
 
-    /// Moves an unusable archive to a sibling `.corrupt` file. Never deletes user data.
+    /// Moves an unusable archive to a timestamped sibling. Repeated corruptions never
+    /// overwrite the previous diagnostic/recovery copy.
     private func preserveAside(_ fileURL: URL) {
-        let backup = fileURL.appendingPathExtension("corrupt")
-        try? FileManager.default.removeItem(at: backup)
+        let stamp = Int(Date.now.timeIntervalSince1970 * 1_000)
+        let backup = fileURL.appendingPathExtension("corrupt-\(stamp)-\(UUID().uuidString.prefix(8))")
         try? FileManager.default.moveItem(at: fileURL, to: backup)
     }
 

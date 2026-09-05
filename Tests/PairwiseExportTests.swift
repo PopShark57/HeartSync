@@ -111,6 +111,46 @@ struct PairwiseExportTests {
         #expect(export.csv.hasSuffix("\r\n"))
     }
 
+    @Test("Compacted medians never masquerade as one raw sample with zero spread")
+    func compactedUnknownEvidence() throws {
+        let observation = makeObservation(
+            sourceA: "alpha",
+            sourceB: "beta",
+            valueA: 70,
+            valueB: 72,
+            sampleCountA: nil,
+            sampleCountB: 4,
+            standardDeviationA: nil,
+            standardDeviationB: 1.5,
+            compactedA: true
+        )
+        let analysis = makeAnalysis(
+            sourceA: "alpha",
+            sourceB: "beta",
+            observations: [observation],
+            state: .collecting(pairedWindowCount: 1, requiredWindowCount: 5)
+        )
+        let export = PairwiseExporter.makeExport(
+            analysis: analysis,
+            sources: [
+                source(id: "alpha", name: "Alpha"),
+                source(id: "beta", name: "Beta"),
+            ],
+            appVersion: "1.0 (1)",
+            generatedAt: base
+        )
+        let rows = try parseRFC4180(export.csv)
+        let row = Dictionary(uniqueKeysWithValues: zip(rows[0], rows[1]))
+
+        #expect(row["source_a_sample_count"] == "")
+        #expect(row["source_a_within_window_sd"] == "")
+        #expect(row["source_a_aggregation"] == "compacted_window_median")
+        #expect(row["source_b_aggregation"] == "raw")
+        #expect(analysis.rawSampleCountA == nil)
+        #expect(export.summary.contains("Original samples contributing: A unknown (compacted history), B 4"))
+        #expect(export.summary.contains("later corrections or upstream deletions cannot update"))
+    }
+
     @Test("Formula-leading source metadata is exported as literal spreadsheet text")
     func spreadsheetFormulaMetadataIsNeutralized() throws {
         let observation = makeObservation(sourceA: "a", sourceB: "b", valueA: 70, valueB: 71)
@@ -349,12 +389,14 @@ struct PairwiseExportTests {
         sourceB: String,
         valueA: Double,
         valueB: Double,
-        sampleCountA: Int = 1,
-        sampleCountB: Int = 1,
-        standardDeviationA: Double = 0,
-        standardDeviationB: Double = 0,
+        sampleCountA: Int? = 1,
+        sampleCountB: Int? = 1,
+        standardDeviationA: Double? = 0,
+        standardDeviationB: Double? = 0,
         provenanceA: Provenance = .measured,
         provenanceB: Provenance = .measured,
+        compactedA: Bool = false,
+        compactedB: Bool = false,
         severity: DiscrepancySeverity = .agreeing
     ) -> PairwiseObservation {
         PairwiseObservation(
@@ -365,14 +407,16 @@ struct PairwiseExportTests {
                 value: valueA,
                 sampleCount: sampleCountA,
                 standardDeviation: standardDeviationA,
-                provenance: provenanceA
+                provenance: provenanceA,
+                isCompacted: compactedA
             ),
             sourceB: SourceValue(
                 sourceID: sourceB,
                 value: valueB,
                 sampleCount: sampleCountB,
                 standardDeviation: standardDeviationB,
-                provenance: provenanceB
+                provenance: provenanceB,
+                isCompacted: compactedB
             ),
             severity: severity
         )
@@ -388,8 +432,10 @@ struct PairwiseExportTests {
     ) -> PairwiseAnalysis {
         let count = observations.count
         let candidates = candidateWindowCount ?? count
-        let sampleCountA = observations.reduce(0) { $0 + $1.sourceA.sampleCount }
-        let sampleCountB = observations.reduce(0) { $0 + $1.sourceB.sampleCount }
+        let knownCountsA = observations.compactMap(\.sourceA.sampleCount)
+        let knownCountsB = observations.compactMap(\.sourceB.sampleCount)
+        let sampleCountA = knownCountsA.count == observations.count ? knownCountsA.reduce(0, +) : nil
+        let sampleCountB = knownCountsB.count == observations.count ? knownCountsB.reduce(0, +) : nil
         let span = observations.first.flatMap { first in
             observations.last.map { DateInterval(start: first.start, end: $0.end) }
         }

@@ -350,7 +350,6 @@ struct OuraClient: Sendable {
         var age: Int?
         var weight: Double?
         var height: Double?
-        var biological_sex: String?
         var email: String?
     }
 

@@ -39,6 +39,7 @@ struct PairwiseAnalysisView: View {
         // render alongside the analysis rather than from inside a computed property that
         // several subviews would each re-evaluate.
         let sensingNote = sensingDifferenceNote
+        let relationshipNote = sourceRelationshipNote
         let beatQuality = hrvBeatQuality()
 
         List {
@@ -106,9 +107,9 @@ struct PairwiseAnalysisView: View {
                         .foregroundStyle(statePresentation(currentAnalysis).tint)
                 }
 
-                // Deliberately a separate, secondary row rather than part of the verdict
-                // text above: a sensing-technology difference explains where a gap can
-                // come from, and must never read as the conclusion itself.
+                // Deliberately a separate, secondary row rather than part of the verdict:
+                // explicit technology metadata or reported placement can provide context,
+                // but neither decides which device is right.
                 if let sensingNote {
                     Label {
                         Text(sensingNote)
@@ -119,6 +120,15 @@ struct PairwiseAnalysisView: View {
                         Image(systemName: "waveform.path.ecg")
                             .foregroundStyle(.secondary)
                     }
+                }
+            }
+            if let relationshipNote {
+                Section {
+                    Label(relationshipNote, systemImage: "arrow.triangle.branch")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } header: {
+                    Text("Source independence")
                 }
             }
 
@@ -201,13 +211,12 @@ struct PairwiseAnalysisView: View {
         .accessibilityLabel("Device A \(sourceAName)\(accessibleSensing(sourceA)), minus Device B \(sourceBName)\(accessibleSensing(sourceB))")
     }
 
-    /// Spoken form of a device's sensing technology, empty when the device never reported
-    /// Body Sensor Location. Kept separate from the visible rows so VoiceOver users get the
-    /// same interpretive context sighted users read in the identity rows.
+    /// Spoken form keeps reported placement separate from independently known technology.
     private func accessibleSensing(_ source: DataSource?) -> String {
-        guard let location = source?.bodyLocation else { return "" }
-        guard location != .other else { return ", sensor location reported as other" }
-        return ", \(location.sensingTechnology) at the \(location.title.lowercased())"
+        var facts: [String] = []
+        if let location = source?.bodyLocation { facts.append("worn at the \(location.title.lowercased())") }
+        if let technology = source?.sensingTechnology { facts.append("\(technology.title) technology") }
+        return facts.isEmpty ? "" : ", " + facts.joined(separator: ", ")
     }
 
     /// Visible description of where a sensor sits and what it senses.
@@ -216,9 +225,9 @@ struct PairwiseAnalysisView: View {
     /// optical, which is a sound default for a finger, wrist or ear sensor but is not
     /// evidence about a device that declined to say where it sits, and this screen must
     /// not turn that default into a stated technology.
-    private func sensingDescription(_ location: BodySensorLocation) -> String {
-        guard location != .other else { return location.title }
-        return "\(location.title) · \(location.sensingTechnology)"
+    private func sensingDescription(_ source: DataSource) -> String? {
+        let facts = [source.bodyLocation?.title, source.sensingTechnology?.title].compactMap { $0 }
+        return facts.isEmpty ? nil : facts.joined(separator: " · ")
     }
 
     private func sourceIdentity(
@@ -242,8 +251,8 @@ struct PairwiseAnalysisView: View {
                 }
                 // Only Bluetooth devices that report Body Sensor Location (0x2A38) have
                 // this; the row is simply absent for everything else rather than guessing.
-                if let location = source?.bodyLocation {
-                    Text(sensingDescription(location))
+                if let source, let description = sensingDescription(source) {
+                    Text(description)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -270,8 +279,14 @@ struct PairwiseAnalysisView: View {
             LabeledContent("Aligned windows") {
                 Text("\(analysis.pairedWindowCount) paired of \(analysis.candidateWindowCount) candidates")
             }
-            LabeledContent("Raw samples") {
-                Text("A \(analysis.rawSampleCountA)  ·  B \(analysis.rawSampleCountB)")
+            LabeledContent("Original samples") {
+                Text("A \(sampleCountText(analysis.rawSampleCountA))  ·  B \(sampleCountText(analysis.rawSampleCountB))")
+            }
+            LabeledContent("Evidence grade") { Text(analysis.evidence.grade.title) }
+            if !analysis.evidence.reasons.isEmpty {
+                Text(analysis.evidence.reasons.joined(separator: ". "))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
             LabeledContent("Window size") {
                 Text(windowDescription(analysis.windowSize))
@@ -291,6 +306,11 @@ struct PairwiseAnalysisView: View {
                 LabeledContent("Difference SD") { Text(kind.formatWithUnit(stats.differenceSD)) }
                 LabeledContent("95% limits") {
                     Text("\(signed(stats.limitsOfAgreement.lowerBound)) to \(signed(stats.limitsOfAgreement.upperBound)) \(kind.unit)")
+                }
+                if let interval = stats.meanBiasConfidenceInterval {
+                    LabeledContent("Bias confidence interval") {
+                        Text("\(signed(interval.lowerBound)) to \(signed(interval.upperBound)) \(kind.unit)")
+                    }
                 }
             }
 
@@ -558,10 +578,14 @@ struct PairwiseAnalysisView: View {
                 Text(kind.formatWithUnit(observation.pairedMean))
             }
             LabeledContent("Raw contribution") {
-                Text("A \(observation.sourceA.sampleCount)  ·  B \(observation.sourceB.sampleCount)")
+                Text("A \(sampleCountText(observation.sourceA.sampleCount))  ·  B \(sampleCountText(observation.sourceB.sampleCount))")
             }
             LabeledContent("Within-window SD") {
-                Text("A \(kind.format(observation.sourceA.standardDeviation))  ·  B \(kind.format(observation.sourceB.standardDeviation)) \(kind.unit)")
+                Text("A \(spreadText(observation.sourceA.standardDeviation))  ·  B \(spreadText(observation.sourceB.standardDeviation)) \(kind.unit)")
+            }
+            if observation.sourceA.isCompacted || observation.sourceB.isCompacted {
+                Text("Compacted window median; old corrections and upstream deletions cannot be reapplied.")
+                    .foregroundStyle(.secondary)
             }
             LabeledContent("Provenance") {
                 Text("A \(observation.sourceA.provenance.title)  ·  B \(observation.sourceB.provenance.title)")
@@ -681,26 +705,32 @@ struct PairwiseAnalysisView: View {
     /// electrical sensor is not "the correct one" here. It is deliberately rendered as a
     /// secondary row beneath the verdict, and the verdict text itself is untouched.
     private var sensingDifferenceNote: String? {
-        guard let locationA = sourceA?.bodyLocation, let locationB = sourceB?.bodyLocation else { return nil }
-        // `.other` says where the sensor is not, so its optical/electrical classification
-        // is a default rather than a report. Nothing is claimed from it.
-        guard locationA != .other, locationB != .other else { return nil }
-        guard locationA.isOptical != locationB.isOptical else { return nil }
+        guard let locationA = sourceA?.bodyLocation, let locationB = sourceB?.bodyLocation,
+              locationA != locationB
+        else { return nil }
 
         var sentences = [
-            "These devices do not sense the same physical signal. \(sourceAName): \(locationA.sensingTechnology) at the \(locationA.title.lowercased()). \(sourceBName): \(locationB.sensingTechnology) at the \(locationB.title.lowercased()).",
+            "These devices report different placements: \(sourceAName) at the \(locationA.title.lowercased()), and \(sourceBName) at the \(locationB.title.lowercased()). Placement can contribute to disagreement, but it does not identify PPG or ECG.",
         ]
 
         if isVariabilityMetric {
-            sentences.append("An optical sensor times a pulse wave arriving at the skin, while an electrical sensor times the heartbeat's R wave directly, so beat-to-beat timing — and therefore \(kind.title) — is expected to differ between the two.")
+            sentences.append("Different placements can observe beat timing under different motion and contact conditions, so they may affect \(kind.title).")
         } else {
-            sentences.append("Optical and electrical sensors derive a beat differently, so part of any difference above can come from the technologies rather than from either device malfunctioning.")
+            sentences.append("Part of the difference can come from placement or contact rather than either device malfunctioning.")
         }
 
         sentences.append("This explains where a difference can come from. It does not resolve one, does not make either value correct, and neither technology is treated as a reference standard.")
 
         return sentences.joined(separator: " ")
     }
+
+    private var sourceRelationshipNote: String? {
+        guard let sourceA, let sourceB, sourceA.likelyRepresentsSameDevice(as: sourceB) else { return nil }
+        return "These sources likely describe the same upstream device through different transports. Agreement is not independent corroboration."
+    }
+
+    private func sampleCountText(_ count: Int?) -> String { count.map(String.init) ?? "unknown" }
+    private func spreadText(_ spread: Double?) -> String { spread.map(kind.format) ?? "unknown" }
 
     /// Whether this screen compares a beat-to-beat variability metric. Exhaustive so a new
     /// `MetricKind` has to decide whether the HRV beat-quality caveat applies to it.

@@ -67,9 +67,9 @@ struct OuraDashboardView: View {
                             .foregroundStyle(.indigo)
                     }
 
-                    Text("Your Oura data, in one place")
+                    Text("Oura is an optional advanced integration")
                         .font(.title2.bold())
-                    Text("Connect with OAuth to explore sleep, readiness, activity, recovery, heart signals, movement patterns, workouts, sessions, and ring details.")
+                    Text("Bluetooth sensors and Apple Health work without Oura. This developer build can also read Oura Cloud data after you create your own Oura OAuth application and paste its public Client ID.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -78,7 +78,7 @@ struct OuraDashboardView: View {
                     Button {
                         showingSetup = true
                     } label: {
-                        Label("Connect Oura", systemImage: "link")
+                        Label("Set up Oura (advanced)", systemImage: "link")
                             .frame(maxWidth: 260)
                     }
                     .buttonStyle(.borderedProminent)
@@ -87,6 +87,12 @@ struct OuraDashboardView: View {
                 .padding(.vertical, 26)
 
                 VStack(alignment: .leading, spacing: 12) {
+                    OuraHonestInfoRow(
+                        icon: "hammer.fill",
+                        tint: .orange,
+                        title: "Personal/developer setup",
+                        message: "HeartSync does not ship a shared first-party Oura client identity. Each user who enables this optional integration creates an OAuth application."
+                    )
                     OuraHonestInfoRow(
                         icon: "lock.shield.fill",
                         tint: .green,
@@ -368,6 +374,7 @@ struct OuraDashboardView: View {
                     .strokeBorder(.orange.opacity(0.20))
             }
         }
+        .accessibilityIdentifier("oura.endpointIssues")
     }
 
     // MARK: - Incomplete collections

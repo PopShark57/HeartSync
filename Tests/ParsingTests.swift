@@ -110,7 +110,7 @@ struct ParsingTests {
         let measurement = try #require(PulseOximeterMeasurement.continuous(data: data))
         #expect(measurement.spo2Percent == 97)
         #expect(measurement.pulseRateBPM == 72)
-        #expect(!measurement.isDeviceReportedInvalid)
+        #expect(measurement.quality(for: .continuous) == .accepted)
     }
 
     @Test("Optional PLX fields are skipped in the order the spec defines")
@@ -130,12 +130,12 @@ struct ParsingTests {
         #expect(measurement.pulseAmplitudeIndex == 10)
     }
 
-    @Test("A device-flagged bad measurement is recognised as invalid")
+    @Test("A disconnected PLX sensor is recognised as invalid")
     func plxInvalidStatus() throws {
-        // flags 0x08 -> device and sensor status present; bit 10 is "sensor unconnected".
-        let data = Data([0x08, 0x61, 0x00, 0x48, 0x00, 0x00, 0x04, 0x00])
+        // flags 0x08 -> device and sensor status present; bit 15 is sensor disconnected.
+        let data = Data([0x08, 0x61, 0x00, 0x48, 0x00, 0x00, 0x80, 0x00])
         let measurement = try #require(PulseOximeterMeasurement.continuous(data: data))
-        #expect(measurement.isDeviceReportedInvalid)
+        #expect(measurement.quality(for: .continuous) == .invalid([.sensorDisconnected]))
     }
 
     @Test("Spot-check PLX parses a device timestamp")

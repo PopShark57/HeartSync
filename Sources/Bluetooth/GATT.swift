@@ -134,19 +134,4 @@ enum BodySensorLocation: UInt8, Sendable, Codable, Hashable, CaseIterable {
         }
     }
 
-    /// Finger and wrist sensors are optical (PPG); chest sensors are electrical (ECG).
-    /// This matters for interpreting a discrepancy: PPG and ECG disagreeing on HRV is
-    /// expected behaviour, not a fault.
-    var isOptical: Bool { self != .chest }
-
-    /// How the sensor acquires a beat, for the interpretation text on a comparison.
-    ///
-    /// Note that `.other` is reported by devices that decline to say, so it is grouped
-    /// with the optical majority rather than claimed as electrical: overstating a sensor
-    /// as ECG would let the UI dismiss a real disagreement as an expected one.
-    var sensingTechnology: String {
-        isOptical
-            ? String(localized: "sensingTechnology.optical", defaultValue: "Optical (PPG)", comment: "Sensing technology: a photoplethysmography sensor that times a pulse wave at the skin. Keep the PPG abbreviation, which is international.")
-            : String(localized: "sensingTechnology.electrical", defaultValue: "Electrical (ECG)", comment: "Sensing technology: an electrocardiography sensor that times the heartbeat's R wave directly. Keep the ECG abbreviation, which is international.")
-    }
 }

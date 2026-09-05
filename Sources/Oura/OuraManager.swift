@@ -70,8 +70,13 @@ final class OuraManager {
     private(set) var rateLimitedUntil: Date?
 
     private weak var store: HealthStore?
-    private var onReadings: (@MainActor ([Reading]) -> Void)?
+    private var onReadings: (@MainActor ([Reading], [DataSource], Set<UUID>) -> Bool)?
     private let oauthSession = OuraOAuthSession()
+    private let archive: ReadingArchive
+
+    init(archive: ReadingArchive = .shared) {
+        self.archive = archive
+    }
 
     /// Page walks that hit the client's ceiling during the sync currently running.
     private var truncationOutcomes: [OuraEndpoint: Bool] = [:]
@@ -130,11 +135,11 @@ final class OuraManager {
 
     func configure(
         store: HealthStore,
-        onReadings: @escaping @MainActor ([Reading]) -> Void
+        onReadings: @escaping @MainActor ([Reading], [DataSource], Set<UUID>) -> Bool
     ) async {
         self.store = store
         self.onReadings = onReadings
-        snapshot = await ReadingArchive.shared.read(
+        snapshot = await archive.read(
             OuraSnapshot.self,
             from: ReadingArchive.File.ouraDashboard
         ) ?? OuraSnapshot()
@@ -204,7 +209,7 @@ final class OuraManager {
         endpointIssues.removeAll()
         rateLimitedUntil = nil
         for endpoint in OuraEndpoint.allCases { endpointStates[endpoint] = .idle }
-        Task { await ReadingArchive.shared.delete(ReadingArchive.File.ouraDashboard) }
+        Task { [archive] in await archive.delete(ReadingArchive.File.ouraDashboard) }
 
         status = cleared
             ? .notConnected
@@ -212,6 +217,30 @@ final class OuraManager {
         lastSyncedAt = nil
         lastSyncSummary = nil
         return cleared
+    }
+
+    /// Removes dashboard/cache records and their normalized readings. Keeping authorization
+    /// makes this a resyncable cache clear; removing it is the explicit "forget imported
+    /// history" path.
+    func clearCachedData(keepingAuthorization: Bool) async -> Bool {
+        let ids = Set(Self.scalarReadings(from: snapshot).map(\.id))
+        if !ids.isEmpty { _ = store?.remove(readingIDs: ids) }
+        snapshot = OuraSnapshot()
+        endpointIssues.removeAll()
+        truncationOutcomes.removeAll()
+        rateLimitedUntil = nil
+        lastSyncedAt = nil
+        lastSyncSummary = nil
+        for endpoint in OuraEndpoint.allCases { endpointStates[endpoint] = .idle }
+
+        var credentialCleared = true
+        if !keepingAuthorization {
+            credentialCleared = disconnect()
+        } else {
+            status = hasAuthorization ? .connected(email: nil) : .notConnected
+        }
+        let cacheDeleted = await archive.delete(ReadingArchive.File.ouraDashboard)
+        return credentialCleared && cacheDeleted
     }
 
     // MARK: - Sync
@@ -276,6 +305,9 @@ final class OuraManager {
         let client = OuraClient(accessToken: credential.accessToken)
         var next = snapshot
         var recordCount = 0
+        let fullReconciliationWindow = wantsFullWindow
+            ? DateInterval(start: fullStart, end: end)
+            : nil
 
         /// The narrowest window that still covers everything this collection may not have.
         func start(_ endpoint: OuraEndpoint) -> Date {
@@ -299,7 +331,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.timestamp },
-                    date: { OuraClient.parseTimestamp($0.timestamp) }
+                    date: { OuraClient.parseTimestamp($0.timestamp) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.heartRate.rawValue] = end
                 recordCount += value.count
@@ -310,7 +343,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.dailyActivity.rawValue] = end
                 recordCount += value.count
@@ -321,7 +355,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.dailyReadiness.rawValue] = end
                 recordCount += value.count
@@ -332,7 +367,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.dailySleep.rawValue] = end
                 recordCount += value.count
@@ -343,7 +379,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseTimestamp($0.bedtime_end) ?? OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseTimestamp($0.bedtime_end) ?? OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.detailedSleep.rawValue] = end
                 recordCount += value.count
@@ -354,7 +391,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.sleepTime.rawValue] = end
                 recordCount += value.count
@@ -365,7 +403,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.dailySpO2.rawValue] = end
                 recordCount += value.count
@@ -376,7 +415,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.dailyStress.rawValue] = end
                 recordCount += value.count
@@ -387,7 +427,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.dailyResilience.rawValue] = end
                 recordCount += value.count
@@ -398,7 +439,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.cardiovascularAge.rawValue] = end
                 recordCount += value.count
@@ -409,7 +451,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseTimestamp($0.timestamp) ?? OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseTimestamp($0.timestamp) ?? OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.vo2Max.rawValue] = end
                 recordCount += value.count
@@ -420,7 +463,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseTimestamp($0.start_datetime) ?? OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseTimestamp($0.start_datetime) ?? OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.workouts.rawValue] = end
                 recordCount += value.count
@@ -431,7 +475,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseTimestamp($0.start_datetime) ?? OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseTimestamp($0.start_datetime) ?? OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.sessions.rawValue] = end
                 recordCount += value.count
@@ -442,7 +487,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseTimestamp($0.timestamp) ?? OuraClient.parseDay($0.day) }
+                    date: { OuraClient.parseTimestamp($0.timestamp) ?? OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.tags.rawValue] = end
                 recordCount += value.count
@@ -453,7 +499,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseTimestamp($0.start_time) ?? OuraClient.parseDay($0.start_day) }
+                    date: { OuraClient.parseTimestamp($0.start_time) ?? OuraClient.parseDay($0.start_day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.enhancedTags.rawValue] = end
                 recordCount += value.count
@@ -464,7 +511,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { $0.id },
-                    date: { OuraClient.parseTimestamp($0.start_time) ?? OuraClient.parseDay($0.start_day) }
+                    date: { OuraClient.parseTimestamp($0.start_time) ?? OuraClient.parseDay($0.start_day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.restMode.rawValue] = end
                 recordCount += value.count
@@ -475,7 +523,8 @@ final class OuraManager {
                     with: value.records,
                     keepAfter: cacheCutoff,
                     id: { String($0.timestamp_unix) },
-                    date: { Date(timeIntervalSince1970: TimeInterval($0.timestamp_unix) / 1_000) }
+                    date: { Date(timeIntervalSince1970: TimeInterval($0.timestamp_unix) / 1_000) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
                 )
                 next.collectionSyncMarks[OuraEndpoint.ringBattery.rawValue] = end
                 recordCount += value.count
@@ -511,12 +560,34 @@ final class OuraManager {
             + Self.readings(fromVO2Max: next.vo2Max)
 
         next.fetchedAt = .now
+        let previousSnapshot = snapshot
+        let previousReadings = Self.scalarReadings(from: previousSnapshot)
+        let cacheWritten = await archive.write(next, to: ReadingArchive.File.ouraDashboard)
+        guard cacheWritten else {
+            status = .error("Oura returned data, but HeartSync could not save the cache. The previous dashboard and comparison readings were kept.")
+            lastSyncSummary = "Sync not committed: local Oura cache write failed"
+            logger.error("Oura sync received data but the cache write failed")
+            return
+        }
+        let withdrawnIDs = Set(previousReadings.map(\.id)).subtracting(Set(readings.map(\.id)))
+        let source = sourceDescriptor(from: next, battery: next.latestBatteryLevel?.level)
+        guard onReadings?(readings, [source], withdrawnIDs) == true else {
+            let cacheRolledBack = await archive.write(
+                previousSnapshot,
+                to: ReadingArchive.File.ouraDashboard
+            )
+            truncationOutcomes.removeAll()
+            restoreEndpointStatesFromSnapshot()
+            status = .error(cacheRolledBack
+                ? "Oura returned data, but HeartSync could not commit it to the health database. The previous Oura cache was restored."
+                : "Oura returned data, but neither the health database nor the previous Oura cache could be confirmed. Retry before relying on this sync.")
+            lastSyncSummary = "Sync not committed: local health database write failed"
+            logger.error("Oura cache was written, but the database batch failed; cache rollback: \(cacheRolledBack, privacy: .public)")
+            return
+        }
+
         snapshot = next
         lastSyncedAt = next.fetchedAt
-        await ReadingArchive.shared.write(next, to: ReadingArchive.File.ouraDashboard)
-
-        upsertSource(battery: next.latestBatteryLevel?.level)
-        if !readings.isEmpty { onReadings?(readings) }
 
         status = .connected(email: next.personalInfo?.email)
         // An incremental cycle fetches only what changed, so "0 records" there means
@@ -675,18 +746,26 @@ final class OuraManager {
     /// Because nothing falls out of a merged cache on its own, records older than
     /// `keepAfter` are dropped here; a record whose date cannot be parsed is kept rather
     /// than silently discarded, since an unreadable timestamp is not evidence of age.
-    nonisolated private static func merged<T>(
+    nonisolated static func merged<T>(
         _ cached: [T],
         with fetched: [T],
         keepAfter: Date,
         id: (T) -> String,
-        date: (T) -> Date?
+        date: (T) -> Date?,
+        reconcileWindow: DateInterval? = nil
     ) -> [T] {
         var byID: [String: T] = Dictionary(minimumCapacity: cached.count + fetched.count)
         var order: [String] = []
         order.reserveCapacity(cached.count + fetched.count)
+        let fetchedIDs = Set(fetched.map(id))
         for record in cached {
             let key = id(record)
+            if let reconcileWindow,
+               let stamp = date(record),
+               reconcileWindow.contains(stamp),
+               !fetchedIDs.contains(key) {
+                continue
+            }
             if byID.updateValue(record, forKey: key) == nil { order.append(key) }
         }
         for record in fetched {
@@ -741,8 +820,8 @@ final class OuraManager {
         return true
     }
 
-    private func upsertSource(battery: Int? = nil) {
-        store?.upsert(DataSource(
+    private func sourceDescriptor(from snapshot: OuraSnapshot, battery: Int? = nil) -> DataSource {
+        DataSource(
             id: DataSource.ouraSourceID,
             displayName: "Oura Ring",
             transport: .oura,
@@ -752,11 +831,17 @@ final class OuraManager {
                     .joined(separator: " ")
             } ?? "Oura Cloud API v2 (OAuth)",
             lastSeenAt: snapshot.fetchedAt ?? .now,
-            batteryPercent: battery
-        ))
+            batteryPercent: battery,
+            upstreamDeviceRelationshipID: "oura.account.default"
+        )
+    }
+
+    private func upsertSource(battery: Int? = nil) {
+        store?.upsert(sourceDescriptor(from: snapshot, battery: battery))
     }
 
     private func restoreEndpointStatesFromSnapshot() {
+        for endpoint in OuraEndpoint.allCases { endpointStates[endpoint] = .idle }
         guard snapshot.fetchedAt != nil else { return }
         endpointStates[.personalInfo] = snapshot.personalInfo == nil ? .idle : cachedState(.personalInfo, 1)
         endpointStates[.heartRate] = cachedState(.heartRate, snapshot.heartRates.count)
@@ -778,6 +863,32 @@ final class OuraManager {
         endpointStates[.ringBattery] = cachedState(.ringBattery, snapshot.batteryLevels.count)
         endpointStates[.ringConfiguration] = cachedState(.ringConfiguration, snapshot.ringConfigurations.count)
     }
+
+    #if DEBUG
+    func injectPartialFailureForUITesting() {
+        let now = Date.now
+        snapshot = OuraSnapshot()
+        snapshot.fetchedAt = now
+        snapshot.heartRates = [
+            OuraClient.HeartRatePoint(
+                bpm: 62,
+                source: "rest",
+                timestamp: ISO8601DateFormatter().string(from: now.addingTimeInterval(-300))
+            ),
+        ]
+        status = .connected(email: "demo@example.com")
+        endpointStates[.heartRate] = .available(1)
+        endpointStates[.dailyStress] = .failed("Simulated endpoint failure")
+        endpointIssues = [
+            OuraEndpointIssue(
+                endpoint: .dailyStress,
+                message: "Stress was unavailable; cached Oura data was kept.",
+                isPermissionIssue: false
+            ),
+        ]
+        lastSyncSummary = "1 collection unavailable"
+    }
+    #endif
 
     /// A relaunch must not upgrade a cached prefix into a complete collection, so the
     /// persisted truncation flag decides which state the cache is restored as.
@@ -863,5 +974,12 @@ final class OuraManager {
                 provenance: .measured
             )
         }
+    }
+
+    nonisolated private static func scalarReadings(from snapshot: OuraSnapshot) -> [Reading] {
+        readings(fromHeartRate: snapshot.heartRates)
+            + readings(fromSleep: snapshot.sleeps)
+            + readings(fromSpO2: snapshot.oxygen)
+            + readings(fromVO2Max: snapshot.vo2Max)
     }
 }

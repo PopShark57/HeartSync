@@ -28,15 +28,23 @@ struct DiscoveredPeripheral: Identifiable, Hashable, Sendable {
 enum PeripheralConnectionState: Equatable, Sendable {
     case disconnected
     case connecting
+    case linkConnected
     case discoveringServices
-    /// Connected and subscribed. The associated set is the metrics being received.
+    case enablingNotifications(Set<MetricKind>)
+    /// Subscribed for these metrics, but no valid measurement has arrived yet.
+    case ready(Set<MetricKind>, warning: String?)
+    /// Connected and receiving. The associated set is the metrics actually observed.
     case streaming(Set<MetricKind>)
+    case unsupported(String)
+    case subscriptionFailed(String)
+    case streamStalled(Set<MetricKind>, String)
     case failed(String)
 
     var isActive: Bool {
         switch self {
-        case .connecting, .discoveringServices, .streaming: true
-        case .disconnected, .failed: false
+        case .connecting, .linkConnected, .discoveringServices, .enablingNotifications,
+             .ready, .streaming, .streamStalled: true
+        case .disconnected, .unsupported, .subscriptionFailed, .failed: false
         }
     }
 
@@ -52,8 +60,14 @@ enum PeripheralConnectionState: Equatable, Sendable {
             String(localized: "peripheral.state.disconnected", defaultValue: "Not connected", comment: "Bluetooth device status: no connection")
         case .connecting:
             String(localized: "peripheral.state.connecting", defaultValue: "Connecting\u{2026}", comment: "Bluetooth device status: connection in progress")
+        case .linkConnected:
+            String(localized: "peripheral.state.linkConnected", defaultValue: "Connected; checking services\u{2026}", comment: "Bluetooth device status: BLE link connected but health capability has not been verified")
         case .discoveringServices:
             String(localized: "peripheral.state.discoveringServices", defaultValue: "Reading services\u{2026}", comment: "Bluetooth device status: discovering GATT services after connecting")
+        case .enablingNotifications(let kinds):
+            "Enabling \(kinds.count) metric\(kinds.count == 1 ? "" : "s")\u{2026}"
+        case .ready(let kinds, let warning):
+            warning ?? "Ready for \(kinds.count) metric\(kinds.count == 1 ? "" : "s"); waiting for data\u{2026}"
         case .streaming(let kinds):
             if kinds.isEmpty {
                 String(localized: "peripheral.state.connected", defaultValue: "Connected", comment: "Bluetooth device status: connected but not yet receiving any metric")
@@ -62,9 +76,38 @@ enum PeripheralConnectionState: Equatable, Sendable {
             } else {
                 String(localized: "peripheral.state.streaming.many", defaultValue: "Streaming \(kinds.count) metrics", comment: "Bluetooth device status: receiving several metrics. The number is always 2 or more.")
             }
+        case .unsupported(let reason), .subscriptionFailed(let reason):
+            reason
+        case .streamStalled(_, let reason):
+            reason
         case .failed(let reason):
             reason
         }
+    }
+
+    /// Pure stream transitions keep value, timeout, and recovery behavior executable in
+    /// tests without manufacturing CoreBluetooth framework objects.
+    func receiving(_ metric: MetricKind) -> Self {
+        var observed: Set<MetricKind>
+        if case .streaming(let existing) = self {
+            observed = existing
+        } else {
+            observed = []
+        }
+        observed.insert(metric)
+        return .streaming(observed)
+    }
+
+    func stalled(_ reason: String) -> Self {
+        let relevant: Set<MetricKind>
+        switch self {
+        case .enablingNotifications(let metrics), .ready(let metrics, _),
+             .streaming(let metrics), .streamStalled(let metrics, _):
+            relevant = metrics
+        default:
+            relevant = []
+        }
+        return .streamStalled(relevant, reason)
     }
 }
 
@@ -94,6 +137,9 @@ final class BluetoothManager: NSObject {
     /// from. Replaced on every emission and cleared on disconnect/forget, because this
     /// describes one live window and a stale entry would caveat the wrong data.
     private(set) var hrvQuality: [UUID: HRVQuality] = [:]
+    /// Latest PLX quality and perfusion facts, including frames deliberately withheld from
+    /// durable history. Devices can explain a low-perfusion or still-calibrating result.
+    private(set) var pulseOximeterQuality: [UUID: (quality: PulseOximeterMeasurement.Quality, pulseAmplitudeIndex: Double?)] = [:]
 
     /// When true the scan reports every peripheral, not just ones advertising a health
     /// service. Many inexpensive rings omit their service UUIDs from the advertisement
@@ -134,6 +180,10 @@ final class BluetoothManager: NSObject {
     /// and a pulse-oximeter's SpO2 stream does not suppress its pulse stream.
     private var readingAdmission = BluetoothReadingAdmission()
     private var pendingModelInfo: [UUID: DeviceInformation] = [:]
+    private var discoveryStates: [UUID: BluetoothDiscoveryState] = [:]
+    private var serviceDiscoveryIDs: [ObjectIdentifier: String] = [:]
+    private var characteristicSubscriptionIDs: [ObjectIdentifier: String] = [:]
+    private var streamStallTasks: [UUID: Task<Void, Never>] = [:]
     private var scanTimeoutTask: Task<Void, Never>?
 
     /// Scan results as they arrive, before publication.
@@ -356,7 +406,11 @@ final class BluetoothManager: NSObject {
         readingAdmission.reset(sourceID: uuid.uuidString)
         hrvProgress[uuid] = nil
         hrvQuality[uuid] = nil
+        pulseOximeterQuality[uuid] = nil
         pendingModelInfo[uuid] = nil
+        discoveryStates[uuid] = nil
+        streamStallTasks[uuid]?.cancel()
+        streamStallTasks[uuid] = nil
         reconnectAttempts[uuid] = nil
         // `discoveredByID` is deliberately left alone: a forgotten device should still be
         // offered by an in-flight scan so the user can add it back.
@@ -416,11 +470,15 @@ final class BluetoothManager: NSObject {
     }
 
     private func discoverServices(on peripheral: CBPeripheral) {
-        connectionStates[peripheral.identifier] = .discoveringServices
+        connectionStates[peripheral.identifier] = .linkConnected
+        discoveryStates[peripheral.identifier] = nil
+        streamStallTasks[peripheral.identifier]?.cancel()
+        streamStallTasks[peripheral.identifier] = nil
         peripheral.delegate = self
         // Pass an explicit list rather than nil: discovering every service on a chatty
         // device costs seconds and yields nothing this app can read.
         peripheral.discoverServices(GATT.discoverServices)
+        connectionStates[peripheral.identifier] = .discoveringServices
     }
 
     // MARK: Ingest
@@ -433,6 +491,7 @@ final class BluetoothManager: NSObject {
         start: Date,
         end: Date? = nil,
         provenance: Provenance = .measured,
+        metadata: ReadingMetadata? = nil,
         receivedAt: Date
     ) -> Bool {
         // Admission happens before constructing a Reading. The callback path therefore has no
@@ -447,19 +506,79 @@ final class BluetoothManager: NSObject {
             value: value,
             start: start,
             end: end,
-            provenance: provenance
+            provenance: provenance,
+            metadata: metadata
         ))
         return true
     }
 
     private func note(metric: MetricKind, for peripheralID: UUID) {
-        if case .streaming(var kinds) = connectionStates[peripheralID] ?? .disconnected {
-            guard !kinds.contains(metric) else { return }
-            kinds.insert(metric)
-            connectionStates[peripheralID] = .streaming(kinds)
-        } else {
-            connectionStates[peripheralID] = .streaming([metric])
+        streamStallTasks[peripheralID]?.cancel()
+        streamStallTasks[peripheralID] = nil
+        let state = (connectionStates[peripheralID] ?? .disconnected).receiving(metric)
+        connectionStates[peripheralID] = state
+        if case .streaming(let observed) = state {
+            scheduleStreamStallCheck(for: peripheralID, expectedMetrics: observed)
         }
+    }
+
+    private func applyDiscoveryResolution(for peripheralID: UUID) {
+        guard let discovery = discoveryStates[peripheralID] else { return }
+        switch discovery.resolution {
+        case .discovering:
+            connectionStates[peripheralID] = .discoveringServices
+        case .enabling(let metrics):
+            connectionStates[peripheralID] = .enablingNotifications(metrics)
+        case .unsupported(let details):
+            connectionStates[peripheralID] = .unsupported(
+                details.first ?? "Connected, but no supported measurement characteristic was found. Check that the sensor uses a standard Heart Rate, Pulse Oximeter, or Health Thermometer service."
+            )
+        case .subscriptionFailed(let details):
+            connectionStates[peripheralID] = .subscriptionFailed(
+                details.first ?? "Connected, but measurement notifications could not be enabled. Move the sensor closer and use Reconnect."
+            )
+        case .ready(let metrics, let warnings):
+            let warning = warnings.isEmpty ? nil : "Ready with a partial service result; waiting for data."
+            connectionStates[peripheralID] = .ready(metrics, warning: warning)
+            scheduleStreamStallCheck(for: peripheralID, expectedMetrics: metrics)
+        }
+    }
+
+    private func scheduleStreamStallCheck(for peripheralID: UUID, expectedMetrics: Set<MetricKind>) {
+        streamStallTasks[peripheralID]?.cancel()
+        streamStallTasks[peripheralID] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(30))
+            guard !Task.isCancelled, let self else { return }
+            let current = self.connectionStates[peripheralID] ?? .disconnected
+            guard case .ready = current else {
+                guard case .streaming = current else { return }
+                self.connectionStates[peripheralID] = current.stalled(
+                    "The measurement stream stopped for 30 seconds. Check sensor contact, then use Reconnect."
+                )
+                return
+            }
+            self.connectionStates[peripheralID] = .streamStalled(
+                expectedMetrics,
+                "Connected and subscribed, but no valid measurement arrived. Check sensor contact, then use Reconnect."
+            )
+        }
+    }
+
+    private func subscriptionCandidate(for characteristic: CBCharacteristic) -> BluetoothDiscoveryState.Candidate? {
+        let metrics: Set<MetricKind>
+        switch characteristic.uuid {
+        case GATT.heartRateMeasurement:
+            metrics = [.heartRate, .hrvRMSSD, .hrvSDNN]
+        case GATT.plxContinuousMeasurement, GATT.plxSpotCheckMeasurement:
+            metrics = [.spo2, .heartRate]
+        case GATT.temperatureMeasurement, GATT.intermediateTemperature:
+            metrics = [.bodyTemperature]
+        default:
+            return nil
+        }
+        let id = "\(characteristic.uuid.uuidString)#\(ObjectIdentifier(characteristic).hashValue)"
+        characteristicSubscriptionIDs[ObjectIdentifier(characteristic)] = id
+        return BluetoothDiscoveryState.Candidate(id: id, metrics: metrics)
     }
 
     fileprivate func handleHeartRate(_ data: Data, from peripheral: CBPeripheral) {
@@ -496,14 +615,17 @@ final class BluetoothManager: NSObject {
         accumulator.add(intervals: measurement.rrIntervalsMS, at: now)
         hrvProgress[id] = (accumulator.bufferedBeats, accumulator.bufferedDuration)
 
-        if let metrics = accumulator.emitIfReady(at: now) {
-            let windowStart = now.addingTimeInterval(-accumulator.window)
+        if let emission = accumulator.emissionIfReady(at: now) {
+            let metrics = emission.metrics
             if emit(sourceID: sourceID, kind: .hrvRMSSD, value: metrics.rmssd,
-                    start: windowStart, end: now, provenance: .derived, receivedAt: now) {
+                    start: emission.observationStart, end: emission.observationEnd,
+                    provenance: .derived, metadata: emission.readingMetadata, receivedAt: now) {
                 note(metric: .hrvRMSSD, for: id)
             }
-            if emit(sourceID: sourceID, kind: .hrvSDNN, value: metrics.sdnn,
-                    start: windowStart, end: now, provenance: .derived, receivedAt: now) {
+            if emission.includesSDNN,
+               emit(sourceID: sourceID, kind: .hrvSDNN, value: metrics.sdnn,
+                    start: emission.observationStart, end: emission.observationEnd,
+                    provenance: .derived, metadata: emission.readingMetadata, receivedAt: now) {
                 note(metric: .hrvSDNN, for: id)
             }
             // Published alongside, not stored: it qualifies the window that was just
@@ -518,9 +640,14 @@ final class BluetoothManager: NSObject {
             ? PulseOximeterMeasurement.spotCheck(data: data)
             : PulseOximeterMeasurement.continuous(data: data)
         guard let measurement = parsed else { return }
-        // The device's own status bits are more reliable than any heuristic here.
-        guard !measurement.isDeviceReportedInvalid else {
-            logger.debug("Pulse oximeter reported an invalid measurement; skipping")
+        let quality = measurement.quality(for: isSpotCheck ? .spotCheck : .continuous)
+        pulseOximeterQuality[peripheral.identifier] = (quality, measurement.pulseAmplitudeIndex)
+        let values = PulseOximeterIngestionPolicy.durableValues(
+            from: measurement,
+            sampleType: isSpotCheck ? .spotCheck : .continuous
+        )
+        guard !values.isEmpty else {
+            logger.debug("Pulse oximeter reported a non-durable measurement; skipping")
             return
         }
 
@@ -535,27 +662,16 @@ final class BluetoothManager: NSObject {
             logger.debug("Rejected pulse-oximeter timestamp outside the accepted receipt window")
             return
         }
-
-        if let spo2 = measurement.spo2Percent {
+        for durableValue in values {
             let admitted = readingAdmission.acceptNotification(
                 sourceID: sourceID,
-                channel: .pulseOximeterSpO2,
+                channel: durableValue.channel,
                 receivedAt: receivedAt
             )
-            if admitted, emit(sourceID: sourceID, kind: .spo2, value: spo2,
-                              start: timestamp, provenance: .measured, receivedAt: receivedAt) {
-                note(metric: .spo2, for: id)
-            }
-        }
-        if let pulse = measurement.pulseRateBPM {
-            let admitted = readingAdmission.acceptNotification(
-                sourceID: sourceID,
-                channel: .pulseOximeterPulse,
-                receivedAt: receivedAt
-            )
-            if admitted, emit(sourceID: sourceID, kind: .heartRate, value: pulse,
-                              start: timestamp, provenance: .measured, receivedAt: receivedAt) {
-                note(metric: .heartRate, for: id)
+            if admitted, emit(sourceID: sourceID, kind: durableValue.kind, value: durableValue.value,
+                              start: timestamp, provenance: .measured, metadata: durableValue.metadata,
+                              receivedAt: receivedAt) {
+                note(metric: durableValue.kind, for: id)
             }
         }
     }
@@ -596,9 +712,8 @@ final class BluetoothManager: NSObject {
     /// Records where on the body the sensor sits (Body Sensor Location, 0x2A38).
     ///
     /// A single uint8 from the SIG enumeration. Unknown values are dropped rather than
-    /// coerced to `.other`: the interpretation text keys off optical-versus-electrical
-    /// sensing, and inventing a location would let the UI explain away a real
-    /// disagreement with a technology difference that may not exist.
+    /// coerced to `.other`; reported placement is useful evidence, but it neither identifies
+    /// sensing technology nor proves why two devices disagree.
     fileprivate func handleBodySensorLocation(_ data: Data, from peripheral: CBPeripheral) {
         var reader = BinaryReader(data)
         guard let raw = reader.uint8(), let location = BodySensorLocation(rawValue: raw) else {
@@ -759,6 +874,10 @@ extension BluetoothManager: CBCentralManagerDelegate {
             self.readingAdmission.reset(sourceID: peripheral.identifier.uuidString)
             self.hrvProgress[peripheral.identifier] = nil
             self.hrvQuality[peripheral.identifier] = nil
+            self.pulseOximeterQuality[peripheral.identifier] = nil
+            self.discoveryStates[peripheral.identifier] = nil
+            self.streamStallTasks[peripheral.identifier]?.cancel()
+            self.streamStallTasks[peripheral.identifier] = nil
 
             // Rings drop out constantly. Reconnect automatically as long as the source is
             // still enabled, but with a backoff: an immediate retry against a device that
@@ -805,9 +924,16 @@ extension BluetoothManager: CBPeripheralDelegate {
             let services = peripheral.services ?? []
             guard !services.isEmpty else {
                 self.connectionStates[peripheral.identifier] =
-                    .failed("This device exposes no readable health services.")
+                    .unsupported("This device exposes no supported health service. Confirm it uses a standard Heart Rate, Pulse Oximeter, or Health Thermometer profile.")
                 return
             }
+            var serviceIDs: Set<String> = []
+            for (index, service) in services.enumerated() {
+                let serviceID = "\(service.uuid.uuidString)#\(index)"
+                self.serviceDiscoveryIDs[ObjectIdentifier(service)] = serviceID
+                serviceIDs.insert(serviceID)
+            }
+            self.discoveryStates[peripheral.identifier] = BluetoothDiscoveryState(serviceIDs: serviceIDs)
             for service in services {
                 peripheral.discoverCharacteristics(nil, for: service)
             }
@@ -820,21 +946,32 @@ extension BluetoothManager: CBPeripheralDelegate {
         error: (any Error)?
     ) {
         MainActor.assumeIsolated {
-            guard error == nil, let characteristics = service.characteristics else { return }
+            guard var discovery = self.discoveryStates[peripheral.identifier],
+                  let serviceID = self.serviceDiscoveryIDs[ObjectIdentifier(service)]
+            else { return }
+            let characteristics = service.characteristics ?? []
+            var candidates: [BluetoothDiscoveryState.Candidate] = []
             for characteristic in characteristics {
                 if GATT.notifyCharacteristics.contains(characteristic.uuid),
                    characteristic.properties.contains(.notify)
                        || characteristic.properties.contains(.indicate) {
-                    peripheral.setNotifyValue(true, for: characteristic)
+                    if let candidate = self.subscriptionCandidate(for: characteristic) {
+                        candidates.append(candidate)
+                        peripheral.setNotifyValue(true, for: characteristic)
+                    }
                 }
                 if GATT.readOnceCharacteristics.contains(characteristic.uuid),
                    characteristic.properties.contains(.read) {
                     peripheral.readValue(for: characteristic)
                 }
             }
-            if case .streaming = self.connectionStates[peripheral.identifier] {} else {
-                self.connectionStates[peripheral.identifier] = .streaming([])
-            }
+            discovery.finishService(
+                id: serviceID,
+                candidates: candidates,
+                errorDescription: error?.localizedDescription
+            )
+            self.discoveryStates[peripheral.identifier] = discovery
+            self.applyDiscoveryResolution(for: peripheral.identifier)
         }
     }
 
@@ -844,7 +981,15 @@ extension BluetoothManager: CBPeripheralDelegate {
         error: (any Error)?
     ) {
         MainActor.assumeIsolated {
-            guard error == nil, let data = characteristic.value else { return }
+            if let error {
+                self.connectionStates[peripheral.identifier] = (
+                    self.connectionStates[peripheral.identifier] ?? .disconnected
+                ).stalled(
+                    "A measurement update failed: \(error.localizedDescription). Use Reconnect if it continues."
+                )
+                return
+            }
+            guard let data = characteristic.value else { return }
             switch characteristic.uuid {
             case GATT.heartRateMeasurement:
                 self.handleHeartRate(data, from: peripheral)
@@ -871,12 +1016,20 @@ extension BluetoothManager: CBPeripheralDelegate {
         didUpdateNotificationStateFor characteristic: CBCharacteristic,
         error: (any Error)?
     ) {
-        guard let error else { return }
-        let uuid = characteristic.uuid
         MainActor.assumeIsolated {
-            self.logger.error(
-                "Failed to subscribe to \(uuid.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
+            guard let subscriptionID = self.characteristicSubscriptionIDs[ObjectIdentifier(characteristic)],
+                  var discovery = self.discoveryStates[peripheral.identifier]
+            else { return }
+            let subscriptionError = error?.localizedDescription
+                ?? (characteristic.isNotifying ? nil : "Peripheral declined notifications")
+            discovery.finishSubscription(id: subscriptionID, errorDescription: subscriptionError)
+            self.discoveryStates[peripheral.identifier] = discovery
+            if let error {
+                self.logger.error(
+                    "Failed to subscribe to \(characteristic.uuid.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
+            self.applyDiscoveryResolution(for: peripheral.identifier)
         }
     }
 }

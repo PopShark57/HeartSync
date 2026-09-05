@@ -43,16 +43,95 @@ final class HealthKitManager {
 
     // Internal setters let the session extension restore/update these across files.
     var availability: Availability = .notDetermined
-    private(set) var lastSyncedAt: Date?
+    private(set) var lastAttemptAt: Date?
+    private(set) var lastCompleteSyncAt: Date?
+    private(set) var syncSummary: HealthKitSyncSummary?
     var lastError: String?
     private(set) var isSyncing = false
+
+    var lastSyncedAt: Date? { lastCompleteSyncAt }
+
+    enum TypeSyncResult: Equatable, Sendable {
+        case complete(String)
+        case permissionUnknown(String, String)
+        case failed(String, String)
+        case budgetDeferred(String)
+
+        var isComplete: Bool {
+            if case .complete = self { return true }
+            return false
+        }
+
+        var canResumeObservation: Bool {
+            switch self {
+            case .complete, .budgetDeferred: true
+            case .permissionUnknown, .failed: false
+            }
+        }
+
+        var userDetail: String? {
+            switch self {
+            case .complete:
+                nil
+            case .permissionUnknown(let name, _):
+                "\(name): read permission is not disclosed by Apple"
+            case .failed(let name, let detail):
+                "\(name): \(detail)"
+            case .budgetDeferred(let name):
+                "\(name): more changes remain; sync again to continue"
+            }
+        }
+    }
+
+    struct HealthKitSyncSummary: Equatable, Sendable {
+        enum Outcome: Equatable, Sendable {
+            case complete
+            case partial
+            case failed
+            case permissionUnknown
+            case budgetDeferred
+        }
+
+        var outcome: Outcome
+        var results: [TypeSyncResult]
+        var attemptedAt: Date
+
+        static func aggregate(_ results: [TypeSyncResult], at date: Date) -> Self {
+            let completed = results.count { $0.isComplete }
+            let permission = results.count {
+                if case .permissionUnknown = $0 { return true }
+                return false
+            }
+            let failed = results.count {
+                if case .failed = $0 { return true }
+                return false
+            }
+            let deferred = results.count {
+                if case .budgetDeferred = $0 { return true }
+                return false
+            }
+
+            let outcome: Outcome
+            if !results.isEmpty, completed == results.count {
+                outcome = .complete
+            } else if completed > 0 || [permission, failed, deferred].count(where: { $0 > 0 }) > 1 {
+                outcome = .partial
+            } else if deferred > 0 {
+                outcome = .budgetDeferred
+            } else if permission > 0 {
+                outcome = .permissionUnknown
+            } else {
+                outcome = .failed
+            }
+            return Self(outcome: outcome, results: results, attemptedAt: date)
+        }
+    }
 
     // Internal so HealthKitManager+Session can query authorization status.
     let healthStore = HKHealthStore()
     private var activeQueries: [HKQuery] = []
     private weak var store: HealthStore?
-    private var onReadings: (@MainActor ([Reading]) -> Void)?
-    private var onDeletedSampleIDs: (@MainActor ([UUID]) -> Void)?
+    private var onReadings: (@MainActor ([Reading], [DataSource], Set<UUID>) -> Bool)?
 
     /// HealthKit query results are deliberately drained in finite pages. The total budget is a
     /// per-mapping guardrail: a dense type is resumed from its committed anchor on the next
@@ -218,6 +297,14 @@ final class HealthKitManager {
         var end: Date
     }
 
+    nonisolated static func sourceRelationshipID(
+        bundleIdentifier: String,
+        sourceName: String
+    ) -> String? {
+        let evidence = (bundleIdentifier + " " + sourceName).lowercased()
+        return evidence.contains("oura") ? "oura.account.default" : nil
+    }
+
     static let mappings: [TypeMapping] = [
         .init(kind: .heartRate, identifier: .heartRate,
               unit: HKUnit.count().unitDivided(by: .minute())),
@@ -254,23 +341,18 @@ final class HealthKitManager {
     static var readTypes: Set<HKObjectType> {
         var types = Set(mappings.compactMap { $0.quantityType as HKObjectType? })
         if let dob = HKObjectType.characteristicType(forIdentifier: .dateOfBirth) { types.insert(dob) }
-        if let sex = HKObjectType.characteristicType(forIdentifier: .biologicalSex) { types.insert(sex) }
         return types
     }
 
-    /// Wires the manager to the store and to the two ingestion seams.
-    ///
-    /// `onDeletedSampleIDs` receives the ids of samples the user deleted in Health. Because
-    /// HealthKit readings are stored under `id: sample.uuid`, and `HKDeletedObject.uuid` is
-    /// that same value, the ids can be handed to the store's removal API unchanged.
+    /// Wires the manager to the store and the app's transactional ingestion seam. The
+    /// callback receives sources, readings, and deleted sample ids from one anchor page and
+    /// reports whether that entire generation committed before the anchor may advance.
     func configure(
         store: HealthStore,
-        onReadings: @escaping @MainActor ([Reading]) -> Void,
-        onDeletedSampleIDs: @escaping @MainActor ([UUID]) -> Void
+        onReadings: @escaping @MainActor ([Reading], [DataSource], Set<UUID>) -> Bool
     ) {
         self.store = store
         self.onReadings = onReadings
-        self.onDeletedSampleIDs = onDeletedSampleIDs
         guard HKHealthStore.isHealthDataAvailable() else {
             availability = .unavailable
             return
@@ -304,22 +386,14 @@ final class HealthKitManager {
         }
     }
 
-    /// Reads age and biological sex, which the VO\u{2082} max estimator needs, so the user does
-    /// not have to type what Health already knows.
-    func readCharacteristics() -> (birthDate: Date?, sex: UserProfile.BiologicalSex?) {
-        var birthDate: Date?
-        var sex: UserProfile.BiologicalSex?
+    /// Reads the birth date used for the age-only VO\u{2082} max estimate so the user does not
+    /// have to type what Health already knows. HeartSync deliberately does not request or
+    /// retain biological sex because no current feature uses it.
+    func readDateOfBirth() -> Date? {
         if let components = try? healthStore.dateOfBirthComponents() {
-            birthDate = Calendar.current.date(from: components)
+            return Calendar.current.date(from: components)
         }
-        if let hkSex = try? healthStore.biologicalSex().biologicalSex {
-            switch hkSex {
-            case .female: sex = .female
-            case .male:   sex = .male
-            default:      sex = .unspecified
-            }
-        }
-        return (birthDate, sex)
+        return nil
     }
 
     // MARK: - Sync
@@ -338,16 +412,22 @@ final class HealthKitManager {
         isSyncing = true
         defer { isSyncing = false }
 
+        var results: [TypeSyncResult] = []
         for mapping in Self.mappings {
-            _ = await sync(mapping)
+            results.append(await sync(mapping))
         }
-        lastSyncedAt = .now
+        let attemptedAt = Date.now
+        lastAttemptAt = attemptedAt
+        let summary = HealthKitSyncSummary.aggregate(results, at: attemptedAt)
+        syncSummary = summary
+        if summary.outcome == .complete { lastCompleteSyncAt = attemptedAt }
 
         if restartObservers { await startObserving() }
     }
 
-    private func sync(_ mapping: TypeMapping) async -> Bool {
-        guard let type = mapping.quantityType else { return true }
+    private func sync(_ mapping: TypeMapping) async -> TypeSyncResult {
+        let name = mapping.kind.title
+        guard let type = mapping.quantityType else { return .complete(name) }
         let predicate = Self.recentPredicate()
         var anchor = loadAnchor(for: mapping.identifier)
         var processedObjects = 0
@@ -366,22 +446,34 @@ final class HealthKitManager {
                 // An "authorization not determined" error for one type is normal when the user
                 // granted only some permissions; it should not abort the whole sync.
                 logger.debug("Sync for \(mapping.identifier.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
-                return false
+                let detail = error.localizedDescription
+                if Self.isPermissionUnknown(error) {
+                    return .permissionUnknown(name, detail)
+                }
+                return .failed(name, detail)
             }
 
-            guard let nextAnchor = await commit(batch, for: mapping) else { return false }
+            guard let nextAnchor = await commit(batch, for: mapping) else {
+                return .failed(name, "Could not durably save the Health data page.")
+            }
             processedObjects += batch.objectCount
             anchor = nextAnchor
 
             // A zero-object response can still carry an anchor (for example after self-source
             // filtering). Commit it once, then stop rather than polling the same anchor.
             guard Self.shouldContinuePaging(objectCount: batch.objectCount, limit: limit) else {
-                return true
+                return .complete(name)
             }
         }
 
         logger.debug("HealthKit sync budget reached for \(mapping.identifier.rawValue, privacy: .public); will resume from the committed anchor")
-        return true
+        return .budgetDeferred(name)
+    }
+
+    nonisolated private static func isPermissionUnknown(_ error: any Error) -> Bool {
+        guard let healthError = error as? HKError else { return false }
+        return healthError.code == .errorAuthorizationDenied
+            || healthError.code == .errorHealthDataRestricted
     }
 
     /// Fetches one finite page. Only value types cross out of HealthKit's callback queue; the
@@ -432,14 +524,20 @@ final class HealthKitManager {
             return nil
         }
 
-        for source in batch.sources { store.upsert(source) }
-        if !batch.readings.isEmpty { onReadings?(batch.readings) }
-        // Deletions are applied after insertions so a sample added and then removed between two
-        // anchors cannot survive by being re-inserted after its own removal.
-        if !batch.deletedIDs.isEmpty { onDeletedSampleIDs?(batch.deletedIDs) }
+        // Sources, samples, and deletions belong to one HealthKit anchor generation. The
+        // app's ingest seam commits them together so a failed page can be replayed without
+        // leaving mixed source/reading state behind.
+        guard onReadings?(
+            batch.readings,
+            batch.sources,
+            Set(batch.deletedIDs)
+        ) == true else {
+            logger.error("HealthKit page transaction failed; refusing to advance sync")
+            return nil
+        }
 
-        // `saveNow()` is intentionally before the anchor write. The next query must never skip
-        // a page that only existed in the in-memory store when a process was interrupted.
+        // `saveNow()` checkpoints and applies retention before the anchor write. The next
+        // query must never skip a page that was not confirmed on durable storage.
         guard await store.saveNow() else {
             logger.error("HealthKit archive write failed; refusing to advance sync")
             return nil
@@ -589,7 +687,7 @@ final class HealthKitManager {
                                 }
                             }
                             guard !Task.isCancelled else { return }
-                            if await self.sync(mapping) {
+                            if (await self.sync(mapping)).canResumeObservation {
                                 guard !Task.isCancelled else { return }
                                 state.finishRecovery()
                                 self.installObserver(for: mapping)
@@ -599,7 +697,7 @@ final class HealthKitManager {
                             }
                         }
                     }
-                    self.lastSyncedAt = .now
+                    self.lastAttemptAt = .now
                 }
             }
             installObserver(for: mapping)
@@ -692,19 +790,36 @@ final class HealthKitManager {
 
         for sample in descriptors {
             guard sample.sourceBundleIdentifier != appBundleIdentifier else { continue }
-            // Preserve the shipped identity formula: one HeartSync source per HealthKit
-            // writing source bundle. Device model is metadata only; adding it to this id
-            // would split existing archived sources without a migration.
+            // Preserve the shipped id formula as an alias: it identifies a HealthKit writer,
+            // not necessarily one physical device. Device descriptors are retained below so
+            // a second/replacement device cannot silently overwrite the first.
             let sourceID = "hk.\(sample.sourceBundleIdentifier)"
 
-            if sources[sourceID] == nil {
+            if var source = sources[sourceID] {
+                var models = source.observedDeviceModels ?? []
+                if let model = sample.deviceModel, !model.isEmpty { models.insert(model) }
+                source.observedDeviceModels = models.isEmpty ? nil : models
+                source.model = models.count > 1
+                    ? "Multiple reported devices: \(models.sorted().joined(separator: ", "))"
+                    : models.first ?? source.model
+                source.lastSeenAt = max(source.lastSeenAt ?? sample.end, sample.end)
+                source.observedMetrics.insert(mapping.kind)
+                sources[sourceID] = source
+            } else {
+                let models: Set<String> = sample.deviceModel.map { $0.isEmpty ? [] : [$0] } ?? []
                 sources[sourceID] = DataSource(
                     id: sourceID,
                     displayName: sample.sourceName,
                     transport: .healthKit,
                     model: sample.deviceModel,
                     lastSeenAt: sample.end,
-                    observedMetrics: [mapping.kind]
+                    observedMetrics: [mapping.kind],
+                    observedDeviceModels: models.isEmpty ? nil : models,
+                    upstreamDeviceRelationshipID: sourceRelationshipID(
+                        bundleIdentifier: sample.sourceBundleIdentifier,
+                        sourceName: sample.sourceName
+                    ),
+                    identifiesHealthKitWriter: true
                 )
             }
 

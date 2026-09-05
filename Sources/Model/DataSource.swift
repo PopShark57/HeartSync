@@ -95,13 +95,22 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
     /// Last known battery level, 0...100, when the device exposes the Battery Service.
     var batteryPercent: Int?
     /// Where on the body the sensor sits, when it reports Body Sensor Location (0x2A38).
-    ///
-    /// This is the field that explains *why* two devices disagree rather than just that
-    /// they do: a finger or wrist sensor is optical (PPG) and a chest sensor is electrical
-    /// (ECG), and those two technologies disagreeing on HRV is expected behaviour rather
-    /// than a fault. Optional both because most transports never report it and because
-    /// `sources.json` archives written before this field existed must still decode.
+    /// The characteristic says nothing about sensing technology; chest must not be treated
+    /// as proof of ECG and wrist/finger must not be treated as proof of PPG.
     var bodyLocation: BodySensorLocation?
+    /// Sensing technology only when it came from explicit device metadata, a reviewed model
+    /// registry, or a user confirmation. Body Sensor Location never populates this field.
+    var sensingTechnology: SensorTechnology?
+    /// Device descriptors observed behind one HealthKit writer. HealthKit often identifies
+    /// the writing app more reliably than the physical device, so retaining the set prevents
+    /// one mutable `model` string from silently hiding a replacement or second device.
+    var observedDeviceModels: Set<String>?
+    /// Stable relationship key for sources that likely represent the same upstream device
+    /// through different transports. This is a warning signal, never an automatic merge.
+    var upstreamDeviceRelationshipID: String?
+    /// True when the stable id identifies a HealthKit writing app rather than a proven
+    /// physical instrument. Optional keeps older source archives backward-decodable.
+    var identifiesHealthKitWriter: Bool?
 
     init(
         id: String,
@@ -114,7 +123,11 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
         lastSeenAt: Date? = nil,
         observedMetrics: Set<MetricKind> = [],
         batteryPercent: Int? = nil,
-        bodyLocation: BodySensorLocation? = nil
+        bodyLocation: BodySensorLocation? = nil,
+        sensingTechnology: SensorTechnology? = nil,
+        observedDeviceModels: Set<String>? = nil,
+        upstreamDeviceRelationshipID: String? = nil,
+        identifiesHealthKitWriter: Bool? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -127,6 +140,10 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
         self.observedMetrics = observedMetrics
         self.batteryPercent = batteryPercent
         self.bodyLocation = bodyLocation
+        self.sensingTechnology = sensingTechnology
+        self.observedDeviceModels = observedDeviceModels
+        self.upstreamDeviceRelationshipID = upstreamDeviceRelationshipID
+        self.identifiesHealthKitWriter = identifiesHealthKitWriter
     }
 
     var color: Color { Self.palette[colorIndex % Self.palette.count] }
@@ -142,6 +159,33 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
     ]
 
     static let ouraSourceID = "oura.cloud"
+
+    var hasMultipleReportedDevices: Bool {
+        (observedDeviceModels?.count ?? 0) > 1
+    }
+
+    func likelyRepresentsSameDevice(as other: DataSource) -> Bool {
+        guard id != other.id,
+              let relationship = upstreamDeviceRelationshipID,
+              !relationship.isEmpty
+        else { return false }
+        return relationship == other.upstreamDeviceRelationshipID
+    }
+}
+
+/// How a sensor acquires a signal, only when explicitly known.
+enum SensorTechnology: String, Codable, Hashable, Sendable, CaseIterable {
+    case opticalPPG
+    case electricalECG
+    case other
+
+    var title: String {
+        switch self {
+        case .opticalPPG: "Optical (PPG)"
+        case .electricalECG: "Electrical (ECG)"
+        case .other: "Other"
+        }
+    }
 }
 
 /// How much a value should be trusted, which matters a great deal when the app is
@@ -189,6 +233,9 @@ struct Reading: Identifiable, Codable, Hashable, Sendable {
     var start: Date
     var end: Date
     var provenance: Provenance
+    /// Optional interpretation facts. Missing means an older archive or a transport that
+    /// did not report these facts; absence must never be converted into false precision.
+    var metadata: ReadingMetadata?
 
     init(
         id: UUID = UUID(),
@@ -197,7 +244,8 @@ struct Reading: Identifiable, Codable, Hashable, Sendable {
         value: Double,
         start: Date,
         end: Date? = nil,
-        provenance: Provenance = .measured
+        provenance: Provenance = .measured,
+        metadata: ReadingMetadata? = nil
     ) {
         self.id = id
         self.sourceID = sourceID
@@ -206,6 +254,7 @@ struct Reading: Identifiable, Codable, Hashable, Sendable {
         self.start = start
         self.end = end ?? start
         self.provenance = provenance
+        self.metadata = metadata
     }
 
     var midpoint: Date {
@@ -215,4 +264,62 @@ struct Reading: Identifiable, Codable, Hashable, Sendable {
     /// Rejects values outside the metric's plausible range so obviously broken sensor
     /// frames never reach the comparison engine.
     var isPlausible: Bool { kind.plausibleRange.contains(value) }
+}
+
+/// Measurement and aggregation facts that qualify a reading without changing its value.
+struct ReadingMetadata: Codable, Hashable, Sendable {
+    var quality: MeasurementQuality?
+    var pulseAmplitudeIndex: Double?
+    var observationDuration: TimeInterval?
+    var acceptedBeatCount: Int?
+    var artefactFraction: Double?
+    var pnn50: Double?
+    var impliedHeartRate: Double?
+    var aggregation: AggregationMetadata?
+
+    init(
+        quality: MeasurementQuality? = nil,
+        pulseAmplitudeIndex: Double? = nil,
+        observationDuration: TimeInterval? = nil,
+        acceptedBeatCount: Int? = nil,
+        artefactFraction: Double? = nil,
+        pnn50: Double? = nil,
+        impliedHeartRate: Double? = nil,
+        aggregation: AggregationMetadata? = nil
+    ) {
+        self.quality = quality
+        self.pulseAmplitudeIndex = pulseAmplitudeIndex
+        self.observationDuration = observationDuration
+        self.acceptedBeatCount = acceptedBeatCount
+        self.artefactFraction = artefactFraction
+        self.pnn50 = pnn50
+        self.impliedHeartRate = impliedHeartRate
+        self.aggregation = aggregation
+    }
+}
+
+enum MeasurementQuality: String, Codable, Hashable, Sendable {
+    case accepted
+    case provisional
+    case questionable
+}
+
+/// Provenance retained when raw rows are irreversibly reduced to a window median.
+struct AggregationMetadata: Codable, Hashable, Sendable {
+    /// Number of original raw rows, when known. Nil is honest for a compacted archive whose
+    /// older schema did not retain it.
+    var originalSampleCount: Int?
+    /// Population standard deviation of the original rows, when known.
+    var originalStandardDeviation: Double?
+    var correctionsAreFinal: Bool
+
+    init(
+        originalSampleCount: Int?,
+        originalStandardDeviation: Double?,
+        correctionsAreFinal: Bool = true
+    ) {
+        self.originalSampleCount = originalSampleCount
+        self.originalStandardDeviation = originalStandardDeviation
+        self.correctionsAreFinal = correctionsAreFinal
+    }
 }
