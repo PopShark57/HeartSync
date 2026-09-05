@@ -608,7 +608,7 @@ struct OuraSyncOrchestrationTests {
         }
     }
 
-    @Test("One failing collection never erases the rest of the cached dashboard")
+    @Test("A failed collection keeps its cache while successful empty collections reconcile")
     func oneFailedCollectionKeepsTheDashboard() async throws {
         let now = Date.now
         let yesterday = ouraUTCDayString(now.addingTimeInterval(-86_400))
@@ -643,9 +643,10 @@ struct OuraSyncOrchestrationTests {
             #expect(ouraIsFailed(manager.state(for: .dailyStress)))
             // The cached collection is untouched by its own failure...
             #expect(manager.snapshot.stress.map(\.id) == ["stress-1"])
-            // ...and so is every other collection, which is the rule the finding protects.
-            #expect(manager.snapshot.oxygen.map(\.id) == ["oxygen-1"])
-            #expect(manager.snapshot.batteryLevels.count == 1)
+            // Successful complete empty responses are server-authoritative withdrawals;
+            // they must not be confused with the failed collection above.
+            #expect(manager.snapshot.oxygen.isEmpty)
+            #expect(manager.snapshot.batteryLevels.isEmpty)
             #expect(manager.hasAuthorization)
             #expect(manager.snapshot.hasData)
         }
@@ -664,6 +665,8 @@ struct OuraSyncOrchestrationTests {
     @Test("Ring battery records older than the window are pruned like every other collection")
     func staleBatteryRecordsArePruned() async throws {
         let now = Date.now
+        let freshTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-3_600))
+        let freshUnix = Int64(now.addingTimeInterval(-3_600).timeIntervalSince1970 * 1_000)
         var seeded = OuraSnapshot()
         seeded.fetchedAt = now.addingTimeInterval(-3_600)
         seeded.batteryLevels = [
@@ -674,13 +677,24 @@ struct OuraSyncOrchestrationTests {
                 charging: false, in_charger: false, level: 41
             ),
             OuraClient.RingBatteryLevel(
-                timestamp: "2026-08-28T12:00:00Z",
-                timestamp_unix: Int64(now.addingTimeInterval(-3_600).timeIntervalSince1970 * 1_000),
+                timestamp: freshTimestamp,
+                timestamp_unix: freshUnix,
                 charging: false, in_charger: false, level: 73
             ),
         ]
 
-        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, _ in
+        let handler: @Sendable (URLRequest) -> OuraStubReply = { request in
+            if request.url?.path.hasSuffix("/ring_battery") == true {
+                return .json(
+                    """
+                    {"data":[{"timestamp":"\(freshTimestamp)","timestamp_unix":\(freshUnix),"charging":false,"in_charger":false,"level":73}],"next_token":null}
+                    """
+                )
+            }
+            return ouraEmptyCollections(request)
+        }
+
+        try await withOuraSyncHarness(seeded: seeded, responding: handler) { manager, _ in
             await manager.sync(days: 14)
 
             #expect(manager.snapshot.batteryLevels.map(\.level) == [73])

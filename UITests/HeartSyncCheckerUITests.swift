@@ -105,8 +105,9 @@ final class HeartSyncCheckerUITests: XCTestCase {
         comparison.launchArguments = ["--pairwise-demo"]
         comparison.launch()
         comparison.buttons["Compare"].tap()
-        XCTAssertTrue(element("compare.root", in: comparison).waitForExistence(timeout: 5))
-        XCTAssertTrue(comparison.staticTexts["Evidence overview"].exists)
+        let comparisonEvidence = element("compare.root", in: comparison)
+        XCTAssertTrue(comparisonEvidence.waitForExistence(timeout: 5))
+        XCTAssertTrue(comparisonEvidence.label.contains("Evidence overview"))
         comparison.terminate()
 
         let oura = launch("ouraPartial")
@@ -118,8 +119,13 @@ final class HeartSyncCheckerUITests: XCTestCase {
 
     func testPseudoLocalizationKeepsAllPrimaryTabsReachable() {
         let application = launch("empty", pseudoLocalized: true)
+        let nowButton = application.buttons.matching(NSPredicate(
+            format: "label CONTAINS[c] %@", "Now"
+        )).firstMatch
+        XCTAssertTrue(nowButton.exists)
+        XCTAssertTrue(nowButton.isHittable)
+
         let tabIdentifiers = [
-            "waveform.path.ecg.rectangle",
             "circle.circle.fill",
             "chart.xyaxis.line",
             "dot.radiowaves.left.and.right",

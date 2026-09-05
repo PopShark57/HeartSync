@@ -112,7 +112,12 @@ struct HRVArtefactFilterTests {
         // cap. The invariant is that neither bound can be exceeded, not that hostile input
         // must fill the larger one exactly.
         #expect(accumulator.bufferedBeats <= HRVAccumulator.maximumBufferedBeats)
-        #expect(accumulator.bufferedDuration <= accumulator.window)
+        // Duration includes the first retained interval, whose end timestamp may sit on
+        // the cutoff. The excess is therefore bounded by one physiologically valid beat.
+        #expect(
+            accumulator.bufferedDuration
+                <= accumulator.window + HRVCalculator.plausibleIntervalMS.upperBound / 1_000
+        )
         #expect(accumulator.bufferedBeats > 0)
     }
 

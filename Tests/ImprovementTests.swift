@@ -371,12 +371,15 @@ struct TransactionalDatabaseTests {
             transport: .bluetooth,
             observedMetrics: [.heartRate]
         )
+        let recentWholeSecond = Date(
+            timeIntervalSince1970: floor(Date.now.timeIntervalSince1970) - 60
+        )
         let reading = Reading(
             id: UUID(stableFrom: "legacy-reading"),
             sourceID: source.id,
             kind: .heartRate,
             value: 72,
-            start: Date(timeIntervalSince1970: 1_700_000_000),
+            start: recentWholeSecond,
             provenance: .measured
         )
         #expect(await archive.write([source], to: ReadingArchive.File.sources))
@@ -521,12 +524,15 @@ struct TransactionalDatabaseTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let archive = ReadingArchive(directory: directory)
         let source = DataSource(id: "pending-source", displayName: "Pending", transport: .bluetooth)
+        let recentWholeSecond = Date(
+            timeIntervalSince1970: floor(Date.now.timeIntervalSince1970) - 30
+        )
         let reading = Reading(
             id: UUID(stableFrom: "pending-reading"),
             sourceID: source.id,
             kind: .heartRate,
             value: 65,
-            start: Date(timeIntervalSince1970: 1_700_000_000)
+            start: recentWholeSecond
         )
         #expect(await archive.write([source], to: ReadingArchive.File.sources))
         #expect(await archive.write([reading], to: ReadingArchive.File.readings))
