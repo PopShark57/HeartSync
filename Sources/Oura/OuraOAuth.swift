@@ -41,11 +41,11 @@ struct OuraOAuthCredential: Codable, Equatable, Sendable {
 
     var scopeMetadata: ScopeMetadata {
         switch scopeFieldWasReturned {
-        case true:
+        case .some(true):
             .granted(grantedScopes)
-        case false:
+        case .some(false):
             .unknown
-        case nil:
+        case .none:
             grantedScopes.isEmpty ? .unknown : .granted(grantedScopes)
         }
     }

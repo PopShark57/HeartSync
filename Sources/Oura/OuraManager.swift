@@ -613,7 +613,7 @@ final class OuraManager {
         }
     }
 
-    private func load<T>(
+    private func load<T: Sendable>(
         _ endpoint: OuraEndpoint,
         credential: OuraOAuthCredential,
         operation: () async throws -> T
