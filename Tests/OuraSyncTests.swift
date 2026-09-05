@@ -684,7 +684,7 @@ struct OuraSyncOrchestrationTests {
         ]
 
         let handler: @Sendable (URLRequest) -> OuraStubReply = { request in
-            if request.url?.path.hasSuffix("/ring_battery") == true {
+            if request.url?.path.hasSuffix("/ring_battery_level") == true {
                 return .json(
                     """
                     {"data":[{"timestamp":"\(freshTimestamp)","timestamp_unix":\(freshUnix),"charging":false,"in_charger":false,"level":73}],"next_token":null}
