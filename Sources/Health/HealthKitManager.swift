@@ -258,6 +258,14 @@ final class HealthKitManager {
     /// repairs archives already polluted before that fix shipped.
     nonisolated static let appSourceID = "hk.\(appBundleIdentifier)"
 
+    /// Pure half of the self-source guard. Keeping this comparison named gives unsigned
+    /// simulator tests coverage without asking `HKSource.default()` to construct a source;
+    /// HealthKit raises an Objective-C exception when that API is called from an unsigned
+    /// hosted test process.
+    nonisolated static func isOwnSource(bundleIdentifier: String) -> Bool {
+        bundleIdentifier == appBundleIdentifier
+    }
+
     /// Removes the phantom source older mirroring builds may already have archived.
     @MainActor
     @discardableResult
@@ -789,7 +797,7 @@ final class HealthKitManager {
         var sources: [String: DataSource] = [:]
 
         for sample in descriptors {
-            guard sample.sourceBundleIdentifier != appBundleIdentifier else { continue }
+            guard !isOwnSource(bundleIdentifier: sample.sourceBundleIdentifier) else { continue }
             // Preserve the shipped id formula as an alias: it identifies a HealthKit writer,
             // not necessarily one physical device. Device descriptors are retained below so
             // a second/replacement device cannot silently overwrite the first.

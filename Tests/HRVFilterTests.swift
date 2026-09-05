@@ -108,7 +108,12 @@ struct HRVArtefactFilterTests {
 
         accumulator.add(intervals: burst, at: epoch)
 
-        #expect(accumulator.bufferedBeats == HRVAccumulator.maximumBufferedBeats)
+        // The five-minute time window is allowed to discard more than the absolute beat
+        // cap. The invariant is that neither bound can be exceeded, not that hostile input
+        // must fill the larger one exactly.
+        #expect(accumulator.bufferedBeats <= HRVAccumulator.maximumBufferedBeats)
+        #expect(accumulator.bufferedDuration <= accumulator.window)
+        #expect(accumulator.bufferedBeats > 0)
     }
 
     // MARK: Artefacts the filter must still catch

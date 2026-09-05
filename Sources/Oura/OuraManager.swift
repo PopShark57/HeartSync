@@ -73,9 +73,32 @@ final class OuraManager {
     private var onReadings: (@MainActor ([Reading], [DataSource], Set<UUID>) -> Bool)?
     private let oauthSession = OuraOAuthSession()
     private let archive: ReadingArchive
+    private let urlSession: URLSession
 
-    init(archive: ReadingArchive = .shared) {
+    /// Production uses Keychain. Tests use an in-memory credential so an unsigned simulator
+    /// host can exercise the complete sync state machine without weakening credential
+    /// storage or depending on a Keychain entitlement that CI deliberately does not sign.
+    private enum CredentialStorage {
+        case keychain
+        case memory(OuraOAuthCredential?)
+    }
+    private var credentialStorage: CredentialStorage
+
+    init(archive: ReadingArchive = .shared, urlSession: URLSession = .shared) {
         self.archive = archive
+        self.urlSession = urlSession
+        credentialStorage = .keychain
+    }
+
+    /// Narrow test seam for deterministic Oura orchestration tests.
+    init(
+        archive: ReadingArchive,
+        urlSession: URLSession,
+        credentialForTesting: OuraOAuthCredential
+    ) {
+        self.archive = archive
+        self.urlSession = urlSession
+        credentialStorage = .memory(credentialForTesting)
     }
 
     /// Page walks that hit the client's ceiling during the sync currently running.
@@ -128,9 +151,40 @@ final class OuraManager {
     /// manager on an unchanged credential.
     @discardableResult
     private func refreshCredentialCache() -> OuraOAuthCredential? {
-        let loaded = OuraOAuthCredentialStore.load()
+        let loaded = storedCredential()
         if loaded != credential { credential = loaded }
         return loaded
+    }
+
+    private func storedCredential() -> OuraOAuthCredential? {
+        switch credentialStorage {
+        case .keychain:
+            OuraOAuthCredentialStore.load()
+        case .memory(let credential):
+            credential
+        }
+    }
+
+    @discardableResult
+    private func saveStoredCredential(_ credential: OuraOAuthCredential) -> Bool {
+        switch credentialStorage {
+        case .keychain:
+            return OuraOAuthCredentialStore.save(credential)
+        case .memory:
+            credentialStorage = .memory(credential)
+            return true
+        }
+    }
+
+    @discardableResult
+    private func clearStoredCredential() -> Bool {
+        switch credentialStorage {
+        case .keychain:
+            return OuraOAuthCredentialStore.clear()
+        case .memory:
+            credentialStorage = .memory(nil)
+            return true
+        }
     }
 
     func configure(
@@ -151,7 +205,7 @@ final class OuraManager {
         if let credential = refreshCredentialCache(), credential.isValid() {
             status = .connected(email: snapshot.personalInfo?.email)
         } else {
-            OuraOAuthCredentialStore.clear()
+            clearStoredCredential()
             refreshCredentialCache()
             status = .notConnected
         }
@@ -164,7 +218,7 @@ final class OuraManager {
         status = .authorizing
         do {
             let credential = try await oauthSession.authorize(clientID: clientID)
-            guard OuraOAuthCredentialStore.save(credential) else {
+            guard saveStoredCredential(credential) else {
                 status = .error("HeartSync could not save the Oura authorization in Keychain.")
                 return
             }
@@ -200,8 +254,8 @@ final class OuraManager {
     @discardableResult
     func disconnect() -> Bool {
         oauthSession.cancel()
-        let accessToken = credential?.accessToken ?? OuraOAuthCredentialStore.load()?.accessToken
-        let cleared = OuraOAuthCredentialStore.clear()
+        let accessToken = credential?.accessToken ?? storedCredential()?.accessToken
+        let cleared = clearStoredCredential()
         refreshCredentialCache()
         if let accessToken { Task { await OuraOAuthSession.revoke(accessToken: accessToken) } }
 
@@ -273,7 +327,7 @@ final class OuraManager {
             return
         }
         guard credential.isValid() else {
-            let cleared = OuraOAuthCredentialStore.clear()
+            let cleared = clearStoredCredential()
             refreshCredentialCache()
             status = .error(cleared
                 ? "Oura authorization expired. Connect your account again."
@@ -302,7 +356,7 @@ final class OuraManager {
             end.timeIntervalSince($0) >= Self.fullBackfillInterval
         } ?? true
         let marks: [String: Date] = wantsFullWindow ? [:] : snapshot.collectionSyncMarks
-        let client = OuraClient(accessToken: credential.accessToken)
+        let client = OuraClient(accessToken: credential.accessToken, session: urlSession)
         var next = snapshot
         var recordCount = 0
         let fullReconciliationWindow = wantsFullWindow
@@ -812,7 +866,7 @@ final class OuraManager {
         guard let failure = error as? OuraClient.Failure,
               case .unauthorized(let detail) = failure
         else { return false }
-        let cleared = OuraOAuthCredentialStore.clear()
+        let cleared = clearStoredCredential()
         refreshCredentialCache()
         status = .error(cleared
             ? (detail ?? failure.errorDescription ?? "Oura authorization failed")

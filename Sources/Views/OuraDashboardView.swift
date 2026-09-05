@@ -347,6 +347,7 @@ struct OuraDashboardView: View {
                 subtitle: "Cached data above remains visible",
                 systemImage: "exclamationmark.triangle.fill"
             )
+            .accessibilityIdentifier("oura.endpointIssues")
 
             VStack(spacing: 0) {
                 ForEach(Array(model.oura.endpointIssues.enumerated()), id: \.element.id) { index, issue in
@@ -374,7 +375,6 @@ struct OuraDashboardView: View {
                     .strokeBorder(.orange.opacity(0.20))
             }
         }
-        .accessibilityIdentifier("oura.endpointIssues")
     }
 
     // MARK: - Incomplete collections

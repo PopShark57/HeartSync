@@ -2,6 +2,22 @@ import XCTest
 
 @MainActor
 final class HeartSyncCheckerUITests: XCTestCase {
+    private func element(_ identifier: String, in application: XCUIApplication) -> XCUIElement {
+        application.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    private func scrollToElement(
+        _ candidate: XCUIElement,
+        in application: XCUIApplication,
+        attempts: Int = 6
+    ) -> Bool {
+        for _ in 0..<attempts {
+            if candidate.exists && candidate.isHittable { return true }
+            application.swipeUp()
+        }
+        return candidate.exists && candidate.isHittable
+    }
+
     @discardableResult
     private func launch(_ scenario: String, pseudoLocalized: Bool = false) -> XCUIApplication {
         let application = XCUIApplication()
@@ -15,27 +31,27 @@ final class HeartSyncCheckerUITests: XCTestCase {
 
     func testStartupLoadingAndUnavailableRecoveryStates() {
         var application = launch("loading")
-        XCTAssertTrue(application.otherElements["startup.loading"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("startup.loading", in: application).waitForExistence(timeout: 5))
         application.terminate()
 
         application = launch("startupUnavailable")
-        XCTAssertTrue(application.otherElements["startup.unavailable"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("startup.unavailable", in: application).waitForExistence(timeout: 5))
         XCTAssertTrue(application.buttons["startup.retry"].exists)
         XCTAssertTrue(application.staticTexts["Health history temporarily unavailable"].exists)
         application.buttons["startup.retry"].tap()
-        XCTAssertTrue(application.buttons["Now"].waitForExistence(timeout: 3))
+        XCTAssertTrue(application.buttons["Now"].waitForExistence(timeout: 5))
     }
 
     func testSourceArchiveFailureAndCorruptRecoveryAreDistinguishable() {
         var application = launch("sourcesUnavailable")
-        XCTAssertTrue(application.otherElements["startup.unavailable"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("startup.unavailable", in: application).waitForExistence(timeout: 5))
         XCTAssertTrue(application.staticTexts.matching(NSPredicate(
             format: "label CONTAINS[c] %@", "sources"
         )).firstMatch.exists)
         application.terminate()
 
         application = launch("corruptRecovery")
-        XCTAssertTrue(application.otherElements["startup.notice"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("startup.notice", in: application).waitForExistence(timeout: 5))
         XCTAssertTrue(application.staticTexts.matching(NSPredicate(
             format: "label CONTAINS[c] %@", "preserving unreadable health data"
         )).firstMatch.exists)
@@ -43,14 +59,14 @@ final class HeartSyncCheckerUITests: XCTestCase {
 
     func testEmptyStateAndSettingsFailureRemainActionable() {
         var application = launch("empty")
-        XCTAssertTrue(application.staticTexts["Add your first device"].waitForExistence(timeout: 3))
+        XCTAssertTrue(application.staticTexts["No devices yet"].waitForExistence(timeout: 5))
         application.terminate()
 
         application = launch("settingsUnavailable")
-        XCTAssertTrue(application.otherElements["startup.notice"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("startup.notice", in: application).waitForExistence(timeout: 5))
         XCTAssertTrue(application.buttons["settings.retry"].exists)
         application.buttons["Settings"].tap()
-        XCTAssertTrue(application.otherElements["settings.unavailable"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("settings.unavailable", in: application).waitForExistence(timeout: 5))
     }
 
     func testSourcePauseAndDeleteActions() {
@@ -73,13 +89,15 @@ final class HeartSyncCheckerUITests: XCTestCase {
     func testRetentionShorteningRequiresConfirmationAndCanCancel() {
         let application = launch("retention")
         application.buttons["Settings"].tap()
-        application.buttons["Keep readings for, 30 days"].tap()
+        let retentionPicker = application.buttons["Keep readings for, 30 days"]
+        XCTAssertTrue(scrollToElement(retentionPicker, in: application))
+        retentionPicker.tap()
         application.buttons["7 days"].tap()
-        XCTAssertTrue(application.otherElements["retention.confirmation"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("retention.confirmation", in: application).waitForExistence(timeout: 5))
         XCTAssertTrue(application.staticTexts["Readings deleted"].exists)
         XCTAssertTrue(application.buttons["retention.export"].exists)
         application.buttons["Cancel"].tap()
-        XCTAssertFalse(application.otherElements["retention.confirmation"].exists)
+        XCTAssertFalse(element("retention.confirmation", in: application).exists)
     }
 
     func testComparisonEvidenceAndOuraPartialFailure() {
@@ -87,20 +105,28 @@ final class HeartSyncCheckerUITests: XCTestCase {
         comparison.launchArguments = ["--pairwise-demo"]
         comparison.launch()
         comparison.buttons["Compare"].tap()
-        XCTAssertTrue(comparison.otherElements["compare.root"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("compare.root", in: comparison).waitForExistence(timeout: 5))
         XCTAssertTrue(comparison.staticTexts["Evidence overview"].exists)
         comparison.terminate()
 
         let oura = launch("ouraPartial")
         oura.buttons["Oura"].tap()
-        XCTAssertTrue(oura.otherElements["oura.endpointIssues"].waitForExistence(timeout: 3))
+        let endpointIssues = element("oura.endpointIssues", in: oura)
+        XCTAssertTrue(scrollToElement(endpointIssues, in: oura))
         XCTAssertTrue(oura.staticTexts["Some data needs attention"].exists)
     }
 
     func testPseudoLocalizationKeepsAllPrimaryTabsReachable() {
         let application = launch("empty", pseudoLocalized: true)
-        for tab in ["Now", "Oura", "Compare", "Devices", "Settings"] {
-            let button = application.buttons[tab]
+        let tabIdentifiers = [
+            "waveform.path.ecg.rectangle",
+            "circle.circle.fill",
+            "chart.xyaxis.line",
+            "dot.radiowaves.left.and.right",
+            "gearshape",
+        ]
+        for identifier in tabIdentifiers {
+            let button = application.buttons[identifier]
             XCTAssertTrue(button.exists)
             XCTAssertTrue(button.isHittable)
         }

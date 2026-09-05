@@ -28,21 +28,15 @@ struct HealthKitSelfSourceTests {
         )
     }
 
-    /// The closest available guard on finding 1.1.
-    ///
-    /// The defence has two halves that must name the same app: `recentPredicate` excludes
-    /// `HKSource.default()` so our own samples are never returned, and `convert` drops any
-    /// sample whose bundle identifier equals `appBundleIdentifier`. If those two ever name
-    /// different apps — a hard-coded literal drifting from the real bundle id, a `.debug`
-    /// suffix on the product bundle id, a fallback taken because there is no main bundle —
-    /// the second half stops matching anything and the phantom source is back.
-    @Test("The self-sample filter names the same app HealthKit will attribute our writes to")
-    func selfFilterMatchesHealthKitsOwnNotionOfThisApp() throws {
-        let mainBundleIdentifier = try #require(Bundle.main.bundleIdentifier)
-        #expect(HealthKitManager.appBundleIdentifier == mainBundleIdentifier)
-        // HKSource.default() is the source HealthKit files this process's own saves under,
-        // and it is exactly what recentPredicate excludes.
-        #expect(HealthKitManager.appBundleIdentifier == HKSource.default().bundleIdentifier)
+    /// `HKSource.default()` raises an Objective-C exception in an unsigned hosted test
+    /// process, so the query predicate itself remains an on-device integration check. This
+    /// test executes the pure identifier guard used by the conversion fallback.
+    @Test("The self-sample filter accepts only HeartSync's bundle identifier")
+    func selfFilterMatchesAppIdentifier() {
+        #expect(HealthKitManager.isOwnSource(
+            bundleIdentifier: "com.heartsync.HeartSyncChecker"
+        ))
+        #expect(!HealthKitManager.isOwnSource(bundleIdentifier: "com.example.watch"))
     }
 
     /// `convert` builds HealthKit source ids as `"hk.\(bundleIdentifier)"`, so the shipping

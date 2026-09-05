@@ -874,8 +874,8 @@ private func ouraArchiveURL() -> URL {
         .appendingPathComponent(ReadingArchive.File.ouraDashboard)
 }
 
-/// Runs `body` against a configured `OuraManager` whose network, Keychain credential and
-/// dashboard archive are all stubbed, and restores the three afterwards whatever happens.
+/// Runs `body` against a configured `OuraManager` whose network, credential and dashboard
+/// archive are all stubbed, and restores the archive afterwards whatever happens.
 @MainActor
 private func withOuraSyncHarness(
     seeded: OuraSnapshot?,
@@ -883,8 +883,6 @@ private func withOuraSyncHarness(
     _ body: @MainActor (OuraManager, HealthStore) async throws -> Void
 ) async throws {
     let archiveURL = ouraArchiveURL()
-    let savedCredential = Keychain.get(.ouraOAuthCredentials)
-
     let savedArchive = try? Data(contentsOf: archiveURL)
     // \`ReadingArchive.shared\` has already created its directory. Capture the user's
     // existing test-host cache before clearing it so the harness never destroys real data.
@@ -900,20 +898,23 @@ private func withOuraSyncHarness(
         grantedScopes: Set(OuraOAuthSession.requestedScopes),
         scopeFieldWasReturned: true
     )
-    #expect(OuraOAuthCredentialStore.save(credential), "Could not seed the Oura credential in Keychain")
-
     OuraStubServer.shared.install(handler)
-    _ = URLProtocol.registerClass(OuraGlobalStubURLProtocol.self)
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [OuraGlobalStubURLProtocol.self]
+    let session = URLSession(configuration: configuration)
 
     defer {
-        URLProtocol.unregisterClass(OuraGlobalStubURLProtocol.self)
+        session.invalidateAndCancel()
         OuraStubServer.shared.uninstall()
-        Keychain.set(savedCredential, for: .ouraOAuthCredentials)
         try? FileManager.default.removeItem(at: archiveURL)
         if let savedArchive { try? savedArchive.write(to: archiveURL) }
     }
 
-    let manager = OuraManager()
+    let manager = OuraManager(
+        archive: .shared,
+        urlSession: session,
+        credentialForTesting: credential
+    )
     let store = HealthStore(persistenceEnabled: false)
     await manager.configure(
         store: store,

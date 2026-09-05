@@ -40,6 +40,7 @@ struct RootView: View {
                     Label(notice, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.primary)
+                        .accessibilityIdentifier("startup.notice")
                     Spacer(minLength: 8)
                     if model.settings.loadState == .failed {
                         Button("Retry") { Task { await model.retryStartup() } }
@@ -50,7 +51,6 @@ struct RootView: View {
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.orange.opacity(0.18))
-                .accessibilityIdentifier("startup.notice")
             }
         }
     }
@@ -63,6 +63,7 @@ private struct StartupRecoveryView: View {
     var body: some View {
         ContentUnavailableView {
             Label("Health history temporarily unavailable", systemImage: "lock.trianglebadge.exclamationmark")
+                .accessibilityIdentifier("startup.unavailable")
         } description: {
             Text("HeartSync has not started Bluetooth, HealthKit, or Oura. Your existing files have not been overwritten. Unlock the device or resolve storage access, then retry.\n\n\(detail)")
         } actions: {
@@ -74,7 +75,6 @@ private struct StartupRecoveryView: View {
             }
         }
         .padding()
-        .accessibilityIdentifier("startup.unavailable")
     }
 }
 

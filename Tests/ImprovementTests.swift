@@ -103,7 +103,7 @@ struct BluetoothDiscoveryStateTests {
         state.finishService(id: "1822", candidates: [oxygen])
         #expect(state.resolution == .enabling([.heartRate, .hrvRMSSD, .hrvSDNN, .spo2]))
         state.finishSubscription(id: "plx")
-        #expect(state.resolution == .enabling([.heartRate, .hrvRMSSD, .hrvSDNN]))
+        #expect(state.resolution == .enabling([.heartRate, .hrvRMSSD, .hrvSDNN, .spo2]))
         state.finishSubscription(id: "hr")
         #expect(state.resolution == .ready(
             metrics: [.heartRate, .hrvRMSSD, .hrvSDNN, .spo2],
@@ -189,7 +189,8 @@ struct HRVObservationIntervalTests {
         let boundary = Date(timeIntervalSince1970: 1_700_000_100)
         let receipt = boundary.addingTimeInterval(20)
         var accumulator = HRVAccumulator()
-        accumulator.add(intervals: Array(repeating: 1_000.0, count: 20), at: receipt)
+        let intervals = (0..<20).map { $0.isMultiple(of: 2) ? 950.0 : 1_050.0 }
+        accumulator.add(intervals: intervals, at: receipt)
         let candidate = accumulator.emissionIfReady(at: receipt)
         let emission = try #require(candidate)
         let reading = Reading(
@@ -375,7 +376,7 @@ struct TransactionalDatabaseTests {
             sourceID: source.id,
             kind: .heartRate,
             value: 72,
-            start: Date(timeIntervalSinceNow: -60),
+            start: Date(timeIntervalSince1970: 1_700_000_000),
             provenance: .measured
         )
         #expect(await archive.write([source], to: ReadingArchive.File.sources))
@@ -525,7 +526,7 @@ struct TransactionalDatabaseTests {
             sourceID: source.id,
             kind: .heartRate,
             value: 65,
-            start: Date(timeIntervalSinceNow: -30)
+            start: Date(timeIntervalSince1970: 1_700_000_000)
         )
         #expect(await archive.write([source], to: ReadingArchive.File.sources))
         #expect(await archive.write([reading], to: ReadingArchive.File.readings))

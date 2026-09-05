@@ -18,11 +18,11 @@ struct SettingsView: View {
                     Section {
                         Label("Settings are temporarily read-only", systemImage: "lock.trianglebadge.exclamationmark")
                             .foregroundStyle(.orange)
+                            .accessibilityIdentifier("settings.unavailable")
                         Text(model.settings.loadIssue ?? "The settings archive is unavailable. Existing bytes were preserved.")
                             .font(.caption)
                         Button("Retry settings") { Task { await model.retryStartup() } }
                     }
-                    .accessibilityIdentifier("settings.unavailable")
                 }
                 Section {
                     NavigationLink {
@@ -349,6 +349,7 @@ private struct RetentionConfirmationView: View {
                     }
                 } header: {
                     Text("Shorter retention")
+                        .accessibilityIdentifier("retention.confirmation")
                 } footer: {
                     Text("Deletion and compaction are irreversible. Compacted medians retain known original counts and spread, but individual rows and later corrections are lost.")
                 }
@@ -370,7 +371,6 @@ private struct RetentionConfirmationView: View {
                 }
             }
         }
-        .accessibilityIdentifier("retention.confirmation")
     }
 }
 

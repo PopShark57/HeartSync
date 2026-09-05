@@ -53,6 +53,7 @@ struct CompareView: View {
                             evidenceOverview(snapshot)
                         } header: {
                             Text("Evidence overview")
+                                .accessibilityIdentifier("compare.root")
                         } footer: {
                             Text("HeartSync uses median values in epoch-aligned windows and excludes estimates. Ready analyses use mean bias and 95% limits of agreement; insufficient overlap is never treated as agreement.")
                         }
@@ -60,7 +61,6 @@ struct CompareView: View {
                 }
             }
             .navigationTitle("Compare")
-            .accessibilityIdentifier("compare.root")
         }
     }
 

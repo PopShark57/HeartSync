@@ -148,7 +148,7 @@ struct PairwiseExportTests {
         #expect(row["source_b_aggregation"] == "raw")
         #expect(analysis.rawSampleCountA == nil)
         #expect(export.summary.contains("Original samples contributing: A unknown (compacted history), B 4"))
-        #expect(export.summary.contains("later corrections or upstream deletions cannot update"))
+        #expect(export.summary.contains("cannot accept later corrections or upstream deletions"))
     }
 
     @Test("Formula-leading source metadata is exported as literal spreadsheet text")
@@ -171,10 +171,11 @@ struct PairwiseExportTests {
         )
 
         let rows = try parseRFC4180(export.csv)
-        #expect(rows[1][5] == "'=SUM(1,1)")
-        #expect(rows[1][7] == "'+model")
-        #expect(rows[1][13] == "' -42")
-        #expect(rows[1][15] == "' @model")
+        let row = Dictionary(uniqueKeysWithValues: zip(rows[0], rows[1]))
+        #expect(row["source_a_name"] == "'=SUM(1,1)")
+        #expect(row["source_a_model"] == "'+model")
+        #expect(row["source_b_name"] == "' -42")
+        #expect(row["source_b_model"] == "' @model")
     }
 
     @Test("No-overlap summary explicitly withholds an agreement conclusion")
@@ -271,7 +272,7 @@ struct PairwiseExportTests {
         #expect(export.summary.contains("Source A: Alpha Strap"))
         #expect(export.summary.contains("Source B: Beta Watch"))
         #expect(export.summary.contains("Overlap: 62.5%"))
-        #expect(export.summary.contains("Raw samples contributing: A 10, B 15"))
+        #expect(export.summary.contains("Original samples contributing: A 10, B 15"))
         #expect(export.summary.contains("Mean bias (A - B): -8 bpm"))
         #expect(export.summary.contains("Sample standard deviation of differences: 1.25 bpm"))
         #expect(export.summary.contains("95% limits of agreement: -10.45 to -5.55 bpm"))
@@ -372,11 +373,12 @@ struct PairwiseExportTests {
         )
 
         let rows = try parseRFC4180(export.csv)
-        #expect(rows[1][4] == "removed-a")
-        #expect(rows[1][5] == "removed-a")
-        #expect(rows[1][6].isEmpty)
-        #expect(rows[1][12] == "removed-b")
-        #expect(rows[1][13] == "removed-b")
+        let row = Dictionary(uniqueKeysWithValues: zip(rows[0], rows[1]))
+        #expect(row["source_a_id"] == "removed-a")
+        #expect(row["source_a_name"] == "removed-a")
+        #expect(row["source_a_transport"]?.isEmpty == true)
+        #expect(row["source_b_id"] == "removed-b")
+        #expect(row["source_b_name"] == "removed-b")
         #expect(export.summary.contains("Transport: Unknown"))
         #expect(export.summary.contains("Model: Unknown"))
     }
