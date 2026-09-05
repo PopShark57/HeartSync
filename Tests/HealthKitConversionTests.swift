@@ -39,6 +39,21 @@ struct HealthKitSelfSourceTests {
         #expect(!HealthKitManager.isOwnSource(bundleIdentifier: "com.example.watch"))
     }
 
+    @Test("The companion's measured workout sample imports once with its HealthKit UUID")
+    func companionWorkoutIsNotPhoneWriteback() throws {
+        let mapping = try #require(HealthKitManager.mappings.first { $0.kind == .heartRate })
+        let sample = descriptor(sourceBundleIdentifier: "com.heartsync.HeartSyncChecker.watchkitapp")
+        let converted = HealthKitManager.convert(descriptors: [sample], mapping: mapping)
+        let reading = try #require(converted.readings.first)
+        #expect(reading.id == sample.id)
+        #expect(reading.sourceID == "hk.com.heartsync.HeartSyncChecker.watchkitapp")
+        #expect(reading.provenance == .measured)
+        let store = HealthStore(persistenceEnabled: false)
+        #expect(store.append(reading))
+        #expect(!store.append(reading))
+        #expect(store.readingCount == 1)
+    }
+
     /// `convert` builds HealthKit source ids as `"hk.\(bundleIdentifier)"`, so the shipping
     /// bundle identifier is part of the persisted identity of every Apple Health device in
     /// the archive. Changing `PRODUCT_BUNDLE_IDENTIFIER` re-namespaces nothing on its own —
