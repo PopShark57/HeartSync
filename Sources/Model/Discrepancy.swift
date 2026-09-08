@@ -14,8 +14,52 @@ struct SourceValue: Identifiable, Hashable, Sendable {
     var provenance: Provenance
     var isCompacted: Bool = false
     var qualityCaveatCount: Int = 0
+    /// Earliest start through latest end of the readings behind `value`.
+    ///
+    /// A window is a bucket the app imposed; this is when the device actually reported
+    /// inside it. Nil when the contributing timestamps no longer exist, which is the case
+    /// for a compacted median — unknown, and never to be replaced with the window bounds.
+    var observedInterval: DateInterval? = nil
+    /// Median of the contributing readings' midpoints: one representative instant for this
+    /// source in this window, used to measure how far apart two sources actually were.
+    /// Nil for the same reason as `observedInterval`.
+    var representativeTime: Date? = nil
 
     var id: String { sourceID }
+}
+
+/// How well a paired observation supports the claim that both devices describe one moment.
+///
+/// Epoch-aligned bucketing pairs anything that lands in the same bucket, so two samples
+/// 59 seconds apart can be paired while two samples 2 seconds apart across a boundary are
+/// not. That is a deliberate, stable grid — but it means "paired" alone does not mean
+/// "simultaneous", and the difference has to be visible rather than assumed.
+enum PairTimingQuality: String, Hashable, Sendable, CaseIterable {
+    /// Both sources reported within the metric's timing tolerance of each other.
+    case simultaneous
+    /// Both timestamps are known, and further apart than the tolerance allows.
+    case separated
+    /// At least one side's contributing timestamps are gone, so separation is unknowable.
+    /// Deliberately distinct from `separated`: unknown is not evidence of either.
+    case unknown
+    /// The metric summarises a long interval (a daily resting rate, a VO2 max estimate),
+    /// so a sub-window separation figure would be meaningless rather than merely unknown.
+    case notApplicable
+
+    /// Whether this observation should count toward a supported agreement conclusion.
+    /// Only an affirmative timing check does; unknown does not qualify by default.
+    var supportsConclusion: Bool {
+        self == .simultaneous || self == .notApplicable
+    }
+
+    var title: String {
+        switch self {
+        case .simultaneous:  "Simultaneous"
+        case .separated:     "Separated in time"
+        case .unknown:       "Timing unknown"
+        case .notApplicable: "Interval summary"
+        }
+    }
 }
 
 /// A single time window in which two or more sources reported the same metric.
@@ -68,12 +112,25 @@ struct PairwiseObservation: Identifiable, Hashable, Sendable {
     var sourceA: SourceValue
     var sourceB: SourceValue
     var severity: DiscrepancySeverity
+    /// How well this pair supports "both devices describe the same moment".
+    var timing: PairTimingQuality = .unknown
 
     var id: String {
         "\(sourceA.sourceID)\u{001F}\(sourceB.sourceID)\u{001F}\(start.timeIntervalSinceReferenceDate.bitPattern)"
     }
 
     var end: Date { start.addingTimeInterval(duration) }
+
+    /// Distance between the two sources' representative observation times. Nil when either
+    /// side's contributing timestamps are unavailable.
+    var timingSeparation: TimeInterval? {
+        guard let a = sourceA.representativeTime, let b = sourceB.representativeTime else { return nil }
+        return abs(a.timeIntervalSince(b))
+    }
+
+    /// Span actually covered by contributing readings, per source. Nil where unknown.
+    var contributingDurationA: TimeInterval? { sourceA.observedInterval?.duration }
+    var contributingDurationB: TimeInterval? { sourceB.observedInterval?.duration }
     var pairedMean: Double { (sourceA.value + sourceB.value) / 2 }
     /// Signed device difference in the canonical direction, A minus B.
     var signedDifference: Double { sourceA.value - sourceB.value }
@@ -117,6 +174,23 @@ struct PairwiseEvidenceAssessment: Hashable, Sendable {
     var compactedWindowCount: Int
     var qualityCaveatCount: Int
     var reasons: [String]
+    /// Paired windows whose two sources were further apart in time than the metric allows.
+    /// They still contribute to the statistics — the paired set is not silently filtered —
+    /// but they hold the evidence grade down and are named in `reasons`.
+    var temporallySeparatedCount: Int = 0
+    /// Paired windows where at least one side's contributing timestamps are gone, so the
+    /// separation cannot be checked either way.
+    var unknownTimingCount: Int = 0
+    /// Median separation across the paired windows where both sides are known.
+    var medianTimingSeparation: TimeInterval? = nil
+    /// How much of the analyzed span the paired windows actually occupy, in `0...1`.
+    /// Below 1 means the pair's shared coverage is sparse rather than continuous.
+    var coverageFraction: Double? = nil
+
+    /// Paired windows whose timing affirmatively supports a same-moment reading.
+    func temporallySupportedCount(of pairedWindowCount: Int) -> Int {
+        max(0, pairedWindowCount - temporallySeparatedCount - unknownTimingCount)
+    }
 }
 
 /// Evidence state for a selected metric and device pair.

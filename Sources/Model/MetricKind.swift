@@ -256,6 +256,32 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
         }
     }
 
+    /// Whether a reading of this metric is a summary over a long interval rather than a
+    /// spot measurement.
+    ///
+    /// A daily resting heart rate and a VO2 max are properties of a day, not of an instant.
+    /// Asking how many seconds apart two of them were is not a meaningful question, so the
+    /// timing policy reports `notApplicable` rather than pretending to a precision the
+    /// measurement never had. This is not the same as `isContinuous`, which asks whether a
+    /// metric belongs on the live dashboard.
+    var isIntervalSummary: Bool {
+        switch self {
+        case .restingHeartRate, .vo2Max: true
+        default: false
+        }
+    }
+
+    /// How far apart two devices' representative observation times may sit inside one
+    /// comparison window and still be treated as describing the same moment.
+    ///
+    /// Half the comparison window: at the boundary, two readings paired by the epoch grid
+    /// would be no closer to each other than to readings in the neighbouring bucket, so
+    /// treating them as simultaneous would be measuring the grid rather than the devices.
+    /// Nil for interval summaries, where separation is not a meaningful quantity.
+    var timingTolerance: TimeInterval? {
+        isIntervalSummary ? nil : comparisonWindow / 2
+    }
+
     func format(_ value: Double) -> String {
         value.formatted(.number.precision(.fractionLength(fractionDigits)))
     }

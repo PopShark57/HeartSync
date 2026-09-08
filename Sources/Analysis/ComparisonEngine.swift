@@ -115,6 +115,24 @@ enum ComparisonEngine {
                 || (metadata.artefactFraction ?? 0) > 0.10
         }
 
+        // Timing facts describe when the device actually reported, which is not the same as
+        // the bucket it landed in. A compacted median has no surviving contributing
+        // timestamps, so its timing stays unknown rather than being backfilled from the
+        // window bounds — that would manufacture a precision the archive discarded.
+        let observedInterval: DateInterval?
+        let representativeTime: Date?
+        if compacted.isEmpty,
+           let earliest = samples.map(\.start).min(),
+           let latest = samples.map(\.end).max() {
+            observedInterval = DateInterval(start: earliest, end: max(earliest, latest))
+            representativeTime = Date(
+                timeIntervalSince1970: median(samples.map(\.midpoint).map(\.timeIntervalSince1970))
+            )
+        } else {
+            observedInterval = nil
+            representativeTime = nil
+        }
+
         return SourceValue(
             sourceID: sourceID,
             value: centre,
@@ -122,8 +140,24 @@ enum ComparisonEngine {
             standardDeviation: standardDeviation,
             provenance: provenance,
             isCompacted: !compacted.isEmpty,
-            qualityCaveatCount: qualityCaveatCount
+            qualityCaveatCount: qualityCaveatCount,
+            observedInterval: observedInterval,
+            representativeTime: representativeTime
         )
+    }
+
+    /// Classifies how well one paired window supports "these describe the same moment".
+    ///
+    /// Deliberately does not move, adjust, or re-bucket any timestamp. The pairing rule is
+    /// unchanged; this only makes the timing implied by that rule inspectable.
+    static func timingQuality(
+        sourceA: SourceValue,
+        sourceB: SourceValue,
+        kind: MetricKind
+    ) -> PairTimingQuality {
+        guard let tolerance = kind.timingTolerance else { return .notApplicable }
+        guard let a = sourceA.representativeTime, let b = sourceB.representativeTime else { return .unknown }
+        return abs(a.timeIntervalSince(b)) <= tolerance ? .simultaneous : .separated
     }
 
     // MARK: - Pairwise analysis
@@ -367,7 +401,8 @@ enum ComparisonEngine {
                 duration: window.duration,
                 sourceA: sourceA,
                 sourceB: sourceB,
-                severity: kind.agreement.severity(forDelta: sourceA.value - sourceB.value)
+                severity: kind.agreement.severity(forDelta: sourceA.value - sourceB.value),
+                timing: timingQuality(sourceA: sourceA, sourceB: sourceB, kind: kind)
             )
         }
 
@@ -496,14 +531,35 @@ enum ComparisonEngine {
         let strongSpan = max(3_600, windowSize * 30)
         let moderateSpan = max(1_800, windowSize * 10)
 
+        // Timing facts. Separated and unknown are counted apart because they mean different
+        // things: one is a measured failure to coincide, the other is an absence of evidence.
+        let separated = observations.count { $0.timing == .separated }
+        let unknownTiming = observations.count { $0.timing == .unknown }
+        let separations = observations.compactMap(\.timingSeparation)
+        let medianSeparation = separations.isEmpty ? nil : median(separations)
+        // How much of the analyzed span the paired windows actually occupy. Below 1 the
+        // pair's shared coverage is intermittent, whatever the window count says.
+        let coverageFraction: Double? = span > 0
+            ? min(1, Double(pairedWindowCount) * windowSize / span)
+            : nil
+
+        // A pair that never actually coincided is not strong evidence about the devices,
+        // however many windows it accumulated, so timing gates the top grades. The paired
+        // set itself is NOT filtered: statistics still use every paired window, as
+        // documented, and this marks the evidence rather than quietly discarding data.
+        let timingSupportsStrong = separated == 0 && unknownTiming == 0
+        let timingSupportsModerate = pairedWindowCount > 0
+            && Double(separated + unknownTiming) / Double(pairedWindowCount) <= 0.25
+
         let grade: PairwiseEvidenceGrade
         if pairedWindowCount < minimumPairedWindows {
             grade = .limited
         } else if pairedWindowCount >= 30, overlapPercentage >= 80,
-                  span >= strongSpan, !unknownDepth, compacted == 0, caveats == 0 {
+                  span >= strongSpan, !unknownDepth, compacted == 0, caveats == 0,
+                  timingSupportsStrong {
             grade = .strong
         } else if pairedWindowCount >= 10, overlapPercentage >= 60,
-                  span >= moderateSpan, caveats == 0 {
+                  span >= moderateSpan, caveats == 0, timingSupportsModerate {
             grade = .moderate
         } else {
             grade = .weak
@@ -515,14 +571,27 @@ enum ComparisonEngine {
         if unknownDepth { reasons.append("Some compacted sample counts are unknown") }
         if compacted > 0 { reasons.append("Includes fixed compacted window medians") }
         if caveats > 0 { reasons.append("Includes signal-quality caveats") }
-        if reasons.isEmpty { reasons.append("Window count, span, overlap, and sample depth support this grade") }
+        if separated > 0 {
+            reasons.append("\(separated) paired \(separated == 1 ? "window pairs readings" : "windows pair readings") taken too far apart in time")
+        }
+        if unknownTiming > 0 {
+            reasons.append("\(unknownTiming) paired \(unknownTiming == 1 ? "window has" : "windows have") unknown measurement timing")
+        }
+        if let coverageFraction, coverageFraction < 0.5 {
+            reasons.append("Paired windows cover only part of the analysed span")
+        }
+        if reasons.isEmpty { reasons.append("Window count, span, overlap, timing, and sample depth support this grade") }
 
         return PairwiseEvidenceAssessment(
             grade: grade,
             hasUnknownSampleDepth: unknownDepth,
             compactedWindowCount: compacted,
             qualityCaveatCount: caveats,
-            reasons: reasons
+            reasons: reasons,
+            temporallySeparatedCount: separated,
+            unknownTimingCount: unknownTiming,
+            medianTimingSeparation: medianSeparation,
+            coverageFraction: coverageFraction
         )
     }
 

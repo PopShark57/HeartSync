@@ -155,7 +155,9 @@ struct MetricDetailView: View {
                 LineMark(
                     x: .value("Time", point.date),
                     y: .value(kind.title, point.value),
-                    series: .value("Source", point.sourceID)
+                    // Segment key, not source key: the line breaks across a gap in this
+                    // source's data rather than implying continuous measurement.
+                    series: .value("Source", point.seriesKey)
                 )
                 .foregroundStyle(by: .value("Source", point.sourceID))
                 .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, dash: point.isEstimate ? [4, 3] : []))

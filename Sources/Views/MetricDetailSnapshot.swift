@@ -17,6 +17,12 @@ struct ChartPoint: Identifiable {
     /// Display text only. Never used as a grouping key.
     var sourceName: String
     var isEstimate: Bool
+    /// Line-segment key: the source ID plus a run index that increments across a gap in
+    /// this source's data. Swift Charts connects consecutive marks that share a series
+    /// key, so drawing one series per source would run a smooth curve straight through a
+    /// six-hour hole and imply measurement that never happened. Colour and symbol still
+    /// key on `sourceID`, so a broken line stays visibly one device.
+    var seriesKey: String = ""
 }
 
 /// Distinguishable mark shapes, assigned per source alongside colour.
@@ -183,7 +189,7 @@ struct MetricDetailSnapshot {
         var names: [String: String] = [:]
         for entry in self.series { names[entry.sourceID] = entry.label }
 
-        self.points = windows.flatMap { window in
+        let chartPoints = windows.flatMap { window in
             window.values.map { value in
                 ChartPoint(
                     id: "\(value.sourceID)-\(window.start.timeIntervalSince1970)",
@@ -195,6 +201,7 @@ struct MetricDetailSnapshot {
                 )
             }
         }
+        self.points = Self.segmented(chartPoints, bucketSize: bucketSize)
 
         // The band is a disagreement verdict drawn on a chart, so it is built from measured
         // and derived values only. Showing estimates must never widen it or change its
@@ -280,6 +287,35 @@ struct MetricDetailSnapshot {
             quality: hrvQuality,
             range: interval
         )
+    }
+
+    /// Assigns each point a line-segment key, starting a new segment wherever a source
+    /// skipped more than one bucket.
+    ///
+    /// A curve drawn across a gap asserts that the device was measuring throughout it. It
+    /// was not, and the chart must not say so. An isolated observation gets its own
+    /// segment and remains visible as a point, because `PointMark` is drawn regardless.
+    ///
+    /// The threshold is 1.5 buckets: one bucket of spacing is normal for a source
+    /// reporting every window, so only a genuinely missed window breaks the line.
+    static func segmented(_ points: [ChartPoint], bucketSize: TimeInterval) -> [ChartPoint] {
+        guard bucketSize > 0 else { return points }
+        let threshold = bucketSize * 1.5
+        var result: [ChartPoint] = []
+        result.reserveCapacity(points.count)
+
+        for (sourceID, group) in Dictionary(grouping: points, by: \.sourceID) {
+            let ordered = group.sorted { $0.date < $1.date }
+            var segment = 0
+            var previous: Date?
+            for var point in ordered {
+                if let previous, point.date.timeIntervalSince(previous) > threshold { segment += 1 }
+                point.seriesKey = "\(sourceID)\u{001F}\(segment)"
+                previous = point.date
+                result.append(point)
+            }
+        }
+        return result.sorted { $0.date < $1.date }
     }
 
     /// Builds the chart series for the sources visible in this range.

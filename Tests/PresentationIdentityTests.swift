@@ -165,3 +165,67 @@ struct PresentationIdentityTests {
         #expect(TimeRange.month.wider == nil)
     }
 }
+
+/// Chart line segmentation across data gaps (improvement 20).
+@Suite("Chart gap segmentation")
+@MainActor
+struct ChartSegmentationTests {
+
+    private func point(_ sourceID: String, _ offset: TimeInterval) -> ChartPoint {
+        ChartPoint(
+            id: "\(sourceID)-\(offset)",
+            date: Date(timeIntervalSince1970: 1_700_000_000 + offset),
+            value: 70,
+            sourceID: sourceID,
+            sourceName: sourceID,
+            isEstimate: false
+        )
+    }
+
+    @Test("Consecutive buckets stay one connected line")
+    func consecutiveBucketsShareASegment() {
+        let segmented = MetricDetailSnapshot.segmented(
+            [point("a", 0), point("a", 60), point("a", 120)],
+            bucketSize: 60
+        )
+        #expect(Set(segmented.map(\.seriesKey)).count == 1)
+    }
+
+    @Test("A missed window breaks the line rather than drawing through the gap")
+    func gapStartsANewSegment() {
+        // 0, 60, then nothing until 600: the curve must not span the hole.
+        let segmented = MetricDetailSnapshot.segmented(
+            [point("a", 0), point("a", 60), point("a", 600), point("a", 660)],
+            bucketSize: 60
+        )
+        let keys = segmented.sorted { $0.date < $1.date }.map(\.seriesKey)
+
+        #expect(keys[0] == keys[1])
+        #expect(keys[2] == keys[3])
+        #expect(keys[1] != keys[2])
+        // Still one device, so the colour/symbol key is untouched.
+        #expect(Set(segmented.map(\.sourceID)) == ["a"])
+    }
+
+    @Test("Each source is segmented independently")
+    func sourcesSegmentIndependently() {
+        let segmented = MetricDetailSnapshot.segmented(
+            [point("a", 0), point("a", 600), point("b", 0), point("b", 60)],
+            bucketSize: 60
+        )
+        let a = segmented.filter { $0.sourceID == "a" }
+        let b = segmented.filter { $0.sourceID == "b" }
+
+        #expect(Set(a.map(\.seriesKey)).count == 2)
+        #expect(Set(b.map(\.seriesKey)).count == 1)
+        // No segment key is ever shared between two devices.
+        #expect(Set(a.map(\.seriesKey)).isDisjoint(with: Set(b.map(\.seriesKey))))
+    }
+
+    @Test("An isolated observation gets its own segment and stays plotted")
+    func isolatedObservationSurvives() {
+        let segmented = MetricDetailSnapshot.segmented([point("a", 0)], bucketSize: 60)
+        #expect(segmented.count == 1)
+        #expect(segmented[0].seriesKey.isEmpty == false)
+    }
+}
