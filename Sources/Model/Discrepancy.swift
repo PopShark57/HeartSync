@@ -303,6 +303,12 @@ struct PairwiseEvidenceOverview: Hashable, Sendable {
     var outsideToleranceCount: Int
     /// Of those, the ones at or above the user's alert threshold — the pairs shown in full.
     var flaggedCount: Int
+    /// Pairs whose two sources are confirmed paths to the same upstream device.
+    ///
+    /// They remain fully inspectable — two paths disagreeing is a real sync problem worth
+    /// seeing — but they are not two devices agreeing, so they must not inflate a count of
+    /// independent corroboration.
+    var sameDevicePairCount: Int = 0
 
     /// Real gaps the user's alert threshold keeps out of the detail list. They still block
     /// a green claim: choosing not to be told about a gap is not the same as agreement.
@@ -311,10 +317,18 @@ struct PairwiseEvidenceOverview: Hashable, Sendable {
     /// - Parameter alertThreshold: the user's "flag disagreements at" preference. It
     ///   controls how much detail the overview lists, never `status`, so lowering the
     ///   alert level can hide a row but can never turn a real gap green.
-    init(analyses: [PairwiseAnalysis], alertThreshold: DiscrepancySeverity = .agreeing) {
+    /// - Parameter sameDevicePairs: pair keys (`sourceA` + `sourceB`) the caller has
+    ///   confirmed describe one upstream device through two transports. Passing them in
+    ///   rather than looking them up keeps this type free of the source list.
+    init(
+        analyses: [PairwiseAnalysis],
+        alertThreshold: DiscrepancySeverity = .agreeing,
+        sameDevicePairs: Set<String> = []
+    ) {
         let readyStatistics = analyses.compactMap(\.statistics)
         let outsideTolerance = readyStatistics.filter { $0.severity != .agreeing }
 
+        self.sameDevicePairCount = analyses.count { sameDevicePairs.contains(Self.pairKey($0)) }
         self.readyCount = readyStatistics.count
         self.incompleteCount = analyses.count - readyStatistics.count
         self.outsideToleranceCount = outsideTolerance.count
@@ -327,6 +341,31 @@ struct PairwiseEvidenceOverview: Hashable, Sendable {
         } else {
             status = .readyPairOutsideTolerance
         }
+    }
+
+    /// Canonical key for one pair, matching `PairwiseAnalysis`'s ordering.
+    static func pairKey(_ analysis: PairwiseAnalysis) -> String {
+        "\(analysis.sourceA)\u{001F}\(analysis.sourceB)"
+    }
+
+    /// Pair keys for analyses whose two sources are confirmed paths to one upstream device.
+    ///
+    /// Uses the existing `upstreamDeviceRelationshipID` and its `describesSameDevice`
+    /// rule; it never infers identity from similar names or models, so an unknown
+    /// relationship stays unknown.
+    static func sameDevicePairKeys(
+        analyses: [PairwiseAnalysis],
+        sources: [DataSource]
+    ) -> Set<String> {
+        let byID = Dictionary(sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return Set(
+            analyses
+                .filter { analysis in
+                    guard let a = byID[analysis.sourceA], let b = byID[analysis.sourceB] else { return false }
+                    return a.likelyRepresentsSameDevice(as: b)
+                }
+                .map(pairKey)
+        )
     }
 }
 

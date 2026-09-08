@@ -19,6 +19,7 @@ struct CompareView: View {
         var range: TimeRange
         var alertThreshold: DiscrepancySeverity
         var enabledSourceIDs: [String]
+        var hiddenSourceIDs: [String]
         var retryToken: Int
     }
 
@@ -28,6 +29,7 @@ struct CompareView: View {
             range: range,
             alertThreshold: model.settings.snapshot.discrepancyThreshold,
             enabledSourceIDs: model.store.enabledSources.map(\.id).sorted(),
+            hiddenSourceIDs: model.settings.snapshot.comparisonHidden.sorted(),
             retryToken: retryToken
         )
     }
@@ -62,6 +64,9 @@ struct CompareView: View {
                 }
             }
             .navigationTitle("Compare")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
+            }
             // `.task(id:)` cancels the in-flight load whenever the key changes, so a slow
             // month-range load cannot land after the user has switched back to an hour.
             .task(id: loadKey) {
@@ -75,7 +80,8 @@ struct CompareView: View {
                 let resolved = ComparisonSnapshot(
                     store: model.store,
                     range: range,
-                    alertThreshold: model.settings.snapshot.discrepancyThreshold
+                    alertThreshold: model.settings.snapshot.discrepancyThreshold,
+                    hiddenSourceIDs: model.settings.snapshot.comparisonHidden
                 )
                 // Rejects a late result: the selection may have moved on while this ran.
                 guard !Task.isCancelled, key == loadKey else { return }
@@ -118,10 +124,57 @@ struct CompareView: View {
                         Text("Evidence overview")
                             .accessibilityIdentifier("compare.root")
                     } footer: {
-                        Text("HeartSync uses median values in epoch-aligned windows and excludes estimates. Ready analyses use mean bias and 95% limits of agreement; insufficient overlap is never treated as agreement.")
+                        Text(overviewFooter(snapshot))
                     }
                 }
         }
+    }
+
+    /// Chooses which sources this comparison uses, without touching collection.
+    ///
+    /// Deliberately separate from Pause on the Devices tab, which disconnects the
+    /// peripheral and stops it recording. Hiding a noisy ring here changes this screen
+    /// only: the device stays connected and its history is untouched, so the choice is
+    /// free to make and free to undo.
+    @ViewBuilder
+    private var sourceSelectionMenu: some View {
+        @Bindable var settings = model.settings
+        let sources = model.store.enabledSources
+        Menu {
+            if sources.isEmpty {
+                Text("No collecting devices yet")
+            } else {
+                ForEach(sources) { source in
+                    let hidden = settings.snapshot.comparisonHidden.contains(source.id)
+                    Button {
+                        settings.snapshot.setComparisonHidden(!hidden, forSource: source.id)
+                    } label: {
+                        Label(source.displayName, systemImage: hidden ? "circle" : "checkmark.circle.fill")
+                    }
+                }
+                if !settings.snapshot.comparisonHidden.isEmpty {
+                    Divider()
+                    Button("Show all in comparison") {
+                        settings.snapshot.comparisonHiddenSourceIDs = nil
+                    }
+                }
+            }
+            Divider()
+            Text("Hiding a device here does not disconnect it or delete its data.")
+        } label: {
+            Label("Sources", systemImage: hiddenCount > 0 ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+        }
+        .accessibilityIdentifier("compare.sources")
+        .accessibilityLabel(
+            hiddenCount == 0
+                ? "Comparison sources, all included"
+                : "Comparison sources, \(hiddenCount) hidden"
+        )
+    }
+
+    private var hiddenCount: Int {
+        let enabled = Set(model.store.enabledSources.map(\.id))
+        return model.settings.snapshot.comparisonHidden.intersection(enabled).count
     }
 
     /// Distinguishes an empty install from a range that happens to hold nothing, because
@@ -196,6 +249,24 @@ struct CompareView: View {
         }
     }
 
+    /// Says plainly when some of the listed pairs are one device seen twice.
+    ///
+    /// Two paths from one ring disagreeing is a real sync problem and stays inspectable,
+    /// but it is not two devices corroborating each other, and the overview must not read
+    /// as though it were.
+    private func overviewFooter(_ snapshot: ComparisonSnapshot) -> String {
+        let base = "HeartSync uses median values in epoch-aligned windows and excludes estimates. Ready analyses use mean bias and 95% limits of agreement; insufficient overlap is never treated as agreement."
+        var extra: [String] = []
+        if snapshot.overview.sameDevicePairCount > 0 {
+            let count = snapshot.overview.sameDevicePairCount
+            extra.append("\(count) of these \(count == 1 ? "pairs is" : "pairs are") two paths to the same device rather than two independent devices; \(count == 1 ? "it is" : "they are") useful for spotting a sync problem but \(count == 1 ? "does" : "do") not corroborate a measurement.")
+        }
+        if hiddenCount > 0 {
+            extra.append("\(hiddenCount) \(hiddenCount == 1 ? "device is" : "devices are") hidden from this comparison. \(hiddenCount == 1 ? "It is" : "They are") still connected and still recording.")
+        }
+        return ([base] + extra).joined(separator: " ")
+    }
+
     private func incompleteEvidenceSummary(_ items: [PairwiseAnalysis]) -> String {
         let noOverlap = items.filter {
             if case .noOverlap = $0.state { return true }
@@ -230,17 +301,30 @@ private struct ComparisonSnapshot {
     /// Pairs with no overlap or too few paired windows, in any metric.
     let incomplete: [PairwiseAnalysis]
 
+    /// Pairs confirmed to be two transports of one device. Surfaced at this level, not
+    /// only in pairwise detail, so the overview cannot imply independent corroboration.
+    let sameDevicePairKeys: Set<String>
+
     private let analysesByKind: [MetricKind: [PairwiseAnalysis]]
     private let sourceIDsByKind: [MetricKind: [String]]
 
-    init(store: HealthStore, range: TimeRange, alertThreshold: DiscrepancySeverity) {
+    init(
+        store: HealthStore,
+        range: TimeRange,
+        alertThreshold: DiscrepancySeverity,
+        hiddenSourceIDs: Set<String>
+    ) {
         let interval = range.interval
         // Estimates never participate in a device comparison, so they are dropped before
         // the metric list is built as well as inside the engine — otherwise a metric with
         // one real device plus the estimate source would look comparable.
         let outcome = store.readingsOutcome(in: interval)
         self.queryFailure = outcome.error
-        let readings = outcome.valueOrEmpty.filter { $0.provenance != .estimated }
+        // Comparison-only hiding. It filters this screen and nothing else: the source stays
+        // connected, keeps recording, and keeps its history.
+        let readings = outcome.valueOrEmpty.filter {
+            $0.provenance != .estimated && !hiddenSourceIDs.contains($0.sourceID)
+        }
 
         var sourceIDs: [MetricKind: Set<String>] = [:]
         for reading in readings {
@@ -264,7 +348,16 @@ private struct ComparisonSnapshot {
 
         let analyses = ComparisonEngine.allPairwiseAnalyses(from: readings, range: interval)
         self.analysesByKind = Dictionary(grouping: analyses, by: \.kind)
-        self.overview = PairwiseEvidenceOverview(analyses: analyses, alertThreshold: alertThreshold)
+        let sameDevice = PairwiseEvidenceOverview.sameDevicePairKeys(
+            analyses: analyses,
+            sources: store.sources
+        )
+        self.sameDevicePairKeys = sameDevice
+        self.overview = PairwiseEvidenceOverview(
+            analyses: analyses,
+            alertThreshold: alertThreshold,
+            sameDevicePairs: sameDevice
+        )
         self.incomplete = analyses.filter { $0.statistics == nil }
         self.flagged = analyses
             .filter { analysis in

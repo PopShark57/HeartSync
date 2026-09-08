@@ -75,12 +75,26 @@ struct DevicesView: View {
                     .tint(.blue)
                 }
                 .contextMenu {
-                    Button(source.isEnabled ? "Pause" : "Resume") {
+                    // Pause is a collection control: it disconnects the peripheral and
+                    // stops new readings. Someone who only wants a noisy device out of one
+                    // comparison wants the Sources menu on Compare instead, which changes
+                    // nothing about the connection — the label says so rather than leaving
+                    // them to discover the difference by losing data.
+                    Button(source.isEnabled ? "Pause collecting" : "Resume collecting") {
                         model.store.setEnabled(!source.isEnabled, forSource: source.id)
                         if source.isEnabled {
                             model.bluetooth.disconnect(sourceID: source.id)
                         } else {
                             model.bluetooth.reconnect(sourceID: source.id)
+                        }
+                    }
+                    if isHiddenFromComparison(source) {
+                        Button("Show in comparisons") {
+                            model.settings.snapshot.setComparisonHidden(false, forSource: source.id)
+                        }
+                    } else {
+                        Button("Hide from comparisons") {
+                            model.settings.snapshot.setComparisonHidden(true, forSource: source.id)
                         }
                     }
                     Button("Reconnect") { model.bluetooth.reconnect(sourceID: source.id) }
@@ -109,6 +123,10 @@ struct DevicesView: View {
         } footer: {
             Text("Works with any device using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles \u{2014} most chest straps, many rings, and standards-compliant pulse oximeters.")
         }
+    }
+
+    private func isHiddenFromComparison(_ source: DataSource) -> Bool {
+        model.settings.snapshot.comparisonHidden.contains(source.id)
     }
 
     private func statusColor(for state: PeripheralConnectionState, enabled: Bool) -> Color {

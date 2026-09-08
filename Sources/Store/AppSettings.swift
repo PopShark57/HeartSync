@@ -21,6 +21,23 @@ struct SettingsSnapshot: Codable, Hashable, Sendable {
     var autoSyncOura = true
     /// Seconds between Oura pulls, floor-limited to respect the API's rate limits.
     var ouraSyncInterval: TimeInterval = 900
+    /// Sources hidden from comparison screens only.
+    ///
+    /// Deliberately separate from `DataSource.isEnabled`, which governs collection: hiding
+    /// a noisy ring from a comparison must not disconnect it, stop it recording, or delete
+    /// anything. Optional so a `settings.json` written before this existed still decodes —
+    /// the same compatibility rule the source archive follows.
+    var comparisonHiddenSourceIDs: Set<String>? = nil
+
+    /// Hidden set with the optional collapsed away, for call sites that only read it.
+    var comparisonHidden: Set<String> { comparisonHiddenSourceIDs ?? [] }
+
+    /// Hides or reveals one source in comparisons. Collection is untouched either way.
+    mutating func setComparisonHidden(_ hidden: Bool, forSource id: String) {
+        var current = comparisonHidden
+        if hidden { current.insert(id) } else { current.remove(id) }
+        comparisonHiddenSourceIDs = current.isEmpty ? nil : current
+    }
 }
 
 @MainActor
