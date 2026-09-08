@@ -6,28 +6,40 @@ Reviewed `main` at commit
 [`ca8f07a7993572722a0d09967f8a8c416acb4389`](https://github.com/PopShark57/HeartSync/commit/ca8f07a7993572722a0d09967f8a8c416acb4389),
 including the native watchOS companion and complications.
 
-**Items 17–25 below are open recommendations, not implemented changes.** The older audit
-and its implementation notes are retained below as history. Its original “Current behavior”
-paragraphs describe the earlier checkout, not the app reviewed here. Existing SQLite storage,
-pairwise evidence grades, source-relationship warnings, recovery screens, CI, and watch
-features should be extended rather than proposed again from scratch.
+**Implementation status (2026-09-08): items 17–25 have since been implemented.** Items
+17–20, 24 and 25 are complete against their “Done when” paragraphs. Items 21, 22 and 23
+are partially complete; each section below records exactly what was deferred and why. The
+“Observed behavior” paragraphs describe the code as reviewed, before those changes.
+
+The older audit and its implementation notes are retained below as history. Its original
+“Current behavior” paragraphs describe the earlier checkout, not the app reviewed here.
+Existing SQLite storage, pairwise evidence grades, source-relationship warnings, recovery
+screens, CI, and watch features were extended rather than rebuilt.
+
+**Validation limits for that implementation work.** It was verified by
+`xcodebuild build-for-testing` for the iOS scheme and a watchOS Simulator build of the
+watch app, plus 118 tests executed against the real source files through a scratch SwiftPM
+harness (no iOS simulator runtime is installed on the machine used). The tests have **not**
+been executed in the real hosted bundle; CI is the first place that happens. No physical
+device run, no profiling, and no on-device latency or memory measurement was performed, so
+every remaining performance and device claim in item 21 and item 25 is still unvalidated.
 
 This is a source review, not an on-device bug reproduction or a completed release audit.
 Each item distinguishes observed code behavior from a product proposal or performance risk.
 
 ### Priorities and suggested sequence
 
-| Item | Priority | Next improvement | Basis |
-| --- | --- | --- | --- |
-| 17 | P1 | Distinguish database query failures from empty results | Observed error handling |
-| 18 | P1 | Key chart series by stable source ID | Observed chart identity issue |
-| 19 | P1 | Carry compaction semantics into metric summaries and full-history exports | Remaining presentation/export gap |
-| 20 | P1 | Qualify pairs by actual measurement timing and show gaps honestly | Analysis refinement |
-| 21 | P1 | Keep large queries, analysis, and exports responsive | Code-supported performance risk; measure on device |
-| 22 | P2 | Add saved comparison sessions and custom date ranges | Product proposal |
-| 23 | P2 | Add comparison-only source selection and editable source relationships | Product proposal |
-| 24 | P2 | Keep range controls available in the empty Compare screen | Observed navigation dead end |
-| 25 | P1 | Exercise the watch workout lifecycle with deterministic tests | Validation gap |
+| Item | Priority | Next improvement | Basis | Status |
+| --- | --- | --- | --- | --- |
+| 17 | P1 | Distinguish database query failures from empty results | Observed error handling | Done |
+| 18 | P1 | Key chart series by stable source ID | Observed chart identity issue | Done |
+| 19 | P1 | Carry compaction semantics into metric summaries and full-history exports | Remaining presentation/export gap | Done |
+| 20 | P1 | Qualify pairs by actual measurement timing and show gaps honestly | Analysis refinement | Done |
+| 21 | P1 | Keep large queries, analysis, and exports responsive | Code-supported performance risk; measure on device | Partial — snapshots and export moved off the render path; database work still on the main actor and no device budgets measured |
+| 22 | P2 | Add saved comparison sessions and custom date ranges | Product proposal | Partial — exact periods, saved sessions and revisit disclosure done; no guided capture screen |
+| 23 | P2 | Add comparison-only source selection and editable source relationships | Product proposal | Partial — comparison-only selection and same-device disclosure done; relationships remain read-only |
+| 24 | P2 | Keep range controls available in the empty Compare screen | Observed navigation dead end | Done |
+| 25 | P1 | Exercise the watch workout lifecycle with deterministic tests | Validation gap | Done (deterministic suite); physical-device recovery and save still unvalidated |
 
 **P1** addresses correctness, reliability, or release confidence. **P2** improves product
 usability after those foundations.
