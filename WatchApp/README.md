@@ -113,8 +113,14 @@ runtime results must be reported separately.
 - Xcode emits its existing metadata-extraction warning for targets without AppIntents;
   the complication extension's App Intent metadata is generated successfully.
 - A temporary native SwiftPM harness executes real source files via symlinks, including the
-  watch payload/projection tests and related store/parser/HRV/export regressions. It does not
-  compile or exercise `WatchWorkoutManager`, WatchConnectivity, or watch SwiftUI.
+  watch payload/projection tests and related store/parser/HRV/export regressions.
+- The workout lifecycle is now covered by `Tests/Watch/WorkoutLifecycleTests.swift`, which runs
+  in the hosted iOS bundle in CI. It exercises `WorkoutLifecycle` in `Shared`, the transition
+  rules `WatchWorkoutManager` drives: duplicate Start/Stop taps, stale callbacks from a
+  discarded or replaced session, interrupted collection, save failure then retry, double-save
+  refusal, discard, and recovered running/paused/stopped sessions. It does **not** exercise
+  HealthKit itself, WatchConnectivity, or watch SwiftUI: `WatchWorkoutManager`, the adapter
+  that owns `HKWorkoutSession` and `HKLiveWorkoutBuilder`, is still only compiled, not run.
 - On 2026-09-05 the external native harness passed **114 tests**, including **11 complication
   tests** for source selection, age transitions, empty/estimated states, cache round-trip,
   duplicate/late deliveries, reset persistence, invalid/corrupt/unavailable storage, and links.
@@ -135,7 +141,17 @@ Before release, use a signed paired iPhone/watch to check:
 3. Denied Workout and denied Heart Rate permissions, normal sensor acquisition, pause/resume,
    elapsed time, watch lock/background operation, and interruption by another workout app.
 4. End/review/save, save failure/retry, discard, and recovery after a terminated active workout.
-   Check Apple Health for the saved workout and sample provenance.
+   Check Apple Health for the saved workout and sample provenance. Specifically confirm on
+   hardware, because none of it is provable from the deterministic suite:
+   - interruption by another workout app leaves a reviewable workout that still saves;
+   - relaunch after the system terminates an active session recovers it in the right state,
+     and a session recovered after it had stopped is still reviewable rather than lost;
+   - a save started while the watch is locked reports success honestly and the workout is
+     present in Health after unlocking;
+   - heart-rate samples reach iPhone only after Health syncs, and reimport is idempotent —
+     record the delay observed rather than assuming it is immediate.
+   Record these on a signed build, separately from the deterministic tests. A green CI run is
+   evidence about the transition rules only.
 5. HealthKit sync to iPhone, reimport without duplicate UUIDs, and comparison against an enabled
    BLE source. Confirm no watch import is written back by the phone.
 6. Both complications in each family and in the Smart Stack; choose different metrics, verify
