@@ -13,6 +13,7 @@ final class AppModel {
 
     let store = HealthStore(persistenceEnabled: !AppModel.debugDataIsolationEnabled)
     let settings = AppSettings(persistenceEnabled: !AppModel.debugDataIsolationEnabled)
+    let sessions = ComparisonSessionStore(persistenceEnabled: !AppModel.debugDataIsolationEnabled)
     let bluetooth = BluetoothManager()
     let healthKit = HealthKitManager()
     let oura = OuraManager()
@@ -82,6 +83,7 @@ final class AppModel {
             }
         }
         await settings.loadIfNeeded()
+        await sessions.loadIfNeeded()
         await store.loadIfNeeded()
         guard store.loadState == .loaded else {
             // Do not attach live transports to an inconclusively loaded archive. Their readings

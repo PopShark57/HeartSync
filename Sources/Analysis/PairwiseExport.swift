@@ -66,6 +66,14 @@ enum PairwiseExporter {
         "signed_difference_a_minus_b",
         "absolute_difference",
         "severity",
+        // Appended in the timing-semantics change. Columns are append-only, so a consumer
+        // written against the earlier schema keeps working on the columns it knows.
+        "source_a_first_observation_utc",
+        "source_a_last_observation_utc",
+        "source_b_first_observation_utc",
+        "source_b_last_observation_utc",
+        "timing_separation_seconds",
+        "timing_quality",
     ]
 
     /// Builds CSV observations and a human-readable methodology/limitations summary.
@@ -131,34 +139,44 @@ enum PairwiseExporter {
             let sourceAModel = safeSpreadsheetMetadata(sourceA.model)
             let sourceBName = safeSpreadsheetMetadata(sourceB.name)
             let sourceBModel = safeSpreadsheetMetadata(sourceB.model)
-            let fields = [
-                formatting.iso8601UTC(observation.start),
-                formatting.iso8601UTC(observation.end),
-                analysis.kind.rawValue,
-                analysis.kind.exportUnit,
-                sourceA.id,
-                sourceAName,
-                sourceA.transportRawValue,
-                sourceAModel,
-                decimal(observation.sourceA.value),
-                observation.sourceA.sampleCount.map(String.init) ?? "",
-                observation.sourceA.standardDeviation.map(decimal) ?? "",
-                observation.sourceA.provenance.rawValue,
-                observation.sourceA.isCompacted ? "compacted_window_median" : "raw",
-                sourceB.id,
-                sourceBName,
-                sourceB.transportRawValue,
-                sourceBModel,
-                decimal(observation.sourceB.value),
-                observation.sourceB.sampleCount.map(String.init) ?? "",
-                observation.sourceB.standardDeviation.map(decimal) ?? "",
-                observation.sourceB.provenance.rawValue,
-                observation.sourceB.isCompacted ? "compacted_window_median" : "raw",
-                decimal(observation.pairedMean),
-                decimal(observation.signedDifference),
-                decimal(observation.absoluteDifference),
-                severityMachineValue(observation.severity),
-            ]
+            // Appended one at a time: a single 32-element heterogeneous literal
+            // exceeds what the type checker will solve in reasonable time.
+            var fields: [String] = []
+            fields.reserveCapacity(csvColumns.count)
+            fields.append(formatting.iso8601UTC(observation.start))
+            fields.append(formatting.iso8601UTC(observation.end))
+            fields.append(analysis.kind.rawValue)
+            fields.append(analysis.kind.exportUnit)
+            fields.append(sourceA.id)
+            fields.append(sourceAName)
+            fields.append(sourceA.transportRawValue)
+            fields.append(sourceAModel)
+            fields.append(decimal(observation.sourceA.value))
+            fields.append(observation.sourceA.sampleCount.map(String.init) ?? "")
+            fields.append(observation.sourceA.standardDeviation.map(decimal) ?? "")
+            fields.append(observation.sourceA.provenance.rawValue)
+            fields.append(observation.sourceA.isCompacted ? "compacted_window_median" : "raw")
+            fields.append(sourceB.id)
+            fields.append(sourceBName)
+            fields.append(sourceB.transportRawValue)
+            fields.append(sourceBModel)
+            fields.append(decimal(observation.sourceB.value))
+            fields.append(observation.sourceB.sampleCount.map(String.init) ?? "")
+            fields.append(observation.sourceB.standardDeviation.map(decimal) ?? "")
+            fields.append(observation.sourceB.provenance.rawValue)
+            fields.append(observation.sourceB.isCompacted ? "compacted_window_median" : "raw")
+            fields.append(decimal(observation.pairedMean))
+            fields.append(decimal(observation.signedDifference))
+            fields.append(decimal(observation.absoluteDifference))
+            fields.append(severityMachineValue(observation.severity))
+            // Empty means unknown and never zero: a compacted median has no surviving
+            // contributing timestamps and must not be reported as instantaneous.
+            fields.append(observation.sourceA.observedInterval.map { formatting.iso8601UTC($0.start) } ?? "")
+            fields.append(observation.sourceA.observedInterval.map { formatting.iso8601UTC($0.end) } ?? "")
+            fields.append(observation.sourceB.observedInterval.map { formatting.iso8601UTC($0.start) } ?? "")
+            fields.append(observation.sourceB.observedInterval.map { formatting.iso8601UTC($0.end) } ?? "")
+            fields.append(observation.timingSeparation.map(decimal) ?? "")
+            fields.append(observation.timing.rawValue)
             rows.append(fields.map(csvEscape).joined(separator: ","))
         }
 
@@ -245,6 +263,11 @@ enum PairwiseExporter {
             "Evidence grade: \(analysis.evidence.grade.title)",
             "Evidence caveats: \(analysis.evidence.reasons.joined(separator: "; "))",
             "Analyzed span (UTC): \(spanDescription(analysis.analyzedSpan, formatting: formatting))",
+            "Timing tolerance (seconds): \(analysis.kind.timingTolerance.map(decimal) ?? "Not applicable")",
+            "Median timing separation (seconds): \(analysis.evidence.medianTimingSeparation.map(decimal) ?? "Unknown")",
+            "Temporally separated windows: \(analysis.evidence.temporallySeparatedCount)",
+            "Windows with unknown timing: \(analysis.evidence.unknownTimingCount)",
+            "Paired coverage of analyzed span: \(analysis.evidence.coverageFraction.map { decimal($0 * 100) + "%" } ?? "Unknown")",
         ]
         if let relationshipA = sourceA.relationshipID,
            relationshipA == sourceB.relationshipID {
@@ -299,9 +322,10 @@ enum PairwiseExporter {
             "",
             "Methodology",
             "Readings are placed into Unix-epoch-aligned windows. Each source is represented by the median of its non-estimated, plausible samples in a window. A compacted_window_median row is a fixed historical aggregate, not one raw sample; blank count or spread means the older archive did not retain that fact. Only windows containing both ordered sources are paired. The signed difference is A minus B. Ready analyses use the sample standard deviation (n - 1); 95% limits of agreement are mean bias plus or minus 1.96 times that standard deviation.",
+            "Pairing is by window occupancy, not by proximity in time: two readings in one window are paired however far apart they fall inside it, and two readings seconds apart on opposite sides of a boundary are not paired. Each paired window is therefore also qualified by timing. Each source's representative instant is the median of its contributing readings' midpoints; timing_separation_seconds is the distance between the two. A pair within the timing tolerance is simultaneous, one beyond it is separated, one where a compacted row has discarded its contributing timestamps is unknown, and a metric that summarises a whole interval (a daily resting rate, a VO2 max) is notApplicable. Unknown is never counted as simultaneous. Separated and unknown windows still contribute to every statistic above; they lower the evidence grade rather than being removed from the paired set. No timestamp is adjusted to improve agreement.",
             "",
             "Limitations",
-            "This is a descriptive device comparison, not a test of statistical significance. Neither source is treated as a medical reference or identified as correct. Compacted windows are final: discarded raw samples cannot accept later corrections or upstream deletions. Sampling schedules, sensor placement, motion, vendor processing, and a small number of paired windows can all affect the result. HeartSync is not a medical device; do not use this export to diagnose or treat a condition.",
+            "This is a descriptive device comparison, not a test of statistical significance. Neither source is treated as a medical reference or identified as correct. Compacted windows are final: discarded raw samples cannot accept later corrections or upstream deletions. Paired coverage below 100% means the two sources shared only part of the analyzed span, so the result describes the moments they overlapped rather than the whole period. Sampling schedules, sensor placement, motion, vendor processing, and a small number of paired windows can all affect the result. HeartSync is not a medical device; do not use this export to diagnose or treat a condition.",
         ]
 
         return lines.joined(separator: "\n") + "\n"

@@ -265,5 +265,8 @@ actor ReadingArchive {
         static let sources = "sources.json"
         static let settings = "settings.json"
         static let ouraDashboard = "oura-dashboard-v1.json"
+        /// Saved comparison sessions. Settings-shaped data, not a second reading store:
+        /// a session records *which* readings to look at, never copies of them.
+        static let comparisonSessions = "comparison-sessions-v1.json"
     }
 }

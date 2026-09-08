@@ -5,63 +5,285 @@ import SwiftUI
 struct CompareView: View {
     @Environment(AppModel.self) private var model
     @State private var range: TimeRange = .day
+    /// Bumped by the retry button so the load key changes and the query runs again. It
+    /// re-reads only; nothing here resets or reimports stored data.
+    @State private var retryToken = 0
+    @State private var snapshot: ComparisonSnapshot?
+    @State private var isLoading = false
+    /// Non-nil when the user has opened a saved session: the analysed span is then fixed
+    /// rather than sliding with the clock.
+    @State private var activeSession: ComparisonSession?
+    @State private var showingSessions = false
+    @State private var savingSession = false
+    @State private var revisitNotice: String?
+
+    /// The span actually analysed. A saved session pins it; otherwise it rolls.
+    private var period: ComparisonPeriod {
+        activeSession.map { .fixed($0.interval) } ?? .rolling(range)
+    }
+
+    /// Everything a snapshot depends on. When this changes the previous load is cancelled
+    /// and a new one starts; when it has not changed, an unrelated view update reuses the
+    /// snapshot instead of re-querying and re-windowing the whole range.
+    private struct LoadKey: Hashable {
+        var generation: Int
+        var range: TimeRange
+        var alertThreshold: DiscrepancySeverity
+        var sessionID: UUID?
+        var enabledSourceIDs: [String]
+        var hiddenSourceIDs: [String]
+        var retryToken: Int
+    }
+
+    private var loadKey: LoadKey {
+        LoadKey(
+            generation: model.store.changeToken,
+            range: range,
+            alertThreshold: model.settings.snapshot.discrepancyThreshold,
+            sessionID: activeSession?.id,
+            enabledSourceIDs: model.store.enabledSources.map(\.id).sorted(),
+            hiddenSourceIDs: model.settings.snapshot.comparisonHidden.sorted(),
+            retryToken: retryToken
+        )
+    }
 
     var body: some View {
-        // Resolved once per update and handed down. Every subview reading its own
-        // computed property would re-window the whole archive, and `TimeRange.interval`
-        // is relative to `.now`, so repeated calls would also compare slightly different
-        // spans within a single frame.
-        let snapshot = ComparisonSnapshot(
-            store: model.store,
-            range: range,
-            alertThreshold: model.settings.snapshot.discrepancyThreshold
-        )
-
         NavigationStack {
-            Group {
-                if snapshot.metrics.isEmpty {
-                    EmptyStateView(
-                        systemImage: "chart.xyaxis.line",
-                        title: "Nothing to compare yet",
-                        message: "Comparison needs measured data from two or more devices for the same metric in the selected range. Their timestamps do not need to overlap. Add another device, or widen the range."
-                    )
+            // The range control lives outside the result content on purpose. When a narrow
+            // range holds nothing comparable, the empty state tells the user to widen the
+            // range \u{2014} so the control that widens it has to still be on screen.
+            List {
+                Section {
+                    if let session = activeSession {
+                        sessionBanner(session)
+                    } else {
+                        Picker("Range", selection: $range) {
+                            ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                        .accessibilityIdentifier("compare.range")
+                    }
+                }
+
+                if let snapshot {
+                    content(snapshot)
                 } else {
-                    List {
-                        Section {
-                            Picker("Range", selection: $range) {
-                                ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
-                            }
-                            .pickerStyle(.segmented)
-                            .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("Loading comparison\u{2026}")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
                         }
-
-                        Section("Metrics measured by more than one device") {
-                            ForEach(snapshot.metrics) { kind in
-                                NavigationLink {
-                                    MetricDetailView(kind: kind, initialRange: range)
-                                } label: {
-                                    ComparisonSummaryRow(
-                                        kind: kind,
-                                        analyses: snapshot.analyses(for: kind),
-                                        sourceIDs: snapshot.sourceIDs(for: kind)
-                                    )
-                                }
-                            }
-                        }
-
-                        Section {
-                            evidenceOverview(snapshot)
-                        } header: {
-                            Text("Evidence overview")
-                                .accessibilityIdentifier("compare.root")
-                        } footer: {
-                            Text("HeartSync uses median values in epoch-aligned windows and excludes estimates. Ready analyses use mean bias and 95% limits of agreement; insufficient overlap is never treated as agreement.")
-                        }
+                        .accessibilityIdentifier("compare.loading")
                     }
                 }
             }
             .navigationTitle("Compare")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Button("Saved sessions\u{2026}", systemImage: "bookmark") { showingSessions = true }
+                        Button("Save this period\u{2026}", systemImage: "bookmark.square") { savingSession = true }
+                        if activeSession != nil {
+                            Button("Back to rolling range", systemImage: "clock.arrow.circlepath") {
+                                activeSession = nil
+                                revisitNotice = nil
+                            }
+                        }
+                    } label: {
+                        Label("Sessions", systemImage: "bookmark")
+                    }
+                    .accessibilityIdentifier("compare.sessions")
+                }
+            }
+            .sheet(isPresented: $showingSessions) {
+                ComparisonSessionsView { session in openSession(session) }
+            }
+            .sheet(isPresented: $savingSession) {
+                SaveComparisonSessionView(
+                    start: period.interval.start,
+                    end: period.interval.end
+                )
+            }
+            // `.task(id:)` cancels the in-flight load whenever the key changes, so a slow
+            // month-range load cannot land after the user has switched back to an hour.
+            .task(id: loadKey) {
+                let key = loadKey
+                isLoading = true
+                defer { isLoading = false }
+                // One frame of slack so dragging across the range picker starts a single
+                // load rather than one per intermediate selection.
+                try? await Task.sleep(for: .milliseconds(16))
+                guard !Task.isCancelled else { return }
+                let resolved = ComparisonSnapshot(
+                    store: model.store,
+                    period: period,
+                    alertThreshold: model.settings.snapshot.discrepancyThreshold,
+                    hiddenSourceIDs: model.settings.snapshot.comparisonHidden
+                )
+                // Rejects a late result: the selection may have moved on while this ran.
+                guard !Task.isCancelled, key == loadKey else { return }
+                snapshot = resolved
+            }
         }
+    }
+
+    @ViewBuilder
+    private func content(_ snapshot: ComparisonSnapshot) -> some View {
+        Group {
+                if let failure = snapshot.queryFailure {
+                    Section {
+                        HistoryUnavailableView(error: failure) { retryToken &+= 1 }
+                            .accessibilityIdentifier("compare.unavailable")
+                    }
+                } else if snapshot.metrics.isEmpty {
+                    Section {
+                        emptyState(snapshot.emptyReason)
+                            .accessibilityIdentifier("compare.empty")
+                    }
+                } else {
+                    Section("Metrics measured by more than one device") {
+                        ForEach(snapshot.metrics) { kind in
+                            NavigationLink {
+                                MetricDetailView(kind: kind, initialRange: range)
+                            } label: {
+                                ComparisonSummaryRow(
+                                    kind: kind,
+                                    analyses: snapshot.analyses(for: kind),
+                                    sourceIDs: snapshot.sourceIDs(for: kind)
+                                )
+                            }
+                        }
+                    }
+
+                    Section {
+                        evidenceOverview(snapshot)
+                    } header: {
+                        Text("Evidence overview")
+                            .accessibilityIdentifier("compare.root")
+                    } footer: {
+                        Text(overviewFooter(snapshot))
+                    }
+                }
+        }
+    }
+
+    /// Shows that a fixed span is in force, and whether the data behind it has moved.
+    @ViewBuilder
+    private func sessionBanner(_ session: ComparisonSession) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(session.displayTitle, systemImage: "bookmark.fill")
+                .font(.subheadline.weight(.semibold))
+            Text("\(session.interval.start.formatted(date: .abbreviated, time: .shortened)) \u{2013} \(session.interval.end.formatted(date: .omitted, time: .shortened))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !session.context.isEmpty {
+                Text(session.context)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            // A saved session is a saved *selection*. Data for its period keeps arriving,
+            // so a revisit says when the result is no longer the one that was seen.
+            if let revisitNotice {
+                Label(revisitNotice, systemImage: "arrow.down.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            let missing = session.missingSourceIDs(in: model.store.sources)
+            if !missing.isEmpty {
+                Label(
+                    "\(missing.count) saved \(missing.count == 1 ? "device is" : "devices are") no longer set up, so this is not the comparison that was saved.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("compare.session")
+    }
+
+    /// Opens a saved session and discloses what has changed since it was last viewed.
+    private func openSession(_ session: ComparisonSession) {
+        activeSession = session
+        revisitNotice = nil
+        Task {
+            // Counted from the same fixed interval the analysis uses, so the disclosure
+            // describes the session's own period rather than the whole database.
+            let outcome = model.store.readingsOutcome(in: session.interval, enabledOnly: false)
+            guard let readings = outcome.value else { return }
+            revisitNotice = session.revisitDisclosure(currentReadingCount: readings.count)
+            await model.sessions.noteViewed(id: session.id, readingCount: readings.count)
+        }
+    }
+
+    /// Chooses which sources this comparison uses, without touching collection.
+    ///
+    /// Deliberately separate from Pause on the Devices tab, which disconnects the
+    /// peripheral and stops it recording. Hiding a noisy ring here changes this screen
+    /// only: the device stays connected and its history is untouched, so the choice is
+    /// free to make and free to undo.
+    @ViewBuilder
+    private var sourceSelectionMenu: some View {
+        @Bindable var settings = model.settings
+        let sources = model.store.enabledSources
+        Menu {
+            if sources.isEmpty {
+                Text("No collecting devices yet")
+            } else {
+                ForEach(sources) { source in
+                    let hidden = settings.snapshot.comparisonHidden.contains(source.id)
+                    Button {
+                        settings.snapshot.setComparisonHidden(!hidden, forSource: source.id)
+                    } label: {
+                        Label(source.displayName, systemImage: hidden ? "circle" : "checkmark.circle.fill")
+                    }
+                }
+                if !settings.snapshot.comparisonHidden.isEmpty {
+                    Divider()
+                    Button("Show all in comparison") {
+                        settings.snapshot.comparisonHiddenSourceIDs = nil
+                    }
+                }
+            }
+            Divider()
+            Text("Hiding a device here does not disconnect it or delete its data.")
+        } label: {
+            Label("Sources", systemImage: hiddenCount > 0 ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+        }
+        .accessibilityIdentifier("compare.sources")
+        .accessibilityLabel(
+            hiddenCount == 0
+                ? "Comparison sources, all included"
+                : "Comparison sources, \(hiddenCount) hidden"
+        )
+    }
+
+    private var hiddenCount: Int {
+        let enabled = Set(model.store.enabledSources.map(\.id))
+        return model.settings.snapshot.comparisonHidden.intersection(enabled).count
+    }
+
+    /// Distinguishes an empty install from a range that happens to hold nothing, because
+    /// only one of those is fixed by widening the range.
+    @ViewBuilder
+    private func emptyState(_ reason: ComparisonEmptyReason) -> some View {
+        // Widening is only offered for a rolling range. A saved session's span is fixed by
+        // definition, so silently widening it would analyse a different period.
+        let wider = activeSession == nil ? range.wider : nil
+        EmptyStateView(
+            systemImage: reason.systemImage,
+            title: reason.title,
+            message: reason.message(range: range, wider: wider),
+            actionTitle: reason.suggestsWidening ? wider.map { "Show \($0.title.lowercased())" } : nil,
+            action: reason.suggestsWidening ? wider.map { next in { range = next } } : nil
+        )
     }
 
     @ViewBuilder
@@ -89,7 +311,9 @@ struct CompareView: View {
                 )
                 .foregroundStyle(.green)
                 .font(.subheadline.weight(.semibold))
-                Text("\(snapshot.overview.readyCount) ready \(snapshot.overview.readyCount == 1 ? "pair" : "pairs") assessed across \(range.title.lowercased()).")
+                // Names the span actually analysed: with a session open that is the saved
+                // period, not the rolling preset the picker would otherwise imply.
+                Text("\(snapshot.overview.readyCount) ready \(snapshot.overview.readyCount == 1 ? "pair" : "pairs") assessed across \(period.title.lowercased()).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if !snapshot.incomplete.isEmpty {
@@ -122,6 +346,24 @@ struct CompareView: View {
         }
     }
 
+    /// Says plainly when some of the listed pairs are one device seen twice.
+    ///
+    /// Two paths from one ring disagreeing is a real sync problem and stays inspectable,
+    /// but it is not two devices corroborating each other, and the overview must not read
+    /// as though it were.
+    private func overviewFooter(_ snapshot: ComparisonSnapshot) -> String {
+        let base = "HeartSync uses median values in epoch-aligned windows and excludes estimates. Ready analyses use mean bias and 95% limits of agreement; insufficient overlap is never treated as agreement."
+        var extra: [String] = []
+        if snapshot.overview.sameDevicePairCount > 0 {
+            let count = snapshot.overview.sameDevicePairCount
+            extra.append("\(count) of these \(count == 1 ? "pairs is" : "pairs are") two paths to the same device rather than two independent devices; \(count == 1 ? "it is" : "they are") useful for spotting a sync problem but \(count == 1 ? "does" : "do") not corroborate a measurement.")
+        }
+        if hiddenCount > 0 {
+            extra.append("\(hiddenCount) \(hiddenCount == 1 ? "device is" : "devices are") hidden from this comparison. \(hiddenCount == 1 ? "It is" : "They are") still connected and still recording.")
+        }
+        return ([base] + extra).joined(separator: " ")
+    }
+
     private func incompleteEvidenceSummary(_ items: [PairwiseAnalysis]) -> String {
         let noOverlap = items.filter {
             if case .noOverlap = $0.state { return true }
@@ -145,21 +387,47 @@ struct CompareView: View {
 @MainActor
 private struct ComparisonSnapshot {
     let metrics: [MetricKind]
+    /// Why `metrics` is empty. Only meaningful when it is.
+    let emptyReason: ComparisonEmptyReason
+    /// Set when the history query itself failed. An empty comparison caused by a failed
+    /// read must never be presented as "you have no data"; it is a retryable error.
+    let queryFailure: HealthStoreQueryError?
     let overview: PairwiseEvidenceOverview
     /// Ready pairs outside tolerance and at or above the user's alert threshold, worst first.
     let flagged: [PairwiseAnalysis]
     /// Pairs with no overlap or too few paired windows, in any metric.
     let incomplete: [PairwiseAnalysis]
 
+    /// The span actually analysed, so callers can report it rather than re-deriving it.
+    let interval: DateInterval
+
+    /// Pairs confirmed to be two transports of one device. Surfaced at this level, not
+    /// only in pairwise detail, so the overview cannot imply independent corroboration.
+    let sameDevicePairKeys: Set<String>
+
     private let analysesByKind: [MetricKind: [PairwiseAnalysis]]
     private let sourceIDsByKind: [MetricKind: [String]]
 
-    init(store: HealthStore, range: TimeRange, alertThreshold: DiscrepancySeverity) {
-        let interval = range.interval
+    init(
+        store: HealthStore,
+        period: ComparisonPeriod,
+        alertThreshold: DiscrepancySeverity,
+        hiddenSourceIDs: Set<String>
+    ) {
+        // Resolved once. A fixed period returns the same seconds on every read, which is
+        // what makes a saved session re-openable; a rolling one resolves against `.now`.
+        let interval = period.interval
+        self.interval = interval
         // Estimates never participate in a device comparison, so they are dropped before
         // the metric list is built as well as inside the engine — otherwise a metric with
         // one real device plus the estimate source would look comparable.
-        let readings = store.readings(in: interval).filter { $0.provenance != .estimated }
+        let outcome = store.readingsOutcome(in: interval)
+        self.queryFailure = outcome.error
+        // Comparison-only hiding. It filters this screen and nothing else: the source stays
+        // connected, keeps recording, and keeps its history.
+        let readings = outcome.valueOrEmpty.filter {
+            $0.provenance != .estimated && !hiddenSourceIDs.contains($0.sourceID)
+        }
 
         var sourceIDs: [MetricKind: Set<String>] = [:]
         for reading in readings {
@@ -168,9 +436,31 @@ private struct ComparisonSnapshot {
         self.sourceIDsByKind = sourceIDs.mapValues { $0.sorted() }
         self.metrics = MetricKind.allCases.filter { (sourceIDs[$0]?.count ?? 0) >= 2 }
 
+        // Resolved from the same read as the metric list. `readingCount` is a COUNT(*) on
+        // the indexed table, not a materialization of the history, and it is only consulted
+        // when the range itself came back empty.
+        let sourcesInRange = Set(readings.map(\.sourceID)).count
+        // Only consulted when the range came back empty, and only trusted when it
+        // succeeded: a failed COUNT(*) must not be read as "this install is empty".
+        let storedCount = sourcesInRange > 0 ? nil : store.readingCountOutcome.value
+        self.emptyReason = ComparisonEmptyReason.resolve(
+            comparableMetricCount: self.metrics.count,
+            sourcesInRange: sourcesInRange,
+            hasStoredReadings: sourcesInRange > 0 || (storedCount ?? 0) > 0
+        )
+
         let analyses = ComparisonEngine.allPairwiseAnalyses(from: readings, range: interval)
         self.analysesByKind = Dictionary(grouping: analyses, by: \.kind)
-        self.overview = PairwiseEvidenceOverview(analyses: analyses, alertThreshold: alertThreshold)
+        let sameDevice = PairwiseEvidenceOverview.sameDevicePairKeys(
+            analyses: analyses,
+            sources: store.sources
+        )
+        self.sameDevicePairKeys = sameDevice
+        self.overview = PairwiseEvidenceOverview(
+            analyses: analyses,
+            alertThreshold: alertThreshold,
+            sameDevicePairs: sameDevice
+        )
         self.incomplete = analyses.filter { $0.statistics == nil }
         self.flagged = analyses
             .filter { analysis in

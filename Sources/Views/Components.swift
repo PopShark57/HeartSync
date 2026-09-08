@@ -305,3 +305,38 @@ struct SignalBars: View {
         .accessibilityLabel("Signal strength \(bars) of 3")
     }
 }
+
+/// A history query failed after startup succeeded.
+///
+/// This is deliberately not an empty state. An empty state says "there is nothing here",
+/// which is a claim about the user's data; a failed read knows nothing about the data and
+/// must not imply it is gone. Retrying re-runs the query only — nothing here deletes,
+/// resets, or reimports, because a read error is not evidence of corruption.
+struct HistoryUnavailableView: View {
+    var error: HealthStoreQueryError
+    var retry: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label {
+                Text("History temporarily unavailable")
+                    .font(.subheadline.weight(.semibold))
+            } icon: {
+                Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
+                    .foregroundStyle(.orange)
+            }
+            Text(error.errorDescription ?? "The measurement database could not be read.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Your stored measurements have not been changed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Try again", action: retry)
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("history.retry")
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+    }
+}

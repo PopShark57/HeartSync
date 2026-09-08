@@ -7,6 +7,73 @@ private struct CompactionBucket: Hashable {
     let sourceID: String
 }
 
+/// Why a history query could not answer.
+///
+/// The point of naming these is that "no rows" and "the query failed" are different facts
+/// with opposite meanings for the user, and the app used to render both as an empty screen.
+enum HealthStoreQueryError: LocalizedError, Equatable {
+    /// The database handle could not be opened at all.
+    case storeUnavailable(String)
+    /// Startup has not finished, or it finished by failing. Readings may exist on disk.
+    case notLoaded
+    /// SQLite answered with an error, or a stored row could not be decoded.
+    case queryFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .storeUnavailable(let detail): "The measurement database could not be opened. \(detail)"
+        case .notLoaded:                    "The measurement database has not finished loading."
+        case .queryFailed(let detail):      "The measurement database could not be read. \(detail)"
+        }
+    }
+}
+
+/// The result of a history query: rows, or a reason there are none.
+///
+/// Deliberately not `[Reading]?` — a nil would collapse back into the same ambiguity this
+/// type exists to remove. Callers that genuinely cannot present an error (a background
+/// projection, a legacy call site) use `valueOrEmpty`, and that spelling is intentionally
+/// visible at the call site so the choice to discard the failure is a decision someone made.
+enum HealthStoreQueryOutcome<Value: Sendable>: Sendable {
+    case success(Value)
+    case failure(HealthStoreQueryError)
+
+    var value: Value? {
+        guard case let .success(value) = self else { return nil }
+        return value
+    }
+
+    var error: HealthStoreQueryError? {
+        guard case let .failure(error) = self else { return nil }
+        return error
+    }
+
+    var isFailure: Bool { error != nil }
+
+    func get() throws -> Value {
+        switch self {
+        case .success(let value): return value
+        case .failure(let error): throw error
+        }
+    }
+
+    /// Transforms a successful value, preserving a failure unchanged.
+    func map<Mapped: Sendable>(_ transform: (Value) -> Mapped) -> HealthStoreQueryOutcome<Mapped> {
+        switch self {
+        case .success(let value): .success(transform(value))
+        case .failure(let error): .failure(error)
+        }
+    }
+}
+
+extension HealthStoreQueryOutcome where Value: RangeReplaceableCollection {
+    /// Rows on success, an empty collection on failure. Only for call sites that have no
+    /// way to show an error; anything user-facing should branch on the outcome instead.
+    var valueOrEmpty: Value {
+        value ?? Value()
+    }
+}
+
 /// The app's single source/readings boundary, backed by one transactional indexed SQLite
 /// database. The public query shape is preserved so transport and analysis code do not own
 /// persistence details.
@@ -82,13 +149,19 @@ final class HealthStore {
     var readings: [Reading] {
         _ = dataGeneration
         if persistenceEnabled, loadState != .loaded { return unavailableBuffer }
-        return (try? database?.allReadings()) ?? []
+        return query { try $0.allReadings() }.valueOrEmpty
     }
 
     var readingCount: Int {
+        readingCountOutcome.value ?? 0
+    }
+
+    /// Distinguishes "the database holds nothing" from "the count could not be read",
+    /// which the Compare empty state depends on to avoid claiming an empty install.
+    var readingCountOutcome: HealthStoreQueryOutcome<Int> {
         _ = dataGeneration
-        if persistenceEnabled, loadState != .loaded { return unavailableBuffer.count }
-        return (try? database?.readingCount()) ?? 0
+        if persistenceEnabled, loadState != .loaded { return .success(unavailableBuffer.count) }
+        return query { try $0.readingCount() }
     }
 
     // MARK: - Sources
@@ -371,20 +444,62 @@ final class HealthStore {
         }
     }
 
-    func readings(kind: MetricKind, in range: DateInterval? = nil, enabledOnly: Bool = true) -> [Reading] {
+    /// Runs a database read, converting a throw or a missing handle into a named failure.
+    ///
+    /// Deliberately free of side effects. These queries are called from SwiftUI view
+    /// bodies while an immutable snapshot is being resolved, so recording the failure in
+    /// observed state here would mutate the model during a view update. The failure
+    /// travels back to the screen inside the snapshot that asked for it instead.
+    private func query<Value>(_ body: (HealthDatabase) throws -> Value) -> HealthStoreQueryOutcome<Value> {
+        guard let database else {
+            return .failure(.storeUnavailable(lastPersistenceError ?? "No database handle is open."))
+        }
+        do {
+            return .success(try body(database))
+        } catch {
+            logger.error("History query failed: \(error.localizedDescription, privacy: .public)")
+            return .failure(.queryFailed(error.localizedDescription))
+        }
+    }
+
+    func readingsOutcome(
+        kind: MetricKind,
+        in range: DateInterval? = nil,
+        enabledOnly: Bool = true
+    ) -> HealthStoreQueryOutcome<[Reading]> {
         _ = dataGeneration
-        guard loadState == .loaded else { return unavailableBuffer.filter { $0.kind == kind } }
+        guard loadState == .loaded else {
+            guard persistenceEnabled else { return .success(unavailableBuffer.filter { $0.kind == kind }) }
+            return .failure(.notLoaded)
+        }
         let enabled = enabledOnly ? Set(enabledSources.map(\.id)) : nil
-        let rows = (try? database?.readings(kind: kind, range: range)) ?? []
-        return enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows
+        return query { try $0.readings(kind: kind, range: range) }
+            .map { rows in enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows }
+    }
+
+    func readingsOutcome(in range: DateInterval, enabledOnly: Bool = true) -> HealthStoreQueryOutcome<[Reading]> {
+        _ = dataGeneration
+        guard loadState == .loaded else {
+            guard persistenceEnabled else { return .success(unavailableBuffer.filter { range.contains($0.midpoint) }) }
+            return .failure(.notLoaded)
+        }
+        let enabled = enabledOnly ? Set(enabledSources.map(\.id)) : nil
+        return query { try $0.readings(range: range) }
+            .map { rows in enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows }
+    }
+
+    func readings(kind: MetricKind, in range: DateInterval? = nil, enabledOnly: Bool = true) -> [Reading] {
+        guard loadState == .loaded || !persistenceEnabled else {
+            return unavailableBuffer.filter { $0.kind == kind }
+        }
+        return readingsOutcome(kind: kind, in: range, enabledOnly: enabledOnly).valueOrEmpty
     }
 
     func readings(in range: DateInterval, enabledOnly: Bool = true) -> [Reading] {
-        _ = dataGeneration
-        guard loadState == .loaded else { return unavailableBuffer.filter { range.contains($0.midpoint) } }
-        let enabled = enabledOnly ? Set(enabledSources.map(\.id)) : nil
-        let rows = (try? database?.readings(range: range)) ?? []
-        return enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows
+        guard loadState == .loaded || !persistenceEnabled else {
+            return unavailableBuffer.filter { range.contains($0.midpoint) }
+        }
+        return readingsOutcome(in: range, enabledOnly: enabledOnly).valueOrEmpty
     }
 
     func readingsPage(
@@ -393,18 +508,35 @@ final class HealthStore {
         limit: Int = 1_000,
         offset: Int = 0
     ) -> [Reading] {
+        readingsPageOutcome(kind: kind, in: range, limit: limit, offset: offset).valueOrEmpty
+    }
+
+    func readingsPageOutcome(
+        kind: MetricKind? = nil,
+        in range: DateInterval? = nil,
+        limit: Int = 1_000,
+        offset: Int = 0
+    ) -> HealthStoreQueryOutcome<[Reading]> {
         _ = dataGeneration
-        return (try? database?.readings(kind: kind, range: range, limit: limit, offset: offset)) ?? []
+        return query { try $0.readings(kind: kind, range: range, limit: limit, offset: offset) }
+    }
+
+    /// Whole-history read for the explicit export. Throws rather than returning an empty
+    /// array so a failed query cannot be shared as an empty history.
+    func allReadingsForExport() throws -> [Reading] {
+        _ = dataGeneration
+        guard loadState == .loaded || !persistenceEnabled else { throw HealthStoreQueryError.notLoaded }
+        return try query { try $0.allReadings() }.get()
     }
 
     func latest(kind: MetricKind, sourceID: String) -> Reading? {
         _ = dataGeneration
-        return try? database?.latest(kind: kind, sourceID: sourceID)
+        return query { try $0.latest(kind: kind, sourceID: sourceID) }.value ?? nil
     }
 
     func lastDataDate(sourceID: String) -> Date? {
         _ = dataGeneration
-        return try? database?.lastDataDate(sourceID: sourceID)
+        return query { try $0.lastDataDate(sourceID: sourceID) }.value ?? nil
     }
 
     var availableMetrics: [MetricKind] {
@@ -662,24 +794,188 @@ final class HealthStore {
         }
     }
 
-    func exportCSV() -> String {
-        var rows = ["id,source_id,metric,value,start_utc,end_utc,provenance,aggregation"]
+    /// Stable, machine-readable columns for the whole-history export.
+    ///
+    /// Documented and append-only, following the same contract as `PairwiseExporter`:
+    /// consumers may rely on column order, on values being locale-independent, and on an
+    /// empty field meaning *unknown* rather than zero. `unit` and the transport/model
+    /// columns come from the export-stable spellings so the bytes do not change with the
+    /// device language.
+    static let exportColumns = [
+        "id",
+        "source_id",
+        "source_name",
+        "source_transport",
+        "source_model",
+        "source_identifies_healthkit_writer",
+        "source_upstream_relationship_id",
+        "metric",
+        "unit",
+        "value",
+        "start_utc",
+        "end_utc",
+        "provenance",
+        "aggregation",
+        "original_sample_count",
+        "original_standard_deviation",
+        "corrections_are_final",
+        "measurement_quality",
+        "observation_duration_seconds",
+        "accepted_beat_count",
+        "artefact_fraction",
+    ]
+
+    /// A complete dump of the stored readings.
+    ///
+    /// **This is not a backup.** There is no import or restore path, so the file cannot
+    /// reconstitute this database; it is an analysis artefact for taking the history
+    /// somewhere else. It is also not a record of every measurement ever taken: rows older
+    /// than the compaction age are one median per source per comparison window, and the raw
+    /// samples behind them are gone. `aggregation` says which kind of row each line is, and
+    /// `original_sample_count`/`original_standard_deviation` carry what was retained about
+    /// the discarded distribution — empty where a legacy compacted row never recorded it.
+    ///
+    /// Throws rather than returning a partial file: a header-only CSV produced by a failed
+    /// query is indistinguishable from a genuinely empty history, and handing a user an
+    /// empty file that claims to be their history is worse than handing them an error.
+    func exportCSV() throws -> String {
+        let rows = try allReadingsForExport()
+        return Self.exportCSV(readings: rows, sources: sources)
+    }
+
+    /// Streams the whole-history export into `url` a page at a time.
+    ///
+    /// Pages rather than materializing the archive plus one complete CSV string in memory:
+    /// a month of 1 Hz strap data is millions of rows, and the previous whole-string export
+    /// was built during view rendering. Rows are read in the database's total
+    /// `ORDER BY end, rowid`, so successive pages do not overlap or skip.
+    ///
+    /// If any page fails the partial file is deleted and the error is rethrown. A truncated
+    /// CSV is indistinguishable from a complete one once it has been shared, so a partial
+    /// export must not survive.
+    ///
+    /// - Parameter shouldContinue: consulted between pages; returning false cancels the
+    ///   export and removes the partial file.
+    /// - Returns: the number of data rows written.
+    @discardableResult
+    func writeExportCSV(
+        to url: URL,
+        pageSize: Int = 5_000,
+        shouldContinue: (Int) -> Bool = { _ in true }
+    ) throws -> Int {
+        guard loadState == .loaded || !persistenceEnabled else { throw HealthStoreQueryError.notLoaded }
+
+        let manager = FileManager.default
+        if manager.fileExists(atPath: url.path) { try manager.removeItem(at: url) }
+        guard manager.createFile(atPath: url.path, contents: nil) else {
+            throw HealthStoreQueryError.queryFailed("Could not create the export file.")
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        var written = 0
+
+        func abort() { try? handle.close(); try? manager.removeItem(at: url) }
+
+        do {
+            try handle.write(contentsOf: Data((Self.exportColumns.joined(separator: ",") + "\r\n").utf8))
+            var offset = 0
+            while true {
+                guard shouldContinue(written) else {
+                    abort()
+                    throw CancellationError()
+                }
+                let page = try readingsPageOutcome(limit: pageSize, offset: offset).get()
+                if page.isEmpty { break }
+                let chunk = Self.exportRows(readings: page, sources: sources)
+                try handle.write(contentsOf: Data(chunk.utf8))
+                written += page.count
+                offset += page.count
+                if page.count < pageSize { break }
+            }
+            try handle.close()
+            return written
+        } catch {
+            abort()
+            throw error
+        }
+    }
+
+    /// Pure projection so the schema is testable without a database.
+    static func exportCSV(readings: [Reading], sources: [DataSource]) -> String {
+        exportColumns.joined(separator: ",") + "\r\n" + exportRows(readings: readings, sources: sources)
+    }
+
+    /// Data rows only, each terminated by CRLF, so the paged writer and the whole-string
+    /// projection cannot drift into two different schemas.
+    static func exportRows(readings: [Reading], sources: [DataSource]) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        let byID = Dictionary(sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+
+        var rows: [String] = []
         for reading in readings {
-            let aggregation = reading.metadata?.aggregation == nil ? "raw" : "compacted_window_median"
-            rows.append([
-                reading.id.uuidString, reading.sourceID, reading.kind.rawValue,
-                String(format: "%.15g", locale: Locale(identifier: "en_US_POSIX"), reading.value),
-                formatter.string(from: reading.start), formatter.string(from: reading.end),
-                reading.provenance.rawValue, aggregation,
-            ].map(Self.csvEscape).joined(separator: ","))
+            let source = byID[reading.sourceID]
+            let aggregation = reading.metadata?.aggregation
+            let metadata = reading.metadata
+
+            // Built in named groups rather than one literal: a single 21-element
+            // heterogeneous array defeats the type checker on this expression.
+            var fields: [String] = []
+            fields.append(reading.id.uuidString)
+            fields.append(reading.sourceID)
+            fields.append(source?.displayName ?? "")
+            fields.append(source?.transport.exportTitle ?? "")
+            fields.append(source?.model ?? "")
+            fields.append(Self.boolean(source?.identifiesHealthKitWriter))
+            fields.append(source?.upstreamDeviceRelationshipID ?? "")
+            fields.append(reading.kind.rawValue)
+            fields.append(reading.kind.exportUnit)
+            fields.append(number(reading.value))
+            fields.append(formatter.string(from: reading.start))
+            fields.append(formatter.string(from: reading.end))
+            fields.append(reading.provenance.rawValue)
+            fields.append(aggregation == nil ? "raw" : "compacted_window_median")
+            fields.append(Self.integer(aggregation?.originalSampleCount))
+            fields.append(Self.decimal(aggregation?.originalStandardDeviation))
+            fields.append(Self.boolean(aggregation?.correctionsAreFinal))
+            fields.append(metadata?.quality?.rawValue ?? "")
+            fields.append(Self.decimal(metadata?.observationDuration))
+            fields.append(Self.integer(metadata?.acceptedBeatCount))
+            fields.append(Self.decimal(metadata?.artefactFraction))
+
+            rows.append(fields.map(csvEscape).joined(separator: ","))
         }
-        return rows.joined(separator: "\r\n") + "\r\n"
+        return rows.isEmpty ? "" : rows.joined(separator: "\r\n") + "\r\n"
+    }
+
+    /// Unknown optionals become an empty field, never a substituted zero or `false`.
+    private static func boolean(_ value: Bool?) -> String {
+        guard let value else { return "" }
+        return value ? "true" : "false"
+    }
+
+    private static func integer(_ value: Int?) -> String {
+        guard let value else { return "" }
+        return String(value)
+    }
+
+    private static func decimal(_ value: Double?) -> String {
+        guard let value else { return "" }
+        return number(value)
+    }
+
+    /// Locale-independent numeric formatting, matching the pairwise export's contract.
+    private static func number(_ value: Double) -> String {
+        String(format: "%.15g", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 
     func injectDatabaseFailureOnNextCommitForTesting() {
         database?.injectFailureOnNextCommitForTesting()
+    }
+
+    /// Makes history reads fail until cleared, so the difference between "no rows" and
+    /// "the read failed" can be asserted after a successful startup.
+    func injectQueryFailureForTesting(_ failing: Bool = true) {
+        database?.injectQueryFailureForTesting(failing)
     }
 
     // MARK: - Helpers

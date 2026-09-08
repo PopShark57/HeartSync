@@ -282,6 +282,23 @@ struct PairwiseAnalysisView: View {
             LabeledContent("Original samples") {
                 Text("A \(sampleCountText(analysis.rawSampleCountA))  ·  B \(sampleCountText(analysis.rawSampleCountB))")
             }
+            // Overlap counts shared buckets; these say whether the readings inside those
+            // buckets were actually taken at the same time, and how much of the span they
+            // cover. A high window count over sparse coverage is not continuous evidence.
+            LabeledContent("Typical separation") {
+                Text(medianSeparationText(analysis))
+            }
+            if analysis.evidence.temporallySeparatedCount > 0 || analysis.evidence.unknownTimingCount > 0 {
+                LabeledContent("Timing caveats") {
+                    Text(timingCaveatText(analysis))
+                        .foregroundStyle(.orange)
+                }
+            }
+            if let coverage = analysis.evidence.coverageFraction {
+                LabeledContent("Paired coverage") {
+                    Text(percentText(coverage))
+                }
+            }
             LabeledContent("Evidence grade") { Text(analysis.evidence.grade.title) }
             if !analysis.evidence.reasons.isEmpty {
                 Text(analysis.evidence.reasons.joined(separator: ". "))
@@ -582,6 +599,23 @@ struct PairwiseAnalysisView: View {
             }
             LabeledContent("Within-window SD") {
                 Text("A \(spreadText(observation.sourceA.standardDeviation))  ·  B \(spreadText(observation.sourceB.standardDeviation)) \(kind.unit)")
+            }
+            // Being in the same bucket is not the same as being at the same moment, and a
+            // user investigating one disagreement needs to know which of the two this is.
+            LabeledContent("Measurement timing") {
+                Text(observation.timing.title)
+                    .foregroundStyle(observation.timing.supportsConclusion ? Color.secondary : Color.orange)
+            }
+            LabeledContent("Apart in time") {
+                Text(separationText(observation))
+            }
+            LabeledContent("Contributing span") {
+                Text("A \(durationText(observation.contributingDurationA))  ·  B \(durationText(observation.contributingDurationB))")
+            }
+            if observation.timing == .separated {
+                Text("These two readings landed in the same aligned window but were taken far enough apart that the gap may reflect when each device measured, not how they differ.")
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if observation.sourceA.isCompacted || observation.sourceB.isCompacted {
                 Text("Compacted window median; old corrections and upstream deletions cannot be reapplied.")
@@ -920,6 +954,40 @@ struct PairwiseAnalysisView: View {
     /// Formats a 0...1 fraction as a whole-number percentage.
     private func percentText(_ fraction: Double) -> String {
         fraction.formatted(.percent.precision(.fractionLength(0)))
+    }
+
+    /// Unknown separation is spelled out rather than shown as a dash or a zero: a compacted
+    /// window genuinely does not know, and that is different from "at the same instant".
+    private func separationText(_ observation: PairwiseObservation) -> String {
+        switch observation.timing {
+        case .notApplicable:
+            return "Not applicable to an interval summary"
+        case .unknown:
+            return "Unknown — compacted window"
+        case .simultaneous, .separated:
+            guard let separation = observation.timingSeparation else { return "Unknown" }
+            return WindowLabel.elapsed(separation)
+        }
+    }
+
+    private func durationText(_ duration: TimeInterval?) -> String {
+        guard let duration else { return "unknown" }
+        return duration == 0 ? "instant" : WindowLabel.elapsed(duration)
+    }
+
+    private func medianSeparationText(_ analysis: PairwiseAnalysis) -> String {
+        guard analysis.kind.timingTolerance != nil else { return "Interval summary" }
+        guard let median = analysis.evidence.medianTimingSeparation else { return "Unknown" }
+        return WindowLabel.elapsed(median)
+    }
+
+    private func timingCaveatText(_ analysis: PairwiseAnalysis) -> String {
+        var parts: [String] = []
+        let separated = analysis.evidence.temporallySeparatedCount
+        let unknown = analysis.evidence.unknownTimingCount
+        if separated > 0 { parts.append("\(separated) too far apart") }
+        if unknown > 0 { parts.append("\(unknown) unknown") }
+        return parts.joined(separator: " · ")
     }
 
     private func windowDescription(_ seconds: TimeInterval) -> String {

@@ -458,11 +458,38 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
 - `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
 - `UITests/HeartSyncCheckerUITests.swift`: 7 deterministic recovery, settings, device-action, retention, evidence, Oura-partial, and pseudo-localization flows.
-- `PerformanceTests/HealthStorePerformanceTests.swift`: the manual physical-iPhone fourteen-day 1 Hz indexed persistence workload.
+- `Tests/HistoryOutcomeTests.swift`: 12 tests covering query outcomes after a successful
+  startup (failure versus emptiness, retry, export failing visibly, paged export) and the
+  compaction-honest per-device summary and whole-history export schema.
+- `Tests/PresentationIdentityTests.swift`: 14 tests covering chart series keyed by stable
+  source ID, duplicate-name disambiguation, rename stability, the Compare empty-state
+  distinction, and chart line segmentation across data gaps.
+- `Tests/PairTimingTests.swift`: 10 tests covering the pair timing policy — near/far samples
+  inside one bucket, close samples across a boundary, bursty delivery, interval summaries,
+  unknown timing from compacted rows, evidence grading, and sparse coverage.
+- `Tests/Watch/WorkoutLifecycleTests.swift`: 17 tests covering the watch workout transition
+  rules in `Shared/WorkoutLifecycle.swift` — duplicate Start/Stop taps, stale callbacks,
+  interruption, save failure and retry, double-save refusal, discard, and recovery.
+- `Tests/ComparisonSourceSelectionTests.swift`: 6 tests covering comparison-only source
+  hiding, settings archive backward compatibility, and same-device pair disclosure.
+- `Tests/ComparisonSessionTests.swift`: 11 tests covering fixed versus rolling periods,
+  session persistence and reload, revisit disclosure, and missing sources.
+- `PerformanceTests/HealthStorePerformanceTests.swift`: the manual physical-iPhone fourteen-day 1 Hz indexed persistence workload, plus a two-source month-range comparison, range changes during ingestion, and the paged export flow.
 
 There is no snapshot-test target, live Oura test, Bluetooth hardware integration-test target, or HealthKit integration-test target.
 
-Do not use `swift test`; this is a hosted Xcode unit-test bundle in an XcodeGen iOS project, not a SwiftPM package.
+Do not use `swift test` on this project; it is a hosted Xcode unit-test bundle in an
+XcodeGen iOS project, not a SwiftPM package.
+
+When no iOS simulator runtime is installed, `build-for-testing` proves compilation only. To
+actually execute the pure logic, build a **scratch** SwiftPM package outside the repository
+and copy or symlink the real source files into it — `Sources/Store`, `Sources/Model`,
+`Sources/Analysis`, `Sources/Views/MetricDetailSnapshot.swift`,
+`Sources/Views/ComparisonEmptyReason.swift`, `Shared`, plus `Sources/Bluetooth/GATT.swift`
+for `BodySensorLocation`. That closure builds for macOS and runs the store, analysis,
+export, presentation-projection and watch-lifecycle suites. It cannot compile the SwiftUI
+screens (they import UIKit), the Oura stack (AuthenticationServices), or `WatchApp`. Never
+add `Package.swift` to the repository itself.
 
 Run all tests against an installed simulator. Do not hard-code a model that may not exist on the current machine; discover a destination first and prefer its ID:
 

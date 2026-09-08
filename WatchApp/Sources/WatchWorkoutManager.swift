@@ -24,32 +24,36 @@ enum WatchWorkoutActivity: String, CaseIterable, Identifiable {
 @MainActor
 @Observable
 final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorkoutBuilderDelegate {
-    private(set) var phase: WorkoutPhase = .idle
+    /// Every transition decision lives in `WorkoutLifecycle`, which is pure and compiled
+    /// into the iPhone app as well, so the lifecycle this class drives is covered by the
+    /// hosted test bundle CI runs. This class stays the HealthKit adapter: it owns the
+    /// session and builder, and asks the lifecycle what is allowed to happen to them.
+    private(set) var lifecycle = WorkoutLifecycle()
     private(set) var heartRate: WorkoutHeartRate?
     private(set) var averageHeartRate: Double?
-    private(set) var message: String?
     private(set) var activityTitle = "Workout"
-    private(set) var finalDuration: TimeInterval = 0
+
+    var phase: WorkoutPhase { lifecycle.phase }
+    var message: String? { lifecycle.message }
+    var finalDuration: TimeInterval { lifecycle.finalDuration }
 
     @ObservationIgnored private let healthStore = HKHealthStore()
     @ObservationIgnored private var session: HKWorkoutSession?
     @ObservationIgnored private var builder: HKLiveWorkoutBuilder?
     @ObservationIgnored private var endDate: Date?
-    @ObservationIgnored private var collectionEnded = false
-    @ObservationIgnored private var isEndingCollection = false
-    @ObservationIgnored private var generation = UUID()
+    /// Token of the session currently attached, matched against every delegate callback
+    /// alongside the object-identity check.
+    @ObservationIgnored private var token: WorkoutSessionToken?
 
     func start(activity: WatchWorkoutActivity, indoors: Bool) async {
-        guard phase.canStart, session == nil else { return }
-        let operation = UUID()
-        generation = operation
-        phase = .authorizing
-        message = nil
+        // A second Start tap while one is in flight returns nil here, so no second
+        // HKWorkoutSession is ever created for one intent.
+        guard let operation = lifecycle.beginStart(), session == nil else { return }
+        self.token = operation
         heartRate = nil
         averageHeartRate = nil
-        finalDuration = 0
         guard HKHealthStore.isHealthDataAvailable() else {
-            failStart("Health data is unavailable on this watch.")
+            failStart(operation, "Health data is unavailable on this watch.")
             return
         }
         do {
@@ -58,11 +62,11 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
                 toShare: [HKObjectType.workoutType(), heartRateType],
                 read: [heartRateType]
             )
-            guard generation == operation else { return }
+            guard lifecycle.accepts(operation) else { return }
             // Sheet completion does not establish read permission. Sharing status does
             // tell us whether the user allows the workout we are about to create.
             guard healthStore.authorizationStatus(for: HKObjectType.workoutType()) == .sharingAuthorized else {
-                failStart("Allow HeartSync to save Workouts in Health permissions, then try again.")
+                failStart(operation, "Allow HeartSync to save Workouts in Health permissions, then try again.")
                 return
             }
             let configuration = HKWorkoutConfiguration()
@@ -71,34 +75,37 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
             let session = try HKWorkoutSession(healthStore: healthStore, configuration: configuration)
             attach(session)
             activityTitle = activity.rawValue
-            phase = .starting
+            lifecycle.markStarting(operation)
             let date = Date.now
             session.startActivity(with: date)
             guard let builder else { return }
             try await builder.beginCollection(at: date)
-            guard self.session === session, phase == .starting else { return }
-            phase = session.state == .paused ? .paused : .running
+            guard self.session === session else { return }
+            lifecycle.markCollecting(operation, paused: session.state == .paused)
         } catch {
-            guard generation == operation else { return }
+            guard lifecycle.accepts(operation) else { return }
             // A start failure has no reviewable workout. Detach before ending so queued
             // delegate events cannot revive this failed session.
-            failStart("Could not start workout: \(error.localizedDescription)")
+            failStart(operation, "Could not start workout: \(error.localizedDescription)")
         }
     }
 
     func pauseOrResume() {
-        if phase == .running { session?.pause() }
-        else if phase == .paused { session?.resume() }
+        switch lifecycle.pauseAction() {
+        case .pause:  session?.pause()
+        case .resume: session?.resume()
+        case .ignore: break
+        }
     }
 
     func stop() {
-        guard phase.isCollecting, let session else { return }
-        phase = .stopping
+        // A repeat Stop tap is rejected here, so stopActivity is sent once per workout.
+        guard let session, lifecycle.beginStop() else { return }
         session.stopActivity(with: .now)
     }
 
     func elapsed(at date: Date) -> TimeInterval {
-        guard let builder, !collectionEnded else { return finalDuration }
+        guard let builder, !lifecycle.collectionEnded else { return lifecycle.finalDuration }
         return max(0, builder.elapsedTime(at: date))
     }
 
@@ -106,44 +113,36 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
     /// only claim success after HealthKit completes the save without an error. A nil
     /// workout with no error means success while the saved object is protected by lock.
     func save() async {
-        guard phase == .review, let builder else { return }
-        phase = .saving
-        message = nil
+        // Returns nil unless we are in review, so a second Save tap (or a repeated event)
+        // cannot write the same workout to HealthKit twice.
+        guard lifecycle.beginSave() != nil, let builder else { return }
         do {
-            if !collectionEnded {
+            if !lifecycle.collectionEnded {
                 try await builder.endCollection(at: endDate ?? .now)
-                collectionEnded = true
-                finalDuration = builder.elapsedTime
+                lifecycle.markCollectionEnded(elapsed: builder.elapsedTime)
             }
             let savedWorkout = try await builder.finishWorkout()
-            detachSession(discard: false)
-            phase = .saved
-            message = savedWorkout == nil
-                ? "Saved to Apple Health. Unlock your watch to view the workout. Readings reach iPhone after Health syncs."
-                : "Saved to Apple Health. Readings appear on iPhone after Health syncs and HeartSync refreshes."
+            detachHealthKitObjects(discard: false)
+            lifecycle.markSaved(protectedByLock: savedWorkout == nil)
         } catch {
-            phase = .review
-            message = "Not saved: \(error.localizedDescription) Try Save again, or discard this workout."
+            lifecycle.markSaveFailed(error.localizedDescription)
         }
     }
 
     func discard() {
-        guard phase == .review else { return }
-        detachSession(discard: true)
-        phase = .idle
+        guard lifecycle.beginDiscard() else { return }
+        detachHealthKitObjects(discard: true)
         heartRate = nil
         averageHeartRate = nil
-        finalDuration = 0
-        message = "Workout discarded. HealthKit may retain sensor samples Apple Watch collected independently."
     }
 
     /// Invoked by WKApplicationDelegate after the system relaunches an active workout.
     func recover() async {
-        guard session == nil, phase.canStart else { return }
-        phase = .starting
+        guard session == nil, let operation = lifecycle.beginRecovery() else { return }
+        self.token = operation
         do {
             guard let recovered = try await healthStore.recoverActiveWorkoutSession() else {
-                failStart("The previous workout could not be recovered.")
+                failStart(operation, "The previous workout could not be recovered.")
                 return
             }
             attach(recovered)
@@ -152,13 +151,18 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
             }?.rawValue ?? "Recovered workout"
             readStatistics()
             switch recovered.state {
-            case .running: phase = .running
-            case .paused: phase = .paused
-            case .stopped, .ended: await prepareReview(at: recovered.endDate ?? .now)
-            default: failStart("The previous workout is no longer active.")
+            case .running:
+                lifecycle.adoptRecovered(operation, state: .running)
+            case .paused:
+                lifecycle.adoptRecovered(operation, state: .paused)
+            case .stopped, .ended:
+                await prepareReview(operation, at: recovered.endDate ?? .now)
+            default:
+                lifecycle.adoptRecovered(operation, state: .unavailable)
+                detachHealthKitObjects(discard: true)
             }
         } catch {
-            failStart("Could not recover workout: \(error.localizedDescription)")
+            failStart(operation, "Could not recover workout: \(error.localizedDescription)")
         }
     }
 
@@ -177,35 +181,32 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
         source.enableCollection(for: heartRateType, predicate: nil)
         builder.dataSource = source
         endDate = builder.endDate
-        collectionEnded = builder.endDate != nil
-        isEndingCollection = false
+        if builder.endDate != nil { lifecycle.markCollectionEnded() }
     }
 
-    private func prepareReview(at date: Date) async {
-        guard let builder, !isEndingCollection, phase != .review, phase != .saving, phase != .saved else { return }
-        isEndingCollection = true
-        phase = .stopping
+    /// Turns a stopped workout into a reviewable one. Repeated stop/end callbacks for the
+    /// same workout are rejected by the lifecycle, so collection is only ended once.
+    private func prepareReview(_ operation: WorkoutSessionToken, at date: Date) async {
+        guard let builder else { return }
+        guard lifecycle.beginReview(operation, at: date, elapsed: builder.elapsedTime(at: date)) else { return }
         endDate = date
-        finalDuration = max(0, builder.elapsedTime(at: date))
-        do {
-            if !collectionEnded { try await builder.endCollection(at: date) }
-            collectionEnded = true
-            finalDuration = max(0, builder.elapsedTime)
-        } catch {
-            message = "Could not finish collecting: \(error.localizedDescription) Save will retry."
+        var failure: String?
+        if !lifecycle.collectionEnded {
+            do { try await builder.endCollection(at: date) }
+            catch { failure = error.localizedDescription }
         }
-        isEndingCollection = false
-        phase = .review
+        lifecycle.completeReview(elapsed: failure == nil ? builder.elapsedTime : nil, failure: failure)
     }
 
-    private func failStart(_ detail: String) {
-        detachSession(discard: true)
-        phase = .failed
-        message = detail
+    private func failStart(_ operation: WorkoutSessionToken, _ detail: String) {
+        guard lifecycle.failStart(operation, reason: detail) else { return }
+        detachHealthKitObjects(discard: true)
     }
 
-    private func detachSession(discard: Bool) {
-        generation = UUID()
+    /// Releases the HealthKit objects. The lifecycle has already cleared its active token,
+    /// so any callback still queued for them is ignored on arrival.
+    private func detachHealthKitObjects(discard: Bool) {
+        token = nil
         let previous = session
         previous?.delegate = nil
         builder?.delegate = nil
@@ -256,13 +257,17 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
         let id = ObjectIdentifier(workoutSession)
         Task { @MainActor [weak self] in
             guard let self, self.session.map(ObjectIdentifier.init) == id else { return }
+            // Both guards matter: object identity catches a callback from a different
+            // HealthKit object, and the token catches one from a session this manager has
+            // already discarded or replaced.
+            guard let operation = self.token, self.lifecycle.accepts(operation) else { return }
             switch toState {
             case .running:
-                if self.phase == .paused { self.phase = .running }
+                self.lifecycle.applyRunning(operation)
             case .paused:
-                if self.phase == .running { self.phase = .paused }
+                self.lifecycle.applyPaused(operation)
             case .stopped, .ended:
-                await self.prepareReview(at: date)
+                await self.prepareReview(operation, at: date)
             default: break
             }
         }
@@ -273,11 +278,29 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
         let detail = error.localizedDescription
         Task { @MainActor [weak self] in
             guard let self, self.session.map(ObjectIdentifier.init) == id else { return }
-            if self.builder?.startDate != nil {
-                self.message = "Workout interrupted: \(detail) Review the collected workout before saving."
-                await self.prepareReview(at: .now)
+            guard let operation = self.token, self.lifecycle.accepts(operation) else { return }
+            if self.builder?.startDate != nil, let builder = self.builder {
+                let now = Date.now
+                // Collected data survives an interruption, so this becomes a reviewable
+                // workout rather than a failed start the user can never save.
+                if self.lifecycle.interrupt(
+                    operation,
+                    detail: detail,
+                    at: now,
+                    elapsed: builder.elapsedTime(at: now)
+                ) {
+                    var failure: String?
+                    if !self.lifecycle.collectionEnded {
+                        do { try await builder.endCollection(at: now) }
+                        catch { failure = error.localizedDescription }
+                    }
+                    self.lifecycle.completeReview(
+                        elapsed: failure == nil ? builder.elapsedTime : nil,
+                        failure: failure
+                    )
+                }
             } else {
-                self.failStart("Workout failed: \(detail)")
+                self.failStart(operation, "Workout failed: \(detail)")
             }
         }
     }

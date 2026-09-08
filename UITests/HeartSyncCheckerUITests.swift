@@ -78,7 +78,11 @@ final class HeartSyncCheckerUITests: XCTestCase {
         XCTAssertTrue(row.label.contains("Optical"))
 
         row.press(forDuration: 1)
-        application.buttons["Pause"].tap()
+        // Collection and comparison are separate controls on purpose: hiding a device from
+        // comparisons must never disconnect it. Both appear here, and only one of them is
+        // about collecting, so the labels have to stay distinguishable.
+        XCTAssertTrue(application.buttons["Hide from comparisons"].exists)
+        application.buttons["Pause collecting"].tap()
         XCTAssertTrue(row.label.contains("Paused"))
 
         row.swipeLeft()
