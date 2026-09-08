@@ -336,6 +336,10 @@ private struct RetentionConfirmationView: View {
     let proposal: RetentionProposal
     let apply: () -> Void
 
+    @State private var sharePayload: RetentionSharePayload?
+    @State private var exportError: String?
+    @State private var isExporting = false
+
     var body: some View {
         NavigationStack {
             Form {
@@ -354,11 +358,36 @@ private struct RetentionConfirmationView: View {
                     Text("Deletion and compaction are irreversible. Compacted medians retain known original counts and spread, but individual rows and later corrections are lost.")
                 }
                 Section {
-                    ShareLink(item: model.store.exportCSV()) {
-                        Label("Export readings before changing", systemImage: "square.and.arrow.up")
+                    Button {
+                        prepareExport()
+                    } label: {
+                        HStack {
+                            Label("Export readings before changing", systemImage: "square.and.arrow.up")
+                            if isExporting {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
                     }
+                    .disabled(isExporting)
                     .accessibilityIdentifier("retention.export")
+                } footer: {
+                    Text("The export is a CSV of the rows currently stored, with units, device metadata, and the original sample count and spread retained for compacted windows. It is an analysis file, not a backup: HeartSync cannot import it, and rows already compacted no longer contain their original samples.")
                 }
+            }
+            .sheet(item: $sharePayload, onDismiss: discardShareFile) { payload in
+                RetentionActivityView(items: [payload.url])
+            }
+            .alert(
+                "Export failed",
+                isPresented: Binding(
+                    get: { exportError != nil },
+                    set: { if !$0 { exportError = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { exportError = nil }
+            } message: {
+                Text(exportError ?? "The export could not be prepared.")
             }
             .navigationTitle("Confirm retention")
             .toolbar {
@@ -372,6 +401,62 @@ private struct RetentionConfirmationView: View {
             }
         }
     }
+
+    /// Builds the export only when asked, into a temporary file, and reports failure.
+    ///
+    /// The previous version constructed `ShareLink(item: store.exportCSV())` while the form
+    /// was rendering, so opening this sheet materialized the entire history whether or not
+    /// the user wanted a file — and a failed query produced a header-only CSV that looked
+    /// like a genuinely empty history.
+    private func prepareExport() {
+        discardShareFile()
+        isExporting = true
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HeartSync-History-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("HeartSync-readings.csv")
+
+        Task { @MainActor in
+            defer { isExporting = false }
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+                let rows = try model.store.writeExportCSV(to: url)
+                guard rows > 0 else {
+                    try? FileManager.default.removeItem(at: directory)
+                    exportError = "There are no stored readings to export."
+                    return
+                }
+                sharePayload = RetentionSharePayload(url: url, directory: directory)
+            } catch is CancellationError {
+                try? FileManager.default.removeItem(at: directory)
+            } catch {
+                try? FileManager.default.removeItem(at: directory)
+                exportError = "HeartSync could not export the readings. \(error.localizedDescription) Nothing was deleted or changed."
+            }
+        }
+    }
+
+    private func discardShareFile() {
+        if let directory = sharePayload?.directory {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        sharePayload = nil
+    }
+}
+
+private struct RetentionSharePayload: Identifiable {
+    let id = UUID()
+    var url: URL
+    var directory: URL
+}
+
+private struct RetentionActivityView: UIViewControllerRepresentable {
+    var items: [URL]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 /// Alert payload after the mirroring toggle asks for HealthKit write access.

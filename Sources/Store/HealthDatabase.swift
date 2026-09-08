@@ -28,6 +28,7 @@ final class HealthDatabase {
     private let fileURL: URL?
     private var handle: OpaquePointer?
     private var failNextCommit = false
+    private var failQueries = false
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -165,6 +166,7 @@ final class HealthDatabase {
     }
 
     func lastDataDate(sourceID: String) throws -> Date? {
+        try checkInjectedQueryFailure("read last data date")
         let statement = try prepare("SELECT MAX(end) FROM readings WHERE source_id = ?")
         defer { sqlite3_finalize(statement) }
         try bind([.text(sourceID)], to: statement)
@@ -315,6 +317,12 @@ final class HealthDatabase {
 
     func injectFailureOnNextCommitForTesting() { failNextCommit = true }
 
+    /// Makes every subsequent read throw until cleared, standing in for a corrupt page, a
+    /// file-protection denial, or a row that no longer decodes. Reads are what the app does
+    /// constantly after startup, and their failure mode used to be indistinguishable from an
+    /// empty history, so it needs to be reachable from a test.
+    func injectQueryFailureForTesting(_ failing: Bool = true) { failQueries = failing }
+
     // MARK: - SQL helpers
 
     private enum Binding {
@@ -359,11 +367,20 @@ final class HealthDatabase {
         return data(at: 0, statement: statement)
     }
 
+    /// Read-path chokepoint for the injected failure. Deliberately not placed in
+    /// `prepare(_:)`, which writes share: a test for "reads fail after a healthy startup"
+    /// must not also disable the writes whose behaviour it is asserting stays intact.
+    private func checkInjectedQueryFailure(_ operation: String) throws {
+        guard failQueries else { return }
+        throw DatabaseError(operation: operation, message: "injected query failure")
+    }
+
     private func decodedRows<T: Decodable>(
         _ sql: String,
         bindings: [Binding] = [],
         as type: T.Type
     ) throws -> [T] {
+        try checkInjectedQueryFailure("decode rows")
         let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
         try bind(bindings, to: statement)
@@ -384,6 +401,7 @@ final class HealthDatabase {
     }
 
     private func scalarInt(_ sql: String) throws -> Int {
+        try checkInjectedQueryFailure("read integer scalar")
         let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else { throw error("read integer scalar") }

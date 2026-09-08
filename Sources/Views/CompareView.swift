@@ -5,8 +5,14 @@ import SwiftUI
 struct CompareView: View {
     @Environment(AppModel.self) private var model
     @State private var range: TimeRange = .day
+    /// Bumped by the retry button. Reading it here makes the snapshot depend on it, so a
+    /// retry re-runs the query without touching or resetting any stored data.
+    @State private var retryToken = 0
 
     var body: some View {
+        // Read so the snapshot below depends on it: tapping Try again re-evaluates the
+        // body and re-runs the query. Not dead code — deleting it disables the retry.
+        let _ = retryToken
         // Resolved once per update and handed down. Every subview reading its own
         // computed property would re-window the whole archive, and `TimeRange.interval`
         // is relative to `.now`, so repeated calls would also compare slightly different
@@ -18,50 +24,70 @@ struct CompareView: View {
         )
 
         NavigationStack {
-            Group {
-                if snapshot.metrics.isEmpty {
-                    EmptyStateView(
-                        systemImage: "chart.xyaxis.line",
-                        title: "Nothing to compare yet",
-                        message: "Comparison needs measured data from two or more devices for the same metric in the selected range. Their timestamps do not need to overlap. Add another device, or widen the range."
-                    )
+            // The range control lives outside the result content on purpose. When a narrow
+            // range holds nothing comparable, the empty state tells the user to widen the
+            // range \u{2014} so the control that widens it has to still be on screen.
+            List {
+                Section {
+                    Picker("Range", selection: $range) {
+                        ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                    .accessibilityIdentifier("compare.range")
+                }
+
+                if let failure = snapshot.queryFailure {
+                    Section {
+                        HistoryUnavailableView(error: failure) { retryToken &+= 1 }
+                            .accessibilityIdentifier("compare.unavailable")
+                    }
+                } else if snapshot.metrics.isEmpty {
+                    Section {
+                        emptyState(snapshot.emptyReason)
+                            .accessibilityIdentifier("compare.empty")
+                    }
                 } else {
-                    List {
-                        Section {
-                            Picker("Range", selection: $range) {
-                                ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
-                            }
-                            .pickerStyle(.segmented)
-                            .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
-                        }
-
-                        Section("Metrics measured by more than one device") {
-                            ForEach(snapshot.metrics) { kind in
-                                NavigationLink {
-                                    MetricDetailView(kind: kind, initialRange: range)
-                                } label: {
-                                    ComparisonSummaryRow(
-                                        kind: kind,
-                                        analyses: snapshot.analyses(for: kind),
-                                        sourceIDs: snapshot.sourceIDs(for: kind)
-                                    )
-                                }
+                    Section("Metrics measured by more than one device") {
+                        ForEach(snapshot.metrics) { kind in
+                            NavigationLink {
+                                MetricDetailView(kind: kind, initialRange: range)
+                            } label: {
+                                ComparisonSummaryRow(
+                                    kind: kind,
+                                    analyses: snapshot.analyses(for: kind),
+                                    sourceIDs: snapshot.sourceIDs(for: kind)
+                                )
                             }
                         }
+                    }
 
-                        Section {
-                            evidenceOverview(snapshot)
-                        } header: {
-                            Text("Evidence overview")
-                                .accessibilityIdentifier("compare.root")
-                        } footer: {
-                            Text("HeartSync uses median values in epoch-aligned windows and excludes estimates. Ready analyses use mean bias and 95% limits of agreement; insufficient overlap is never treated as agreement.")
-                        }
+                    Section {
+                        evidenceOverview(snapshot)
+                    } header: {
+                        Text("Evidence overview")
+                            .accessibilityIdentifier("compare.root")
+                    } footer: {
+                        Text("HeartSync uses median values in epoch-aligned windows and excludes estimates. Ready analyses use mean bias and 95% limits of agreement; insufficient overlap is never treated as agreement.")
                     }
                 }
             }
             .navigationTitle("Compare")
         }
+    }
+
+    /// Distinguishes an empty install from a range that happens to hold nothing, because
+    /// only one of those is fixed by widening the range.
+    @ViewBuilder
+    private func emptyState(_ reason: ComparisonEmptyReason) -> some View {
+        let wider = range.wider
+        EmptyStateView(
+            systemImage: reason.systemImage,
+            title: reason.title,
+            message: reason.message(range: range, wider: wider),
+            actionTitle: reason.suggestsWidening ? wider.map { "Show \($0.title.lowercased())" } : nil,
+            action: reason.suggestsWidening ? wider.map { next in { range = next } } : nil
+        )
     }
 
     @ViewBuilder
@@ -137,6 +163,81 @@ struct CompareView: View {
     }
 }
 
+/// Why Compare has nothing to list. These are genuinely different situations and only two
+/// of them are improved by widening the range, so they must not share one message.
+enum ComparisonEmptyReason: Equatable, Sendable {
+    /// No readings are stored at all: a new install, or history that was deleted.
+    case noStoredData
+    /// Readings exist, but none of them fall inside the selected range.
+    case noDataInRange
+    /// Exactly one source reported in this range, so no pair can exist.
+    case singleSourceInRange
+    /// Two or more sources reported, but no single metric was measured by two of them.
+    case noSharedMetric
+
+    /// Chooses the reason from facts the snapshot already resolved.
+    ///
+    /// Kept separate from the view so the distinction between "you have no data",
+    /// "you have data but not here", and "you have one device" is unit-testable without
+    /// rendering SwiftUI.
+    ///
+    /// - Parameters:
+    ///   - comparableMetricCount: metrics measured by two or more sources in the range.
+    ///   - sourcesInRange: distinct non-estimated sources reporting anything in the range.
+    ///   - hasStoredReadings: whether the database holds any readings at all.
+    static func resolve(
+        comparableMetricCount: Int,
+        sourcesInRange: Int,
+        hasStoredReadings: Bool
+    ) -> ComparisonEmptyReason {
+        if comparableMetricCount > 0 { return .noSharedMetric }
+        if sourcesInRange >= 2 { return .noSharedMetric }
+        if sourcesInRange == 1 { return .singleSourceInRange }
+        return hasStoredReadings ? .noDataInRange : .noStoredData
+    }
+
+    var systemImage: String {
+        switch self {
+        case .noStoredData:        "tray"
+        case .noDataInRange:       "clock.arrow.circlepath"
+        case .singleSourceInRange: "plus.circle"
+        case .noSharedMetric:      "chart.xyaxis.line"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .noStoredData:        "No measurements yet"
+        case .noDataInRange:       "No measurements in this range"
+        case .singleSourceInRange: "Only one device reported"
+        case .noSharedMetric:      "No metric measured by two devices"
+        }
+    }
+
+    /// Widening cannot conjure data that was never stored, and it cannot add a second
+    /// device, so those two cases do not offer the action.
+    var suggestsWidening: Bool {
+        switch self {
+        case .noStoredData:                             false
+        case .noDataInRange, .singleSourceInRange, .noSharedMetric: true
+        }
+    }
+
+    func message(range: TimeRange, wider: TimeRange?) -> String {
+        let widerHint = wider.map { " Try \($0.title.lowercased())." } ?? ""
+        switch self {
+        case .noStoredData:
+            return "Connect a device on the Devices tab, or allow Apple Health access in Settings. Comparison needs measured data from two or more devices for the same metric."
+        case .noDataInRange:
+            return "Measurements are stored, but none of them fall in \(range.title.lowercased()).\(widerHint)"
+        case .singleSourceInRange:
+            return "Only one device reported in \(range.title.lowercased()). Comparison needs two.\(widerHint)"
+        case .noSharedMetric:
+            return "Two or more devices reported in \(range.title.lowercased()), but no single metric was measured by two of them. Their timestamps do not need to overlap \u{2014} they do need to measure the same thing.\(widerHint)"
+        }
+    }
+}
+
 /// One resolved pass over the store for a time range.
 ///
 /// Building the metric list, the per-metric pairs, and the overview from a single read
@@ -145,6 +246,11 @@ struct CompareView: View {
 @MainActor
 private struct ComparisonSnapshot {
     let metrics: [MetricKind]
+    /// Why `metrics` is empty. Only meaningful when it is.
+    let emptyReason: ComparisonEmptyReason
+    /// Set when the history query itself failed. An empty comparison caused by a failed
+    /// read must never be presented as "you have no data"; it is a retryable error.
+    let queryFailure: HealthStoreQueryError?
     let overview: PairwiseEvidenceOverview
     /// Ready pairs outside tolerance and at or above the user's alert threshold, worst first.
     let flagged: [PairwiseAnalysis]
@@ -159,7 +265,9 @@ private struct ComparisonSnapshot {
         // Estimates never participate in a device comparison, so they are dropped before
         // the metric list is built as well as inside the engine — otherwise a metric with
         // one real device plus the estimate source would look comparable.
-        let readings = store.readings(in: interval).filter { $0.provenance != .estimated }
+        let outcome = store.readingsOutcome(in: interval)
+        self.queryFailure = outcome.error
+        let readings = outcome.valueOrEmpty.filter { $0.provenance != .estimated }
 
         var sourceIDs: [MetricKind: Set<String>] = [:]
         for reading in readings {
@@ -167,6 +275,19 @@ private struct ComparisonSnapshot {
         }
         self.sourceIDsByKind = sourceIDs.mapValues { $0.sorted() }
         self.metrics = MetricKind.allCases.filter { (sourceIDs[$0]?.count ?? 0) >= 2 }
+
+        // Resolved from the same read as the metric list. `readingCount` is a COUNT(*) on
+        // the indexed table, not a materialization of the history, and it is only consulted
+        // when the range itself came back empty.
+        let sourcesInRange = Set(readings.map(\.sourceID)).count
+        // Only consulted when the range came back empty, and only trusted when it
+        // succeeded: a failed COUNT(*) must not be read as "this install is empty".
+        let storedCount = sourcesInRange > 0 ? nil : store.readingCountOutcome.value
+        self.emptyReason = ComparisonEmptyReason.resolve(
+            comparableMetricCount: self.metrics.count,
+            sourcesInRange: sourcesInRange,
+            hasStoredReadings: sourcesInRange > 0 || (storedCount ?? 0) > 0
+        )
 
         let analyses = ComparisonEngine.allPairwiseAnalyses(from: readings, range: interval)
         self.analysesByKind = Dictionary(grouping: analyses, by: \.kind)

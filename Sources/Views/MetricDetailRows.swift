@@ -2,6 +2,12 @@ import SwiftUI
 
 // MARK: - Rows
 
+/// One device's window summary.
+///
+/// The labels are load-bearing. "Samples" over a row count read as "this many measurements
+/// were taken", which stopped being true the moment compaction replaced a window's raw rows
+/// with one median. These say "windows", keep the original sample count in its own row, and
+/// say "unknown" where the archive genuinely no longer knows.
 struct PerSourceStatsRow: View {
     var kind: MetricKind
     var entry: SourceStats
@@ -13,19 +19,46 @@ struct PerSourceStatsRow: View {
                 Text(entry.source.displayName)
                     .font(.subheadline.weight(.medium))
                 Spacer()
-                Text(kind.formatWithUnit(entry.mean))
+                Text(kind.formatWithUnit(entry.typicalWindowValue))
                     .font(.subheadline.monospacedDigit())
             }
             HStack(spacing: 14) {
-                statistic("Low", kind.format(entry.minimum))
-                statistic("High", kind.format(entry.maximum))
-                statistic("Samples", "\(entry.sampleCount)")
+                statistic("Lowest window", kind.format(entry.lowestWindowValue))
+                statistic("Highest window", kind.format(entry.highestWindowValue))
+                statistic("Windows", "\(entry.windowCount)")
+                statistic("Original samples", originalSampleText)
                 Spacer()
+            }
+            if entry.includesCompactedWindows {
+                Text(compactionNote)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(entry.source.displayName), mean \(kind.formatWithUnit(entry.mean)), low \(kind.format(entry.minimum)), high \(kind.format(entry.maximum)), \(entry.sampleCount) samples")
+        .accessibilityLabel(accessibilityDescription)
+    }
+
+    private var originalSampleText: String {
+        entry.originalSampleCount.map(String.init) ?? "unknown"
+    }
+
+    private var compactionNote: String {
+        entry.originalSampleCount == nil
+            ? "Includes compacted window medians. Some original sample counts were never recorded, so the number of measurements behind these windows is unknown."
+            : "Includes compacted window medians: the original samples are gone and only their count and spread were kept."
+    }
+
+    /// Spells out what each number is, because the shortened on-screen labels rely on
+    /// column position that VoiceOver does not convey.
+    private var accessibilityDescription: String {
+        let base = "\(entry.source.displayName), typical \(kind.formatWithUnit(entry.typicalWindowValue)) across \(entry.windowCount) \(entry.windowCount == 1 ? "window" : "windows"), lowest window median \(kind.format(entry.lowestWindowValue)), highest window median \(kind.format(entry.highestWindowValue))"
+        let depth = entry.originalSampleCount.map { ", from \($0) original \($0 == 1 ? "sample" : "samples")" }
+            ?? ", original sample count unknown"
+        let compaction = entry.includesCompactedWindows ? ", includes compacted window medians" : ""
+        return base + depth + compaction
     }
 
     private func statistic(_ label: String, _ value: String) -> some View {

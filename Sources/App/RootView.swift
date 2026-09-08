@@ -123,4 +123,16 @@ enum TimeRange: String, CaseIterable, Identifiable, Sendable {
         case .month:    "Last 30 days"
         }
     }
+
+    /// The next longer span, or nil at the widest. Screens that tell the user to widen the
+    /// range use this to offer the action directly rather than only describing it.
+    var wider: TimeRange? {
+        switch self {
+        case .hour:     .sixHours
+        case .sixHours: .day
+        case .day:      .week
+        case .week:     .month
+        case .month:    nil
+        }
+    }
 }

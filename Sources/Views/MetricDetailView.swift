@@ -12,8 +12,12 @@ struct MetricDetailView: View {
     /// Presentation only. Estimated values are drawn as dashed lines when this is on; they
     /// are never fed into a comparison verdict either way \u{2014} see `MetricDetailSnapshot`.
     @State private var showEstimates = true
+    /// Bumped by the retry button so the snapshot below re-runs its query. Reading it in
+    /// `body` is what makes the retry work; it is not dead code.
+    @State private var retryToken = 0
 
     var body: some View {
+        let _ = retryToken
         // Resolved once per update and threaded through every section. The chart, the
         // band, the legend, the per-device table, and the pair list are five projections
         // of one windowing pass; computing them separately re-read the whole archive and
@@ -46,7 +50,12 @@ struct MetricDetailView: View {
             }
 
             Section {
-                if snapshot.points.isEmpty {
+                if let failure = snapshot.queryFailure {
+                    // A failed read is not an empty range. Saying "no data" here would be a
+                    // claim about the user's history that this screen cannot support.
+                    HistoryUnavailableView(error: failure) { retryToken &+= 1 }
+                        .accessibilityIdentifier("metric.unavailable")
+                } else if snapshot.points.isEmpty {
                     Text("No \(kind.title.lowercased()) data in this range.")
                         .foregroundStyle(.secondary)
                         .font(.subheadline)
@@ -67,10 +76,14 @@ struct MetricDetailView: View {
             }
 
             if !snapshot.perSourceStats.isEmpty {
-                Section("Per device, \(range.title.lowercased())") {
+                Section {
                     ForEach(snapshot.perSourceStats) { entry in
                         PerSourceStatsRow(kind: kind, entry: entry)
                     }
+                } header: {
+                    Text("Per device, \(range.title.lowercased())")
+                } footer: {
+                    Text("These summarise one median per device per \(WindowLabel.length(snapshot.bucketSize)) window \u{2014} the same windows the chart draws. They are not raw sample statistics: readings older than the compaction age are stored as one median per window, so the original minimum, maximum and mean no longer exist. Where the original sample count was recorded it is shown separately; where it was not, it is shown as unknown.")
                 }
             }
 
@@ -136,13 +149,15 @@ struct MetricDetailView: View {
                 .interpolationMethod(.monotone)
             }
 
+            // Every mark keys on `sourceID`, never on the display name. Two devices called
+            // "Polar H10" are two series; renaming one is a label change, not a data move.
             ForEach(snapshot.points) { point in
                 LineMark(
                     x: .value("Time", point.date),
                     y: .value(kind.title, point.value),
-                    series: .value("Source", point.sourceName)
+                    series: .value("Source", point.sourceID)
                 )
-                .foregroundStyle(by: .value("Source", point.sourceName))
+                .foregroundStyle(by: .value("Source", point.sourceID))
                 .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, dash: point.isEstimate ? [4, 3] : []))
                 .interpolationMethod(.monotone)
 
@@ -151,11 +166,13 @@ struct MetricDetailView: View {
                     x: .value("Time", point.date),
                     y: .value(kind.title, point.value)
                 )
-                .foregroundStyle(by: .value("Source", point.sourceName))
+                .foregroundStyle(by: .value("Source", point.sourceID))
+                .symbol(by: .value("Source", point.sourceID))
                 .symbolSize(36)
             }
         }
         .chartForegroundStyleScale(domain: snapshot.styleDomain, range: snapshot.styleRange)
+        .chartSymbolScale(domain: snapshot.styleDomain, range: snapshot.symbolRange)
         .chartLegend(.hidden)
         .chartYScale(domain: snapshot.yDomain)
         .chartXAxis {
@@ -169,20 +186,30 @@ struct MetricDetailView: View {
         }
     }
 
+    /// Legend entries come from the same `series` the chart scales use, so a label here can
+    /// never name a different device than the line it points at. The symbol is spoken as
+    /// well as drawn: a legend that only differs by colour is unusable to a reader who
+    /// cannot distinguish the two colours.
     private func legend(_ snapshot: MetricDetailSnapshot) -> some View {
-        HStack(spacing: 14) {
-            ForEach(snapshot.sourcesInRange, id: \.id) { source in
-                HStack(spacing: 5) {
-                    SourceDot(color: source.color, size: 8)
-                    Text(source.displayName)
-                        .font(.caption2)
-                        .lineLimit(1)
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(source.displayName)
-            }
-            Spacer(minLength: 0)
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) { legendEntries(snapshot) }
+            VStack(alignment: .leading, spacing: 5) { legendEntries(snapshot) }
         }
+    }
+
+    @ViewBuilder
+    private func legendEntries(_ snapshot: MetricDetailSnapshot) -> some View {
+        ForEach(snapshot.series) { entry in
+            HStack(spacing: 5) {
+                SourceDot(color: entry.color, size: 8)
+                Text(entry.label)
+                    .font(.caption2)
+                    .lineLimit(1)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(entry.label), \(entry.symbol.accessibilityName) marks")
+        }
+        Spacer(minLength: 0)
     }
 
     private var axisFormat: Date.FormatStyle {
