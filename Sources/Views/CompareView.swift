@@ -10,6 +10,17 @@ struct CompareView: View {
     @State private var retryToken = 0
     @State private var snapshot: ComparisonSnapshot?
     @State private var isLoading = false
+    /// Non-nil when the user has opened a saved session: the analysed span is then fixed
+    /// rather than sliding with the clock.
+    @State private var activeSession: ComparisonSession?
+    @State private var showingSessions = false
+    @State private var savingSession = false
+    @State private var revisitNotice: String?
+
+    /// The span actually analysed. A saved session pins it; otherwise it rolls.
+    private var period: ComparisonPeriod {
+        activeSession.map { .fixed($0.interval) } ?? .rolling(range)
+    }
 
     /// Everything a snapshot depends on. When this changes the previous load is cancelled
     /// and a new one starts; when it has not changed, an unrelated view update reuses the
@@ -18,6 +29,7 @@ struct CompareView: View {
         var generation: Int
         var range: TimeRange
         var alertThreshold: DiscrepancySeverity
+        var sessionID: UUID?
         var enabledSourceIDs: [String]
         var hiddenSourceIDs: [String]
         var retryToken: Int
@@ -28,6 +40,7 @@ struct CompareView: View {
             generation: model.store.changeToken,
             range: range,
             alertThreshold: model.settings.snapshot.discrepancyThreshold,
+            sessionID: activeSession?.id,
             enabledSourceIDs: model.store.enabledSources.map(\.id).sorted(),
             hiddenSourceIDs: model.settings.snapshot.comparisonHidden.sorted(),
             retryToken: retryToken
@@ -41,12 +54,16 @@ struct CompareView: View {
             // range \u{2014} so the control that widens it has to still be on screen.
             List {
                 Section {
-                    Picker("Range", selection: $range) {
-                        ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
+                    if let session = activeSession {
+                        sessionBanner(session)
+                    } else {
+                        Picker("Range", selection: $range) {
+                            ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                        .accessibilityIdentifier("compare.range")
                     }
-                    .pickerStyle(.segmented)
-                    .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
-                    .accessibilityIdentifier("compare.range")
                 }
 
                 if let snapshot {
@@ -66,6 +83,30 @@ struct CompareView: View {
             .navigationTitle("Compare")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Button("Saved sessions\u{2026}", systemImage: "bookmark") { showingSessions = true }
+                        Button("Save this period\u{2026}", systemImage: "bookmark.square") { savingSession = true }
+                        if activeSession != nil {
+                            Button("Back to rolling range", systemImage: "clock.arrow.circlepath") {
+                                activeSession = nil
+                                revisitNotice = nil
+                            }
+                        }
+                    } label: {
+                        Label("Sessions", systemImage: "bookmark")
+                    }
+                    .accessibilityIdentifier("compare.sessions")
+                }
+            }
+            .sheet(isPresented: $showingSessions) {
+                ComparisonSessionsView { session in openSession(session) }
+            }
+            .sheet(isPresented: $savingSession) {
+                SaveComparisonSessionView(
+                    start: period.interval.start,
+                    end: period.interval.end
+                )
             }
             // `.task(id:)` cancels the in-flight load whenever the key changes, so a slow
             // month-range load cannot land after the user has switched back to an hour.
@@ -79,7 +120,7 @@ struct CompareView: View {
                 guard !Task.isCancelled else { return }
                 let resolved = ComparisonSnapshot(
                     store: model.store,
-                    range: range,
+                    period: period,
                     alertThreshold: model.settings.snapshot.discrepancyThreshold,
                     hiddenSourceIDs: model.settings.snapshot.comparisonHidden
                 )
@@ -127,6 +168,58 @@ struct CompareView: View {
                         Text(overviewFooter(snapshot))
                     }
                 }
+        }
+    }
+
+    /// Shows that a fixed span is in force, and whether the data behind it has moved.
+    @ViewBuilder
+    private func sessionBanner(_ session: ComparisonSession) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(session.displayTitle, systemImage: "bookmark.fill")
+                .font(.subheadline.weight(.semibold))
+            Text("\(session.interval.start.formatted(date: .abbreviated, time: .shortened)) \u{2013} \(session.interval.end.formatted(date: .omitted, time: .shortened))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !session.context.isEmpty {
+                Text(session.context)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            // A saved session is a saved *selection*. Data for its period keeps arriving,
+            // so a revisit says when the result is no longer the one that was seen.
+            if let revisitNotice {
+                Label(revisitNotice, systemImage: "arrow.down.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            let missing = session.missingSourceIDs(in: model.store.sources)
+            if !missing.isEmpty {
+                Label(
+                    "\(missing.count) saved \(missing.count == 1 ? "device is" : "devices are") no longer set up, so this is not the comparison that was saved.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("compare.session")
+    }
+
+    /// Opens a saved session and discloses what has changed since it was last viewed.
+    private func openSession(_ session: ComparisonSession) {
+        activeSession = session
+        revisitNotice = nil
+        Task {
+            // Counted from the same fixed interval the analysis uses, so the disclosure
+            // describes the session's own period rather than the whole database.
+            let outcome = model.store.readingsOutcome(in: session.interval, enabledOnly: false)
+            guard let readings = outcome.value else { return }
+            revisitNotice = session.revisitDisclosure(currentReadingCount: readings.count)
+            await model.sessions.noteViewed(id: session.id, readingCount: readings.count)
         }
     }
 
@@ -181,7 +274,9 @@ struct CompareView: View {
     /// only one of those is fixed by widening the range.
     @ViewBuilder
     private func emptyState(_ reason: ComparisonEmptyReason) -> some View {
-        let wider = range.wider
+        // Widening is only offered for a rolling range. A saved session's span is fixed by
+        // definition, so silently widening it would analyse a different period.
+        let wider = activeSession == nil ? range.wider : nil
         EmptyStateView(
             systemImage: reason.systemImage,
             title: reason.title,
@@ -216,7 +311,9 @@ struct CompareView: View {
                 )
                 .foregroundStyle(.green)
                 .font(.subheadline.weight(.semibold))
-                Text("\(snapshot.overview.readyCount) ready \(snapshot.overview.readyCount == 1 ? "pair" : "pairs") assessed across \(range.title.lowercased()).")
+                // Names the span actually analysed: with a session open that is the saved
+                // period, not the rolling preset the picker would otherwise imply.
+                Text("\(snapshot.overview.readyCount) ready \(snapshot.overview.readyCount == 1 ? "pair" : "pairs") assessed across \(period.title.lowercased()).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if !snapshot.incomplete.isEmpty {
@@ -301,6 +398,9 @@ private struct ComparisonSnapshot {
     /// Pairs with no overlap or too few paired windows, in any metric.
     let incomplete: [PairwiseAnalysis]
 
+    /// The span actually analysed, so callers can report it rather than re-deriving it.
+    let interval: DateInterval
+
     /// Pairs confirmed to be two transports of one device. Surfaced at this level, not
     /// only in pairwise detail, so the overview cannot imply independent corroboration.
     let sameDevicePairKeys: Set<String>
@@ -310,11 +410,14 @@ private struct ComparisonSnapshot {
 
     init(
         store: HealthStore,
-        range: TimeRange,
+        period: ComparisonPeriod,
         alertThreshold: DiscrepancySeverity,
         hiddenSourceIDs: Set<String>
     ) {
-        let interval = range.interval
+        // Resolved once. A fixed period returns the same seconds on every read, which is
+        // what makes a saved session re-openable; a rolling one resolves against `.now`.
+        let interval = period.interval
+        self.interval = interval
         // Estimates never participate in a device comparison, so they are dropped before
         // the metric list is built as well as inside the engine — otherwise a metric with
         // one real device plus the estimate source would look comparable.
