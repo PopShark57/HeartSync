@@ -12,25 +12,77 @@ struct MetricDetailView: View {
     /// Presentation only. Estimated values are drawn as dashed lines when this is on; they
     /// are never fed into a comparison verdict either way \u{2014} see `MetricDetailSnapshot`.
     @State private var showEstimates = true
-    /// Bumped by the retry button so the snapshot below re-runs its query. Reading it in
-    /// `body` is what makes the retry work; it is not dead code.
+    /// Bumped by the retry button so the load key changes and the query runs again.
     @State private var retryToken = 0
+    @State private var snapshot: MetricDetailSnapshot?
 
-    var body: some View {
-        let _ = retryToken
-        // Resolved once per update and threaded through every section. The chart, the
-        // band, the legend, the per-device table, and the pair list are five projections
-        // of one windowing pass; computing them separately re-read the whole archive and
-        // re-bucketed it for each projection, and `TimeRange.interval` is relative to
-        // `.now`, so those passes did not even describe the same span.
-        let snapshot = MetricDetailSnapshot(
-            store: model.store,
+    /// Everything the snapshot depends on. An unrelated view update leaves this unchanged
+    /// and reuses the resolved snapshot instead of re-reading and re-windowing the range.
+    private struct LoadKey: Hashable {
+        var generation: Int
+        var kind: MetricKind
+        var range: TimeRange
+        var showEstimates: Bool
+        var hrvQualityCount: Int
+        var retryToken: Int
+    }
+
+    private var loadKey: LoadKey {
+        LoadKey(
+            generation: model.store.changeToken,
             kind: kind,
             range: range,
-            includeEstimates: showEstimates,
-            hrvQuality: isHRV ? model.bluetooth.hrvQuality : [:]
+            showEstimates: showEstimates,
+            hrvQualityCount: isHRV ? model.bluetooth.hrvQuality.count : 0,
+            retryToken: retryToken
         )
+    }
 
+    var body: some View {
+        // Resolved off the render path, once per load key. The chart, the band, the
+        // legend, the per-device table, and the pair list are five projections of one
+        // windowing pass; computing them separately re-read the whole archive and
+        // re-bucketed it for each projection, and `TimeRange.interval` is relative to
+        // `.now`, so those passes did not even describe the same span. Building it inside
+        // `body` also meant every unrelated update paid for the whole pass again.
+        Group {
+            if let snapshot {
+                content(snapshot)
+            } else {
+                List {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Loading \(kind.title.lowercased())\u{2026}")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityIdentifier("metric.loading")
+                }
+            }
+        }
+        .navigationTitle(kind.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { range = initialRange }
+        // Cancels a superseded load and rejects a late one, so a slow month-range result
+        // cannot replace a newer hour-range selection.
+        .task(id: loadKey) {
+            let key = loadKey
+            try? await Task.sleep(for: .milliseconds(16))
+            guard !Task.isCancelled else { return }
+            let resolved = MetricDetailSnapshot(
+                store: model.store,
+                kind: kind,
+                range: range,
+                includeEstimates: showEstimates,
+                hrvQuality: isHRV ? model.bluetooth.hrvQuality : [:]
+            )
+            guard !Task.isCancelled, key == loadKey else { return }
+            snapshot = resolved
+        }
+    }
+
+    @ViewBuilder
+    private func content(_ snapshot: MetricDetailSnapshot) -> some View {
         List {
             Section {
                 Picker("Range", selection: $range) {
@@ -128,9 +180,6 @@ struct MetricDetailView: View {
                 }
             }
         }
-        .navigationTitle(kind.title)
-        .navigationBarTitleDisplayMode(.inline)
-        .onAppear { range = initialRange }
     }
 
     private var isHRV: Bool { kind == .hrvRMSSD || kind == .hrvSDNN }

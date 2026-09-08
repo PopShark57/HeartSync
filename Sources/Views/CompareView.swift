@@ -5,24 +5,34 @@ import SwiftUI
 struct CompareView: View {
     @Environment(AppModel.self) private var model
     @State private var range: TimeRange = .day
-    /// Bumped by the retry button. Reading it here makes the snapshot depend on it, so a
-    /// retry re-runs the query without touching or resetting any stored data.
+    /// Bumped by the retry button so the load key changes and the query runs again. It
+    /// re-reads only; nothing here resets or reimports stored data.
     @State private var retryToken = 0
+    @State private var snapshot: ComparisonSnapshot?
+    @State private var isLoading = false
+
+    /// Everything a snapshot depends on. When this changes the previous load is cancelled
+    /// and a new one starts; when it has not changed, an unrelated view update reuses the
+    /// snapshot instead of re-querying and re-windowing the whole range.
+    private struct LoadKey: Hashable {
+        var generation: Int
+        var range: TimeRange
+        var alertThreshold: DiscrepancySeverity
+        var enabledSourceIDs: [String]
+        var retryToken: Int
+    }
+
+    private var loadKey: LoadKey {
+        LoadKey(
+            generation: model.store.changeToken,
+            range: range,
+            alertThreshold: model.settings.snapshot.discrepancyThreshold,
+            enabledSourceIDs: model.store.enabledSources.map(\.id).sorted(),
+            retryToken: retryToken
+        )
+    }
 
     var body: some View {
-        // Read so the snapshot below depends on it: tapping Try again re-evaluates the
-        // body and re-runs the query. Not dead code — deleting it disables the retry.
-        let _ = retryToken
-        // Resolved once per update and handed down. Every subview reading its own
-        // computed property would re-window the whole archive, and `TimeRange.interval`
-        // is relative to `.now`, so repeated calls would also compare slightly different
-        // spans within a single frame.
-        let snapshot = ComparisonSnapshot(
-            store: model.store,
-            range: range,
-            alertThreshold: model.settings.snapshot.discrepancyThreshold
-        )
-
         NavigationStack {
             // The range control lives outside the result content on purpose. When a narrow
             // range holds nothing comparable, the empty state tells the user to widen the
@@ -37,6 +47,46 @@ struct CompareView: View {
                     .accessibilityIdentifier("compare.range")
                 }
 
+                if let snapshot {
+                    content(snapshot)
+                } else {
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("Loading comparison\u{2026}")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .accessibilityIdentifier("compare.loading")
+                    }
+                }
+            }
+            .navigationTitle("Compare")
+            // `.task(id:)` cancels the in-flight load whenever the key changes, so a slow
+            // month-range load cannot land after the user has switched back to an hour.
+            .task(id: loadKey) {
+                let key = loadKey
+                isLoading = true
+                defer { isLoading = false }
+                // One frame of slack so dragging across the range picker starts a single
+                // load rather than one per intermediate selection.
+                try? await Task.sleep(for: .milliseconds(16))
+                guard !Task.isCancelled else { return }
+                let resolved = ComparisonSnapshot(
+                    store: model.store,
+                    range: range,
+                    alertThreshold: model.settings.snapshot.discrepancyThreshold
+                )
+                // Rejects a late result: the selection may have moved on while this ran.
+                guard !Task.isCancelled, key == loadKey else { return }
+                snapshot = resolved
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func content(_ snapshot: ComparisonSnapshot) -> some View {
+        Group {
                 if let failure = snapshot.queryFailure {
                     Section {
                         HistoryUnavailableView(error: failure) { retryToken &+= 1 }
@@ -71,8 +121,6 @@ struct CompareView: View {
                         Text("HeartSync uses median values in epoch-aligned windows and excludes estimates. Ready analyses use mean bias and 95% limits of agreement; insufficient overlap is never treated as agreement.")
                     }
                 }
-            }
-            .navigationTitle("Compare")
         }
     }
 
