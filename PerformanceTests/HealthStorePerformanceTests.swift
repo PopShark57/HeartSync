@@ -178,4 +178,153 @@ struct HealthStorePerformanceTests {
               range changes during ingest: \(rangeChangeDurations.map(\.description).joined(separator: ", "))
             """)
     }
+
+    // MARK: - Live screens during ingest
+
+    /// Longest acceptable single Now reload. The screen reloads at most once a second
+    /// during live ingest, so this is the per-second main-thread cost of keeping Now current.
+    static let nowReloadBudget: Duration = .milliseconds(50)
+
+    /// Largest acceptable share of main-thread time spent reloading Now and an open 30-day
+    /// detail screen while a strap streams at 1 Hz. The rest is left for scrolling,
+    /// animation, and the ingest itself.
+    ///
+    /// Both budgets are initial values chosen before any device run, set so a regression to
+    /// per-reading reloads fails them clearly. Confirm or tune them on the first
+    /// representative-device measurement and record the result in `RELEASE_CHECKLIST.md`.
+    static let mainThreadShareBudget = 0.25
+
+    /// Now and a 30-day metric detail left open while a strap streams at 1 Hz on top of two
+    /// weeks of history (improvement 29).
+    ///
+    /// Replays the screens' own reload rule, `LiveReloadPolicy`, against a simulated clock:
+    /// each simulated second appends one strap reading, and a screen rebuilds its snapshot
+    /// only when the policy would let it. Snapshot construction is exactly what the screens
+    /// run on the main actor, so the summed durations are the main-thread cost of staying
+    /// current. The previous behaviour — a reload after every reading, and a two-day read
+    /// for every metric on Now — is what these budgets exist to keep out.
+    @Test("Now and a 30-day detail stay within a main-thread budget during 1 Hz ingest")
+    func liveScreensDuringIngest() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HeartSync-device-live-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = HealthStore(
+            persistenceEnabled: true,
+            databaseURL: directory.appendingPathComponent("health.sqlite3"),
+            archive: ReadingArchive(directory: directory)
+        )
+        await store.loadIfNeeded()
+        #expect(store.loadState == .loaded)
+
+        let strapID = "performance.live-strap"
+        let ringID = "performance.live-ring"
+        store.upsert(DataSource(id: strapID, displayName: "Strap", transport: .bluetooth))
+        store.upsert(DataSource(id: ringID, displayName: "Ring", transport: .oura))
+
+        // Two weeks of history, ending where the simulated live minute begins.
+        let liveSeconds = 120
+        let historyEnd = Date.now.addingTimeInterval(-TimeInterval(liveSeconds) - 1)
+        let historyStart = historyEnd.addingTimeInterval(-14 * 86_400)
+        for hour in 0..<(14 * 24) {
+            let base = historyStart.addingTimeInterval(TimeInterval(hour) * 3_600)
+            var batch = (0..<3_600).map { second in
+                Reading(
+                    id: UUID(stableFrom: "perf.live.strap.\(hour).\(second)"),
+                    sourceID: strapID,
+                    kind: .heartRate,
+                    value: 60 + Double((hour + second) % 40),
+                    start: base.addingTimeInterval(TimeInterval(second))
+                )
+            }
+            for slot in 0..<12 {
+                batch.append(Reading(
+                    id: UUID(stableFrom: "perf.live.ring.\(hour).\(slot)"),
+                    sourceID: ringID,
+                    kind: .heartRate,
+                    value: 62 + Double((hour + slot) % 36),
+                    start: base.addingTimeInterval(TimeInterval(slot) * 300)
+                ))
+            }
+            _ = store.append(contentsOf: batch)
+            await Task.yield()
+        }
+
+        let clock = ContinuousClock()
+        let detailPeriod = ComparisonPeriod.rolling(.month)
+        var nowDurations: [Duration] = []
+        var detailDurations: [Duration] = []
+        var lastNowLoad: Date?
+        var lastDetailLoad: Date?
+
+        for second in 0..<liveSeconds {
+            let stamp = historyEnd.addingTimeInterval(TimeInterval(second + 1))
+            _ = store.append(Reading(
+                id: UUID(stableFrom: "perf.live.stream.\(second)"),
+                sourceID: strapID,
+                kind: .heartRate,
+                value: 70 + Double(second % 9),
+                start: stamp
+            ))
+
+            if LiveReloadPolicy.delay(
+                dataOnly: true,
+                elapsed: lastNowLoad.map { stamp.timeIntervalSince($0) },
+                minimumInterval: LiveReloadPolicy.liveScreenInterval
+            ) <= LiveReloadPolicy.debounce {
+                let started = clock.now
+                _ = DashboardSnapshot(store: store, now: stamp)
+                nowDurations.append(started.duration(to: clock.now))
+                lastNowLoad = stamp
+            }
+
+            if LiveReloadPolicy.delay(
+                dataOnly: true,
+                elapsed: lastDetailLoad.map { stamp.timeIntervalSince($0) },
+                minimumInterval: LiveReloadPolicy.minimumInterval(for: detailPeriod)
+            ) <= LiveReloadPolicy.debounce {
+                let started = clock.now
+                _ = MetricDetailSnapshot(
+                    store: store,
+                    kind: .heartRate,
+                    period: detailPeriod,
+                    includeEstimates: true,
+                    hrvQuality: [:]
+                )
+                detailDurations.append(started.duration(to: clock.now))
+                lastDetailLoad = stamp
+            }
+            await Task.yield()
+        }
+
+        func seconds(_ duration: Duration) -> Double {
+            Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+        }
+        func mean(_ durations: [Duration]) -> Double {
+            durations.isEmpty ? 0 : durations.map(seconds).reduce(0, +) / Double(durations.count)
+        }
+        let sortedNow = nowDurations.sorted()
+        let nowP95 = sortedNow[min(sortedNow.count - 1, Int(Double(sortedNow.count) * 0.95))]
+        let detailInterval = LiveReloadPolicy.minimumInterval(for: detailPeriod)
+        // Steady state: each screen costs its mean reload time once per reload interval.
+        // A month range reloads rarely, so a two-minute window may hold one detail reload;
+        // measuring the share this way is still exact for the policy in force.
+        let share = mean(nowDurations) / LiveReloadPolicy.liveScreenInterval + mean(detailDurations) / detailInterval
+
+        print("""
+            Live screens during 1 Hz ingest over two weeks of history
+              rows: \(store.readingCount)
+              Now reloads: \(nowDurations.count) in \(liveSeconds) s, p95 \(nowP95), max \(sortedNow.last ?? .zero)
+              30-day detail reloads: \(detailDurations.count) (interval \(Int(detailInterval)) s), each \(detailDurations.map(\.description).joined(separator: ", "))
+              steady-state main-thread share: \(String(format: "%.1f", share * 100))%
+            """)
+
+        // The rule itself: at most one Now reload a second and one detail reload per
+        // interval, never one of each per reading.
+        #expect(nowDurations.count <= liveSeconds)
+        #expect(Double(detailDurations.count) <= Double(liveSeconds) / detailInterval + 1)
+        #expect(nowP95 <= Self.nowReloadBudget)
+        #expect(share <= Self.mainThreadShareBudget)
+    }
 }

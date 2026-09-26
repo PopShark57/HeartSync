@@ -85,9 +85,69 @@ final class HeartSyncCheckerUITests: XCTestCase {
         application.buttons["Pause collecting"].tap()
         XCTAssertTrue(row.label.contains("Paused"))
 
+        // Remove proposes; only the dialog's own button deletes. This fixture stores no
+        // readings, so the button says so rather than claiming to delete history.
         row.swipeLeft()
         application.buttons["Remove"].tap()
+        let confirm = application.buttons["Remove device"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        confirm.tap()
         XCTAssertFalse(row.waitForExistence(timeout: 1))
+    }
+
+    /// Reads a combined element's spoken text, whichever of label and value carries it.
+    private func spokenText(_ candidate: XCUIElement) -> String {
+        "\(candidate.label) \((candidate.value as? String) ?? "")"
+    }
+
+    func testRemovalAsksFirstAndDeletesOnlyThatDevice() {
+        let application = launch("removal")
+        application.buttons["Settings"].tap()
+        let stored = element("data.storedReadings", in: application)
+        XCTAssertTrue(scrollToElement(stored, in: application))
+        XCTAssertTrue(spokenText(stored).contains("24"))
+
+        application.buttons["Devices"].tap()
+        let strap = application.otherElements["source.22222222-2222-2222-2222-222222222222"]
+        let finger = application.otherElements["source.33333333-3333-3333-3333-333333333333"]
+        XCTAssertTrue(strap.waitForExistence(timeout: 3))
+        XCTAssertTrue(finger.exists)
+
+        // A drag across the whole row reveals the actions but must not perform one.
+        let confirm = application.buttons["Remove and delete readings"]
+        strap.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5))
+            .press(forDuration: 0.05, thenDragTo: strap.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.5)))
+        XCTAssertTrue(strap.exists)
+        XCTAssertFalse(confirm.exists)
+
+        // Remove proposes, and the dialog states the consequence in numbers.
+        if !application.buttons["Remove"].exists { strap.swipeLeft() }
+        application.buttons["Remove"].tap()
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        XCTAssertTrue(application.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@", "12 readings"
+        )).firstMatch.exists)
+
+        // Cancel leaves the device and every stored reading in place.
+        application.buttons["Cancel"].tap()
+        XCTAssertTrue(strap.waitForExistence(timeout: 2))
+        application.buttons["Settings"].tap()
+        XCTAssertTrue(scrollToElement(stored, in: application))
+        XCTAssertTrue(spokenText(stored).contains("24"))
+
+        // Confirming removes exactly that device's twelve readings and nothing else.
+        application.buttons["Devices"].tap()
+        XCTAssertTrue(strap.waitForExistence(timeout: 3))
+        strap.swipeLeft()
+        application.buttons["Remove"].tap()
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        confirm.tap()
+        XCTAssertFalse(strap.waitForExistence(timeout: 2))
+        XCTAssertTrue(finger.exists)
+        application.buttons["Settings"].tap()
+        XCTAssertTrue(scrollToElement(stored, in: application))
+        XCTAssertTrue(spokenText(stored).contains("12"))
+        XCTAssertFalse(spokenText(stored).contains("24"))
     }
 
     func testRetentionShorteningRequiresConfirmationAndCanCancel() {
@@ -118,6 +178,77 @@ final class HeartSyncCheckerUITests: XCTestCase {
         let endpointIssues = element("oura.endpointIssues", in: oura)
         XCTAssertTrue(scrollToElement(endpointIssues, in: oura))
         XCTAssertTrue(oura.staticTexts["Some data needs attention"].exists)
+    }
+
+    private func launchPairwiseDemo() -> XCUIApplication {
+        let application = XCUIApplication()
+        application.launchArguments = ["--pairwise-demo"]
+        application.launch()
+        return application
+    }
+
+    private func anyElement(containing text: String, in application: XCUIApplication) -> XCUIElement {
+        application.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch
+    }
+
+    private func openHeartRate(in application: XCUIApplication) {
+        let heartRate = application.buttons.matching(NSPredicate(
+            format: "label BEGINSWITH %@", "Heart Rate"
+        )).firstMatch
+        XCTAssertTrue(heartRate.waitForExistence(timeout: 5))
+        heartRate.tap()
+    }
+
+    func testMetricDetailKeepsTheChosenRangeAfterBack() {
+        let application = launchPairwiseDemo()
+        application.buttons["Compare"].tap()
+        openHeartRate(in: application)
+
+        let detailRange = element("metric.range", in: application)
+        XCTAssertTrue(detailRange.waitForExistence(timeout: 5))
+        detailRange.buttons["7D"].tap()
+        XCTAssertTrue(detailRange.buttons["7D"].isSelected)
+
+        // The pair opens at the range chosen on detail…
+        let pair = element("metric.pair", in: application)
+        XCTAssertTrue(scrollToElement(pair, in: application))
+        pair.tap()
+        let pairRange = element("pairwise.range", in: application)
+        XCTAssertTrue(pairRange.waitForExistence(timeout: 5))
+        XCTAssertTrue(pairRange.buttons["7D"].isSelected)
+
+        // …and Back no longer resets detail to the range it was first opened with.
+        application.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(detailRange.waitForExistence(timeout: 5))
+        XCTAssertTrue(detailRange.buttons["7D"].isSelected)
+        XCTAssertFalse(detailRange.buttons["24H"].isSelected)
+    }
+
+    func testSavedSessionPeriodReachesDetailAndPair() {
+        let application = launchPairwiseDemo()
+        application.buttons["Compare"].tap()
+        let sessions = element("compare.sessions", in: application)
+        XCTAssertTrue(sessions.waitForExistence(timeout: 5))
+        sessions.tap()
+        application.buttons["Saved sessions\u{2026}"].tap()
+        let demoWalk = application.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Demo walk")).firstMatch
+        XCTAssertTrue(demoWalk.waitForExistence(timeout: 5))
+        demoWalk.tap()
+        XCTAssertTrue(element("compare.session", in: application).waitForExistence(timeout: 5))
+
+        // Detail shows the session, not a rolling picker that would imply the last 24 hours.
+        openHeartRate(in: application)
+        XCTAssertTrue(element("metric.session", in: application).waitForExistence(timeout: 5))
+        XCTAssertFalse(element("metric.range", in: application).exists)
+
+        let pair = element("metric.pair", in: application)
+        XCTAssertTrue(scrollToElement(pair, in: application))
+        pair.tap()
+        XCTAssertTrue(element("pairwise.session", in: application).waitForExistence(timeout: 5))
+        XCTAssertFalse(element("pairwise.range", in: application).exists)
+        // Five of the fixture's eight paired minutes fall inside the session; the rolling
+        // range would report all eight.
+        XCTAssertTrue(anyElement(containing: "5 paired of 5", in: application).waitForExistence(timeout: 5))
     }
 
     func testPseudoLocalizationKeepsAllPrimaryTabsReachable() {

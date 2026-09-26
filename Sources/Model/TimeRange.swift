@@ -46,6 +46,15 @@ enum TimeRange: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// The shortest preset at least `duration` long, or the widest preset.
+    ///
+    /// A saved session's span is arbitrary; this picks the zoom level whose chart bucket and
+    /// axis labels suit it, so a one-hour walk is drawn like the 1H preset rather than with
+    /// the six-hour buckets of a month.
+    static func fitting(duration: TimeInterval) -> TimeRange {
+        allCases.first { $0.duration >= duration } ?? .month
+    }
+
     /// The next longer span, or nil at the widest. Screens that tell the user to widen the
     /// range use this to offer the action directly rather than only describing it.
     var wider: TimeRange? {

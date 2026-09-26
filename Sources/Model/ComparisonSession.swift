@@ -32,6 +32,24 @@ enum ComparisonPeriod: Hashable, Sendable {
             "\(interval.start.formatted(date: .abbreviated, time: .shortened)) to \(interval.end.formatted(date: .omitted, time: .shortened))"
         }
     }
+
+    /// The preset whose zoom suits this period: its own preset when rolling, otherwise the
+    /// shortest preset that covers the fixed span. Chart bucket and axis labels follow it.
+    var displayRange: TimeRange {
+        switch self {
+        case .rolling(let range): range
+        case .fixed(let interval): TimeRange.fitting(duration: interval.duration)
+        }
+    }
+
+    /// Chart bucket for this period, never finer than the preset that fits it.
+    var chartBucket: TimeInterval { displayRange.chartBucket }
+
+    /// The rolling preset, or nil for a fixed span that no picker selection describes.
+    var rollingRange: TimeRange? {
+        if case .rolling(let range) = self { return range }
+        return nil
+    }
 }
 
 /// A saved, re-openable comparison.

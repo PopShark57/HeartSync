@@ -1,5 +1,8 @@
 import Foundation
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Where a reading came from.
 ///
@@ -148,15 +151,52 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
 
     var color: Color { Self.palette[colorIndex % Self.palette.count] }
 
-    /// Distinct, colour-blind-tolerant hues. Sources are assigned round-robin on add.
-    static let palette: [Color] = [
-        Color(red: 0.00, green: 0.48, blue: 1.00),   // blue
-        Color(red: 1.00, green: 0.42, blue: 0.21),   // orange
-        Color(red: 0.20, green: 0.72, blue: 0.47),   // green
-        Color(red: 0.69, green: 0.32, blue: 0.87),   // purple
-        Color(red: 0.93, green: 0.26, blue: 0.45),   // rose
-        Color(red: 0.12, green: 0.70, blue: 0.78),   // teal
+    /// Source colour slots, in `colorIndex` order. Sources are assigned round-robin on add.
+    ///
+    /// Measured, not asserted: `ColourVisionTests` simulates every pair under protan,
+    /// deutan, and tritan deficiency (Machado et al. 2009, full severity) and requires a
+    /// CAM02-UCS ΔE of at least 15 between every two slots, and between every slot and the
+    /// neutral ink reserved for statistical reference lines, in both appearances. The
+    /// previous palette fell as low as 4.4 (green and teal under tritan). Each slot also
+    /// keeps at least 3:1 contrast against the list backgrounds it is drawn on.
+    ///
+    /// `colorIndex` persists, so slots are changed in place and never renumbered: every
+    /// device keeps its slot, and its shape (`SourceSymbol`), across this change.
+    static let paletteSlots: [SourcePaletteSlot] = [
+        SourcePaletteSlot(
+            name: "blue",
+            light: SRGBColor(red: 0.22, green: 0.27, blue: 0.67),    // #3845AB
+            dark: SRGBColor(red: 0.42, green: 0.65, blue: 1.00)      // #6BA6FF
+        ),
+        SourcePaletteSlot(
+            name: "amber",
+            light: SRGBColor(red: 0.48, green: 0.22, blue: 0.00),    // #7A3800
+            dark: SRGBColor(red: 0.75, green: 0.46, blue: 0.00)      // #BF7500
+        ),
+        SourcePaletteSlot(
+            name: "green",
+            light: SRGBColor(red: 0.28, green: 0.53, blue: 0.00),    // #478700
+            dark: SRGBColor(red: 0.67, green: 1.00, blue: 0.31)      // #ABFF4F
+        ),
+        SourcePaletteSlot(
+            name: "violet",
+            light: SRGBColor(red: 0.51, green: 0.26, blue: 1.00),    // #8242FF
+            dark: SRGBColor(red: 0.52, green: 0.38, blue: 1.00)      // #8561FF
+        ),
+        SourcePaletteSlot(
+            name: "magenta",
+            light: SRGBColor(red: 0.70, green: 0.00, blue: 0.39),    // #B20063
+            dark: SRGBColor(red: 0.85, green: 0.00, blue: 0.66)      // #D900A8
+        ),
+        SourcePaletteSlot(
+            name: "cyan",
+            light: SRGBColor(red: 0.09, green: 0.59, blue: 0.78),    // #1796C7
+            dark: SRGBColor(red: 0.07, green: 0.87, blue: 1.00)      // #12DEFF
+        ),
     ]
+
+    /// The slots as colours that follow the system appearance.
+    static let palette: [Color] = paletteSlots.map(\.color)
 
     static let ouraSourceID = "oura.cloud"
 
@@ -170,6 +210,26 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
               !relationship.isEmpty
         else { return false }
         return relationship == other.upstreamDeviceRelationshipID
+    }
+}
+
+extension SourcePaletteSlot {
+    /// Resolves to the light or dark value with the trait environment it is drawn in, as
+    /// the system colours around it do. A fixed sRGB value tuned for white lost contrast on
+    /// the dark list background.
+    var color: Color {
+        #if canImport(UIKit)
+        let light = self.light
+        let dark = self.dark
+        return Color(uiColor: UIColor { traits in
+            let value = traits.userInterfaceStyle == .dark ? dark : light
+            return UIColor(red: value.red, green: value.green, blue: value.blue, alpha: 1)
+        })
+        #else
+        // Only the macOS scratch test harness (AGENTS.md) builds without UIKit. It draws
+        // nothing, so the light value keeps the model layer compiling there.
+        return Color(red: light.red, green: light.green, blue: light.blue)
+        #endif
     }
 }
 

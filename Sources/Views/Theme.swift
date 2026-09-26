@@ -19,6 +19,57 @@ enum HeartSyncTheme {
 
     /// Soft lift used on dashboard tiles. Kept low so lists and Forms stay quiet.
     static let cardShadow = Color.black.opacity(0.10)
+
+    /// Styling for statistical reference lines on charts.
+    ///
+    /// Reference lines are drawn in neutral ink and told apart by dash pattern and weight,
+    /// never by hue. A mean-bias line in system blue matched palette slot 0 almost exactly,
+    /// so "Device A" and "mean bias" shared a colour on one screen; neutral ink is reserved
+    /// for statistics so a reference line can never be read as a device. The palette
+    /// validator in the tests checks every source colour against these inks.
+    enum Chart {
+        /// Mean bias and limits of agreement.
+        static var referenceInk: Color { .primary }
+        /// Zero difference and the fixed agreement tolerances.
+        static var secondaryReferenceInk: Color { .secondary }
+
+        static var meanBias: StrokeStyle { StrokeStyle(lineWidth: 2) }
+        static var limitsOfAgreement: StrokeStyle { StrokeStyle(lineWidth: 1.5, dash: [10, 4]) }
+        static var zeroDifference: StrokeStyle { StrokeStyle(lineWidth: 1) }
+        static var warningTolerance: StrokeStyle { StrokeStyle(lineWidth: 1, dash: [4, 3]) }
+        static var majorTolerance: StrokeStyle { StrokeStyle(lineWidth: 1, dash: [1.5, 3]) }
+        /// The dashed rule marking a selected window.
+        static var selection: StrokeStyle { StrokeStyle(lineWidth: 1, dash: [3, 3]) }
+    }
+}
+
+extension SRGBColor {
+    /// The same value in both appearances. Source slots use their own light/dark pair
+    /// instead (`SourcePaletteSlot.color`).
+    var color: Color { Color(red: red, green: green, blue: blue) }
+}
+
+/// A legend swatch that draws a reference line with its real stroke, so the key shows the
+/// same dash pattern the chart does rather than a coloured capsule.
+struct ReferenceLineSwatch: View {
+    var ink: Color
+    var style: StrokeStyle
+
+    var body: some View {
+        HorizontalRule()
+            .stroke(ink, style: style)
+            .frame(width: 24, height: max(style.lineWidth, 2))
+            .accessibilityHidden(true)
+    }
+
+    private struct HorizontalRule: Shape {
+        func path(in rect: CGRect) -> Path {
+            var path = Path()
+            path.move(to: CGPoint(x: rect.minX, y: rect.midY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+            return path
+        }
+    }
 }
 
 // MARK: - Surfaces

@@ -39,10 +39,14 @@ struct OuraHeartRateSection: View {
 
     private func chart(_ series: OuraHeartRateSeries) -> some View {
         Chart(series.points) { point in
+            // Monotone, not Catmull-Rom: Catmull-Rom curves overshoot and drew peaks and
+            // dips no sample had, contradicting the series' own "invents no value" contract.
+            // Keyed per segment so the line and its fill stop at a hole in the series.
             AreaMark(
                 x: .value("Time", point.date),
                 yStart: .value("Baseline", series.floor),
-                yEnd: .value("Heart rate", point.bpm)
+                yEnd: .value("Heart rate", point.bpm),
+                series: .value("Segment", point.segment)
             )
             .foregroundStyle(
                 LinearGradient(
@@ -51,15 +55,26 @@ struct OuraHeartRateSection: View {
                     endPoint: .bottom
                 )
             )
-            .interpolationMethod(.catmullRom)
+            .interpolationMethod(.monotone)
 
             LineMark(
                 x: .value("Time", point.date),
-                y: .value("Heart rate", point.bpm)
+                y: .value("Heart rate", point.bpm),
+                series: .value("Segment", point.segment)
             )
             .foregroundStyle(.pink)
             .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
-            .interpolationMethod(.catmullRom)
+            .interpolationMethod(.monotone)
+
+            // A sample alone between two holes has no line; the dot keeps it visible.
+            if point.isIsolated {
+                PointMark(
+                    x: .value("Time", point.date),
+                    y: .value("Heart rate", point.bpm)
+                )
+                .foregroundStyle(.pink)
+                .symbolSize(24)
+            }
         }
         .chartYAxis {
             AxisMarks(position: .leading)

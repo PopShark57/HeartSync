@@ -31,11 +31,18 @@ struct ChartPoint: Identifiable {
 /// vision deficiency, and someone comparing two devices whose palette entries are adjacent.
 /// Dash patterns are deliberately *not* used here \u{2014} the chart already spends dashes on
 /// "this value is modelled, not measured", and one visual channel cannot carry two meanings.
+///
+/// One shape per palette slot, chosen from the source's persisted `colorIndex`. Shape
+/// used to be positional within a chart, so a device's symbol changed whenever another
+/// device entered or left the range; now a device keeps its shape exactly as it keeps its
+/// colour, on every chart that draws it.
 enum SourceSymbol: Int, CaseIterable, Hashable, Sendable {
-    case circle, square, triangle, diamond, pentagon
+    case circle, square, triangle, diamond, pentagon, cross
 
-    static func forIndex(_ index: Int) -> SourceSymbol {
-        allCases[index % allCases.count]
+    /// The shape paired with a palette slot. Negative indices wrap rather than trap.
+    static func forColorIndex(_ index: Int) -> SourceSymbol {
+        let count = allCases.count
+        return allCases[((index % count) + count) % count]
     }
 
     var chartSymbol: BasicChartSymbolShape {
@@ -45,6 +52,7 @@ enum SourceSymbol: Int, CaseIterable, Hashable, Sendable {
         case .triangle: .triangle
         case .diamond:  .diamond
         case .pentagon: .pentagon
+        case .cross:    .cross
         }
     }
 
@@ -56,8 +64,15 @@ enum SourceSymbol: Int, CaseIterable, Hashable, Sendable {
         case .triangle: "triangle"
         case .diamond:  "diamond"
         case .pentagon: "pentagon"
+        case .cross:    "cross"
         }
     }
+}
+
+extension DataSource {
+    /// The mark shape paired with this source's colour slot, stable for the life of the
+    /// source in the same way its colour is.
+    var symbol: SourceSymbol { .forColorIndex(colorIndex) }
 }
 
 /// One chart series: a stable source identity plus everything needed to draw and name it.
@@ -77,6 +92,12 @@ struct BandPoint: Identifiable {
     var low: Double
     var high: Double
     var severity: DiscrepancySeverity
+    /// Area series key. It advances wherever the band breaks: at a gap in comparison, and
+    /// where the severity changes, because an area series takes one style for all of it.
+    var seriesKey: String = ""
+    /// A compared window with no compared neighbour. An area needs two points, so the view
+    /// draws this one as a short bar rather than losing it.
+    var isIsolated: Bool = false
 }
 
 /// One device's descriptive summary over the selected range.
@@ -130,6 +151,16 @@ struct HRVQualityEntry: Identifiable {
 /// slightly different spans of time, and drawing the screen costs one pass rather than ten.
 @MainActor
 struct MetricDetailSnapshot {
+    /// The period requested: a rolling preset, or a saved session's fixed span.
+    let period: ComparisonPeriod
+    /// The exact seconds analysed, resolved once. A rolling period is relative to `.now`,
+    /// so re-resolving it per projection would describe a slightly different span each time;
+    /// everything drawn from this snapshot, and every pair opened from it, uses this value.
+    let interval: DateInterval
+    /// Store generation this snapshot read, and when. Live reloads are coalesced, so the
+    /// screen compares this with the current generation to say when it is behind.
+    let generation: Int
+    let resolvedAt: Date
     /// Chart bucket actually used, which is the metric's comparison window widened to the
     /// zoom level so a month does not try to render 43,000 points.
     let bucketSize: TimeInterval
@@ -165,13 +196,35 @@ struct MetricDetailSnapshot {
         includeEstimates: Bool,
         hrvQuality: [UUID: HRVQuality]
     ) {
-        let interval = range.interval
+        self.init(
+            store: store,
+            kind: kind,
+            period: .rolling(range),
+            includeEstimates: includeEstimates,
+            hrvQuality: hrvQuality
+        )
+    }
+
+    init(
+        store: HealthStore,
+        kind: MetricKind,
+        period: ComparisonPeriod,
+        includeEstimates: Bool,
+        hrvQuality: [UUID: HRVQuality]
+    ) {
+        // Resolved once: a fixed period returns the same seconds on every read, and a
+        // rolling one is pinned here so every projection below agrees on "now".
+        let interval = period.interval
+        self.period = period
+        self.interval = interval
+        self.generation = store.changeToken
+        self.resolvedAt = .now
         let outcome = store.readingsOutcome(kind: kind, in: interval)
         self.queryFailure = outcome.error
         let readings = outcome.valueOrEmpty
         self.hasEstimatedReadings = readings.contains { $0.provenance == .estimated }
 
-        let bucketSize = max(kind.comparisonWindow, range.chartBucket)
+        let bucketSize = max(kind.comparisonWindow, period.chartBucket)
         self.bucketSize = bucketSize
         let windows = ComparisonEngine.windows(
             from: readings,
@@ -206,7 +259,7 @@ struct MetricDetailSnapshot {
         // The band is a disagreement verdict drawn on a chart, so it is built from measured
         // and derived values only. Showing estimates must never widen it or change its
         // colour: the switch above is presentation, and an estimate is not a device.
-        self.bandPoints = windows.compactMap { window in
+        let compared = windows.compactMap { window -> BandPoint? in
             let comparable = window.values.filter { $0.provenance != .estimated }
             guard comparable.count >= 2,
                   let low = comparable.min(by: { $0.value < $1.value }),
@@ -220,6 +273,7 @@ struct MetricDetailSnapshot {
                 severity: kind.agreement.severity(forDelta: high.value - low.value)
             )
         }
+        self.bandPoints = Self.bandRuns(compared, bucketSize: bucketSize)
 
         // Pads the observed range slightly so lines are not flush against the plot edges,
         // and never collapses to zero height when every reading is identical.
@@ -300,30 +354,93 @@ struct MetricDetailSnapshot {
     /// reporting every window, so only a genuinely missed window breaks the line.
     static func segmented(_ points: [ChartPoint], bucketSize: TimeInterval) -> [ChartPoint] {
         guard bucketSize > 0 else { return points }
-        let threshold = bucketSize * 1.5
+        let threshold = ChartSegmentation.windowThreshold(windowSize: bucketSize)
         var result: [ChartPoint] = []
         result.reserveCapacity(points.count)
 
         for (sourceID, group) in Dictionary(grouping: points, by: \.sourceID) {
             let ordered = group.sorted { $0.date < $1.date }
-            var segment = 0
-            var previous: Date?
-            for var point in ordered {
-                if let previous, point.date.timeIntervalSince(previous) > threshold { segment += 1 }
-                point.seriesKey = "\(sourceID)\u{001F}\(segment)"
-                previous = point.date
-                result.append(point)
+            let segments = ChartSegmentation.segments(for: ordered.map(\.date), threshold: threshold)
+            for (point, segment) in zip(ordered, segments) {
+                var keyed = point
+                keyed.seriesKey = ChartSegmentation.key(series: sourceID, segment: segment)
+                result.append(keyed)
             }
         }
         return result.sorted { $0.date < $1.date }
     }
 
+    /// Splits the disagreement band into areas that are honest about two things.
+    ///
+    /// **Gaps.** A window where fewer than two devices reported has no band. One area drawn
+    /// across it shaded "disagreement" over time when nothing was compared, so the band
+    /// breaks at a missing window exactly as the lines do.
+    ///
+    /// **Severity.** Swift Charts draws a whole area series in the style of its first mark,
+    /// so one area per stretch painted every window in the first window's colour: a major
+    /// disagreement after an agreeing start was shaded as agreement. Each run of equal
+    /// severity is its own series instead. Where the severity changes the two runs meet at
+    /// the midpoint between the windows, so each window keeps its own colour for its half
+    /// of the interval and the band stays continuous.
+    ///
+    /// A compared window with no compared neighbour is kept and flagged `isIsolated`.
+    static func bandRuns(_ band: [BandPoint], bucketSize: TimeInterval) -> [BandPoint] {
+        let ordered = band.sorted { $0.date < $1.date }
+        let gaps = ChartSegmentation.segments(
+            for: ordered.map(\.date),
+            threshold: ChartSegmentation.windowThreshold(windowSize: bucketSize)
+        )
+        var result: [BandPoint] = []
+        result.reserveCapacity(ordered.count)
+        var run = -1
+
+        func emit(_ point: BandPoint, id: String) {
+            var keyed = point
+            keyed.id = id
+            keyed.seriesKey = ChartSegmentation.key(series: "band", segment: run)
+            result.append(keyed)
+        }
+
+        for index in ordered.indices {
+            let point = ordered[index]
+            guard index > 0, gaps[index] == gaps[index - 1] else {
+                run += 1
+                emit(point, id: point.id)
+                continue
+            }
+            let previous = ordered[index - 1]
+            if point.severity != previous.severity {
+                let middle = BandPoint(
+                    id: "",
+                    date: Date(timeIntervalSince1970: (previous.date.timeIntervalSince1970 + point.date.timeIntervalSince1970) / 2),
+                    low: (previous.low + point.low) / 2,
+                    high: (previous.high + point.high) / 2,
+                    severity: previous.severity
+                )
+                emit(middle, id: "\(previous.id)\u{001F}end")
+                run += 1
+                var opening = middle
+                opening.severity = point.severity
+                emit(opening, id: "\(point.id)\u{001F}start")
+            }
+            emit(point, id: point.id)
+        }
+
+        var counts: [String: Int] = [:]
+        for point in result { counts[point.seriesKey, default: 0] += 1 }
+        for index in result.indices { result[index].isIsolated = counts[result[index].seriesKey] == 1 }
+        return result
+    }
+
     /// Builds the chart series for the sources visible in this range.
     ///
-    /// Colour comes from `DataSource.colorIndex`, which the store assigns once per device
-    /// and never reuses while that device exists, so a device keeps its colour across
-    /// ranges and relaunches. The symbol is positional within this chart, which is enough
-    /// to separate two adjacent palette entries on screen.
+    /// Colour and symbol both come from `DataSource.colorIndex`, which the store assigns
+    /// once per device and never reuses while that device exists, so a device keeps its
+    /// colour and its shape across ranges, charts, and relaunches.
+    ///
+    /// Only past six devices can two visible sources share a slot. Then the later one takes
+    /// the first shape no other visible series uses, so the two stay apart by shape even
+    /// though their colours match.
     ///
     /// Labels are disambiguated only where they collide. A user with one "Polar H10" sees
     /// "Polar H10"; a user whose ring is visible over both Bluetooth and Apple Health sees
@@ -338,6 +455,7 @@ struct MetricDetailSnapshot {
             transportCounts["\(source.displayName)\u{001F}\(source.transport.title)", default: 0] += 1
         }
 
+        let symbols = Self.symbols(for: sources)
         return sources.enumerated().map { index, source in
             let label: String
             if (nameCounts[source.displayName] ?? 0) <= 1 {
@@ -353,8 +471,27 @@ struct MetricDetailSnapshot {
                 sourceID: source.id,
                 label: label,
                 color: source.color,
-                symbol: SourceSymbol.forIndex(index)
+                symbol: symbols[index]
             )
+        }
+    }
+
+    /// Each source's own slot shape, except where two visible sources share a slot: the
+    /// later one then takes the first shape nobody visible is using.
+    static func symbols(for sources: [DataSource]) -> [SourceSymbol] {
+        // First pass: every source claims its own shape, so an unshared slot never moves.
+        var owner: [SourceSymbol: Int] = [:]
+        for (index, source) in sources.enumerated() where owner[source.symbol] == nil {
+            owner[source.symbol] = index
+        }
+        var used = Set(owner.keys)
+        return sources.enumerated().map { index, source in
+            if owner[source.symbol] == index { return source.symbol }
+            guard let spare = SourceSymbol.allCases.first(where: { !used.contains($0) }) else {
+                return source.symbol
+            }
+            used.insert(spare)
+            return spare
         }
     }
 

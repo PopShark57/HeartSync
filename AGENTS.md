@@ -103,7 +103,7 @@ code and does not access HealthKit. App Group sharing is local to the watch, not
 - Framework-specific: `Sources/Bluetooth` for CoreBluetooth, `Sources/Health` for HealthKit, and the OAuth presentation code in `Sources/Oura/OuraOAuth.swift` for AuthenticationServices/UIKit.
 - Security-specific: `Sources/Store/Keychain.swift` and CryptoKit-based `StableID.swift`.
 
-Do not assume the model layer can already be moved into a Foundation-only package: `DataSource`, `MetricKind`, and `Discrepancy` currently import SwiftUI for presentation colors.
+Do not assume the model layer can already be moved into a Foundation-only package: `DataSource`, `MetricKind`, and `Discrepancy` currently import SwiftUI for presentation colors. `DataSource` also imports UIKit, behind `#if canImport(UIKit)`, so that each source palette slot resolves a light or dark value. Source colours are defined as numbers (`SourcePaletteSlot`, `SRGBColor`) so that `Tests/ColourVisionTests.swift` measures exactly what is drawn. Change a slot's values in place, never renumber the slots, and keep that test passing.
 
 ## State Management and Dependency Injection
 
@@ -291,7 +291,7 @@ The Oura snapshot is schema-versioned and token-free. Its `schemaVersion` is rec
 
 OAuth credentials are encoded as one Keychain generic-password value using `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. No Keychain access group is configured, so the item is not shared and does not migrate through iCloud. The Oura client ID is deliberately public configuration in `@AppStorage`; never put the bearer token there.
 
-HealthKit query anchors use `UserDefaults` keys prefixed with `hk.anchor.`. Pairwise exports use per-export temporary directories and remove them after the share sheet is dismissed.
+HealthKit query anchors use `UserDefaults` keys prefixed with `hk.anchor.`. Pairwise exports and per-source removal exports use per-export temporary directories and remove them after the share sheet is dismissed.
 
 The version-1 whole-file reading/source archives are migration inputs only. Do not reintroduce a parallel reading persistence path beside SQLite. Compaction bounds old high-frequency history but still sacrifices individual samples, the full within-window distribution, and later corrections; preserve its explicit aggregation metadata and unknown legacy evidence.
 
@@ -321,7 +321,8 @@ Preserve these comparison rules:
 - Insufficient evidence and out-of-tolerance data can never be presented as green merely because an alert preference is disabled.
 - Bland-Altman limits use sample variance.
 - UI chart thinning is presentation-only; statistics and exports use the full paired set.
-- `CompareView` intentionally creates one `ComparisonSnapshot` per render so all subviews use the same time boundary and do not repeat expensive windowing.
+- Compare, metric detail, the pair screen, and Now each resolve one immutable snapshot per load in `.task(id:)`: `ComparisonSnapshot`, `MetricDetailSnapshot`, `PairwiseSnapshot`, and `DashboardSnapshot`. All subviews share one resolved interval, gestures change only lightweight `@State`, and late results are rejected. Reloads caused only by new data are coalesced by `LiveReloadPolicy`: once a second on Now, and at most 30 per chart bucket elsewhere. A screen that trails ingest says so with `SnapshotLagNote`.
+- A saved session's `ComparisonPeriod` travels with every drill-down. Screens opened from a session show `ComparisonSessionBanner`, never the rolling range picker.
 
 Preserve measurement semantics:
 
@@ -342,11 +343,14 @@ The application is SwiftUI-first and targets iOS 18:
 - Add accessibility labels/hints for icon-only controls and compound measurement rows, following existing views.
 - Keep business, parser, network, and statistical logic out of SwiftUI view bodies. Compute one immutable analysis snapshot and pass it through where a view needs multiple projections.
 - Keep large point sets bounded for chart rendering with the existing thinning approach; do not thin analysis/export inputs.
+- Break every line, band, and area at data gaps with `ChartSegmentation`, keying series by segment, and draw isolated samples as points. Use `.monotone` or `.linear` interpolation; never use a curve that can overshoot the samples.
+- Draw statistical reference lines (bias, limits, zero, tolerances) in the neutral ink and dash tokens of `HeartSyncTheme.Chart`, never in a hue a device could wear. Give each source its slot's shape as well as its colour (`DataSource.symbol`, `SourceSymbolGlyph` in legends).
+- Removing a source or disconnecting Oura goes through the confirmation dialog in `DevicesView`, which states the consequence with `SourceRemovalConsequence`. Never attach a destructive action to a full swipe.
 
 UIKit is used only where the platform API requires it:
 
 - OAuth supplies an `ASWebAuthenticationSession` presentation anchor by finding/retaining an active `UIWindow`.
-- Pairwise export wraps `UIActivityViewController` with `UIViewControllerRepresentable`.
+- Pairwise export, and the per-source export offered before removal (`ReadingsShareSheet`), wrap `UIActivityViewController` with `UIViewControllerRepresentable`.
 
 There are no storyboards or XIBs. Do not introduce UIKit architecture for an isolated SwiftUI feature.
 
@@ -457,7 +461,13 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/HRVFilterTests.swift`: 20 tests covering artefact filtering, body-location versus technology metadata, accumulator thresholds, and rate limiting.
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
 - `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
-- `UITests/HeartSyncCheckerUITests.swift`: 7 deterministic recovery, settings, device-action, retention, evidence, Oura-partial, and pseudo-localization flows.
+- `UITests/HeartSyncCheckerUITests.swift`: 10 deterministic flows:
+  - recovery and settings;
+  - device actions, including removal that asks first and deletes only that device;
+  - retention and evidence;
+  - drill-down range and saved-session period;
+  - Oura partial failure;
+  - pseudo-localization.
 - `Tests/HistoryOutcomeTests.swift`: 12 tests covering query outcomes after a successful
   startup (failure versus emptiness, retry, export failing visibly, paged export) and the
   compaction-honest per-device summary and whole-history export schema.
@@ -474,7 +484,29 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   hiding, settings archive backward compatibility, and same-device pair disclosure.
 - `Tests/ComparisonSessionTests.swift`: 11 tests covering fixed versus rolling periods,
   session persistence and reload, revisit disclosure, and missing sources.
-- `PerformanceTests/HealthStorePerformanceTests.swift`: the manual physical-iPhone fourteen-day 1 Hz indexed persistence workload, plus a two-source month-range comparison, range changes during ingestion, and the paged export flow.
+- `Tests/SourceRemovalTests.swift`: 9 tests covering the per-source history count behind
+  the removal dialog, failed counts reported as unknown, the per-source export, and the
+  consequence wording for each transport.
+- `Tests/DrillDownPeriodTests.swift`: 6 tests covering fixed-period resolution: a saved
+  session's seconds reach metric detail, the pair analysis, and its export unchanged.
+- `Tests/PairwiseSnapshotTests.swift`: 8 tests covering the pairwise snapshot: engine
+  equality, binary-search lookups against a linear scan, thinning disclosure, and query
+  failure.
+- `Tests/LiveReloadTests.swift`: 8 tests covering the reload-coalescing rule and the
+  bounded Now read, which shows the same values and verdicts as the two-day read.
+- `Tests/ChartGapTests.swift`: 12 tests covering shared gap segmentation for the band,
+  the pairwise timeline, and Oura heart rate, including isolated points and thinning.
+- `Tests/ColourVisionTests.swift`: 11 tests. They pin the Machado/CAM02-UCS validator to
+  published values and enforce ΔE ≥ 15 under protan, deutan, and tritan simulation:
+  between source slots, against the reference-line ink, and between sleep stages. They
+  also cover 3:1 graphical contrast and stable per-slot shapes.
+- `PerformanceTests/HealthStorePerformanceTests.swift`: the manual physical-iPhone
+  fourteen-day 1 Hz indexed persistence workload, plus:
+  - a two-source month-range comparison;
+  - range changes during ingestion;
+  - the paged export flow;
+  - Now and a 30-day detail during 1 Hz ingest, against initial main-thread budgets that
+    are still to be confirmed on a device.
 
 There is no snapshot-test target, live Oura test, Bluetooth hardware integration-test target, or HealthKit integration-test target.
 
@@ -485,8 +517,10 @@ When no iOS simulator runtime is installed, `build-for-testing` proves compilati
 actually execute the pure logic, build a **scratch** SwiftPM package outside the repository
 and copy or symlink the real source files into it — `Sources/Store`, `Sources/Model`,
 `Sources/Analysis`, `Sources/Views/MetricDetailSnapshot.swift`,
-`Sources/Views/ComparisonEmptyReason.swift`, `Shared`, plus `Sources/Bluetooth/GATT.swift`
-for `BodySensorLocation`. That closure builds for macOS and runs the store, analysis,
+`Sources/Views/ComparisonEmptyReason.swift`, the other Foundation-only view projections
+(`DashboardSnapshot`, `PairwiseSnapshot`, `ChartSegmentation`, `LiveReloadPolicy`,
+`SourceRemovalConsequence`, `WindowLabel`, `Oura/OuraSleepStage`), `Shared`, plus
+`Sources/Bluetooth/GATT.swift` for `BodySensorLocation`. That closure builds for macOS and runs the store, analysis,
 export, presentation-projection and watch-lifecycle suites. It cannot compile the SwiftUI
 screens (they import UIKit), the Oura stack (AuthenticationServices), or `WatchApp`. Never
 add `Package.swift` to the repository itself.

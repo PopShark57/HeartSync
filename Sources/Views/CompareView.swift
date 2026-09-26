@@ -22,6 +22,11 @@ struct CompareView: View {
         activeSession.map { .fixed($0.interval) } ?? .rolling(range)
     }
 
+    /// When the last snapshot load finished, and for which key. A reload caused only by new
+    /// data is coalesced against these; one caused by the user is not.
+    @State private var lastLoadedKey: LoadKey?
+    @State private var lastLoadedAt: Date?
+
     /// Everything a snapshot depends on. When this changes the previous load is cancelled
     /// and a new one starts; when it has not changed, an unrelated view update reuses the
     /// snapshot instead of re-querying and re-windowing the whole range.
@@ -33,6 +38,13 @@ struct CompareView: View {
         var enabledSourceIDs: [String]
         var hiddenSourceIDs: [String]
         var retryToken: Int
+
+        /// True when `other` asks the same question and only the data may have changed.
+        func sameSelection(as other: LoadKey) -> Bool {
+            var aligned = other
+            aligned.generation = generation
+            return aligned == self
+        }
     }
 
     private var loadKey: LoadKey {
@@ -63,6 +75,9 @@ struct CompareView: View {
                         .pickerStyle(.segmented)
                         .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
                         .accessibilityIdentifier("compare.range")
+                    }
+                    if let snapshot, snapshot.generation != model.store.changeToken {
+                        SnapshotLagNote(resolvedAt: snapshot.resolvedAt)
                     }
                 }
 
@@ -114,9 +129,16 @@ struct CompareView: View {
                 let key = loadKey
                 isLoading = true
                 defer { isLoading = false }
-                // One frame of slack so dragging across the range picker starts a single
-                // load rather than one per intermediate selection.
-                try? await Task.sleep(for: .milliseconds(16))
+                // One frame of slack for a changed question, so dragging across the range
+                // picker starts a single load. New data alone waits out the live-reload
+                // interval instead: a Bluetooth strap bumps the key once a second, and a
+                // month-range comparison must not be re-read that often.
+                let wait = LiveReloadPolicy.delay(
+                    dataOnly: lastLoadedKey.map { key.sameSelection(as: $0) } ?? false,
+                    elapsed: lastLoadedAt.map { Date.now.timeIntervalSince($0) },
+                    minimumInterval: LiveReloadPolicy.minimumInterval(for: period)
+                )
+                try? await Task.sleep(for: .seconds(wait))
                 guard !Task.isCancelled else { return }
                 let resolved = ComparisonSnapshot(
                     store: model.store,
@@ -127,6 +149,8 @@ struct CompareView: View {
                 // Rejects a late result: the selection may have moved on while this ran.
                 guard !Task.isCancelled, key == loadKey else { return }
                 snapshot = resolved
+                lastLoadedKey = key
+                lastLoadedAt = .now
             }
         }
     }
@@ -148,7 +172,9 @@ struct CompareView: View {
                     Section("Metrics measured by more than one device") {
                         ForEach(snapshot.metrics) { kind in
                             NavigationLink {
-                                MetricDetailView(kind: kind, initialRange: range)
+                                // The session, not only the picker value: with a session
+                                // open, detail must analyse the session's exact seconds.
+                                MetricDetailView(kind: kind, initialRange: range, session: activeSession)
                             } label: {
                                 ComparisonSummaryRow(
                                     kind: kind,
@@ -172,41 +198,9 @@ struct CompareView: View {
     }
 
     /// Shows that a fixed span is in force, and whether the data behind it has moved.
-    @ViewBuilder
     private func sessionBanner(_ session: ComparisonSession) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Label(session.displayTitle, systemImage: "bookmark.fill")
-                .font(.subheadline.weight(.semibold))
-            Text("\(session.interval.start.formatted(date: .abbreviated, time: .shortened)) \u{2013} \(session.interval.end.formatted(date: .omitted, time: .shortened))")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            if !session.context.isEmpty {
-                Text(session.context)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            // A saved session is a saved *selection*. Data for its period keeps arriving,
-            // so a revisit says when the result is no longer the one that was seen.
-            if let revisitNotice {
-                Label(revisitNotice, systemImage: "arrow.down.circle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            let missing = session.missingSourceIDs(in: model.store.sources)
-            if !missing.isEmpty {
-                Label(
-                    "\(missing.count) saved \(missing.count == 1 ? "device is" : "devices are") no longer set up, so this is not the comparison that was saved.",
-                    systemImage: "exclamationmark.triangle"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.vertical, 2)
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("compare.session")
+        ComparisonSessionBanner(session: session, revisitNotice: revisitNotice)
+            .accessibilityIdentifier("compare.session")
     }
 
     /// Opens a saved session and discloses what has changed since it was last viewed.
@@ -401,6 +395,11 @@ private struct ComparisonSnapshot {
     /// The span actually analysed, so callers can report it rather than re-deriving it.
     let interval: DateInterval
 
+    /// Store generation this snapshot read, and when, so a coalesced live reload can say
+    /// how far behind the newest reading it is.
+    let generation: Int
+    let resolvedAt: Date
+
     /// Pairs confirmed to be two transports of one device. Surfaced at this level, not
     /// only in pairwise detail, so the overview cannot imply independent corroboration.
     let sameDevicePairKeys: Set<String>
@@ -418,6 +417,8 @@ private struct ComparisonSnapshot {
         // what makes a saved session re-openable; a rolling one resolves against `.now`.
         let interval = period.interval
         self.interval = interval
+        self.generation = store.changeToken
+        self.resolvedAt = .now
         // Estimates never participate in a device comparison, so they are dropped before
         // the metric list is built as well as inside the engine — otherwise a metric with
         // one real device plus the estimate source would look comparable.

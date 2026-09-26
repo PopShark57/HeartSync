@@ -41,7 +41,11 @@ final class AppModel {
 
         #if DEBUG
         if Self.pairwiseDemoEnabled {
-            DebugAnalysisFixtures.populate(store: store)
+            let now = Date.now
+            DebugAnalysisFixtures.populate(store: store, now: now)
+            // Held in memory only: persistence is disabled in the demo, so this reports
+            // "not saved" by design and nothing reaches the user's sessions archive.
+            await sessions.save(DebugAnalysisFixtures.demoSession(now: now))
             startupState = .ready
             return
         }
@@ -63,6 +67,9 @@ final class AppModel {
                 startupState = .ready
             case .devices, .retention:
                 DebugUITestFixtures.populateDevices(store: store, includeHistory: scenario == .retention)
+                startupState = .ready
+            case .removal:
+                DebugUITestFixtures.populateRemoval(store: store)
                 startupState = .ready
             case .ouraPartial:
                 oura.injectPartialFailureForUITesting()
@@ -435,6 +442,7 @@ final class AppModel {
         case empty
         case devices
         case retention
+        case removal
         case ouraPartial
 
         static var requested: Self? {

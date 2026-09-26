@@ -41,18 +41,17 @@ struct OuraSleepSection: View {
                     if let phases = sleep.sleep_phase_5_min, !phases.isEmpty {
                         OuraCategoricalRibbon(
                             values: Array(phases),
-                            colors: sleepStageColors,
+                            colors: Self.stageColors,
                             fallback: .gray.opacity(0.25),
+                            patterned: Self.patternedCodes,
                             accessibilityText: "Sleep-stage timeline with \(phases.count) five-minute intervals"
                         )
                         .frame(height: 28)
 
-                        OuraRibbonLegend(items: [
-                            ("Deep", sleepStageColors["1"]!),
-                            ("Light", sleepStageColors["2"]!),
-                            ("REM", sleepStageColors["3"]!),
-                            ("Awake", sleepStageColors["4"]!),
-                        ])
+                        OuraRibbonLegend(
+                            items: OuraSleepStage.allCases.map { ($0.title, $0.fill.color) },
+                            patterned: Set(OuraSleepStage.allCases.filter(\.isPatterned).map(\.title))
+                        )
                     }
 
                     LazyVGrid(columns: OuraCardLayout.metricColumns, alignment: .leading, spacing: 12) {
@@ -73,14 +72,14 @@ struct OuraSleepSection: View {
         }
     }
 
-    /// Keys are Oura's `sleep_phase_5_min` codes. The legend force-unwraps `"1"`–`"4"`, so
-    /// those four keys must stay present.
-    private var sleepStageColors: [Character: Color] {
-        [
-            "1": .indigo,
-            "2": .blue.opacity(0.68),
-            "3": .purple,
-            "4": .orange,
-        ]
-    }
+    /// Keyed by Oura's `sleep_phase_5_min` codes: a lightness ramp that follows depth, so
+    /// deep is darkest and awake palest. See `OuraSleepStage`.
+    private static let stageColors: [Character: Color] = Dictionary(
+        uniqueKeysWithValues: OuraSleepStage.allCases.map { ($0.code, $0.fill.color) }
+    )
+
+    /// Awake is hatched as well as coloured, so it never depends on colour alone.
+    private static let patternedCodes: Set<Character> = Set(
+        OuraSleepStage.allCases.filter(\.isPatterned).map(\.code)
+    )
 }
