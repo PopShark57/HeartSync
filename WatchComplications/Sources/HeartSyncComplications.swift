@@ -50,17 +50,30 @@ struct MeasurementComplicationView: View {
         .privacySensitive()
     }
 
+    /// A gauge over the metric's nominal display range. The number sits in the centre and
+    /// the label in the ring's opening: Older or Median when either applies, otherwise the
+    /// metric's short name. An older reading shows an empty ring and a dash, as before,
+    /// rather than a full-strength arc for a value that is no longer current.
     private var circular: some View {
-        ZStack {
-            AccessoryWidgetBackground()
-            VStack(spacing: 1) {
-                Text(value.kind.shortTitle).font(.caption2).widgetAccentable()
-                Text(compactNumber)
-                    .font(.title3.bold()).monospacedDigit()
-                Text(compactFootnote).font(.caption2)
-            }
-            .lineLimit(1).minimumScaleFactor(0.65)
+        let range = value.kind.displayRange
+        let shown = value.reading.flatMap { isStale ? nil : $0.value }
+        return Gauge(value: min(max(shown ?? range.lowerBound, range.lowerBound), range.upperBound), in: range) {
+            Text(circularLabel)
+        } currentValueLabel: {
+            Text(compactNumber)
+                .monospacedDigit()
+                .minimumScaleFactor(0.6)
         }
+        .gaugeStyle(.accessoryCircular)
+        .widgetAccentable()
+    }
+
+    private var circularLabel: String {
+        guard let reading = value.reading else { return value.kind.shortTitle }
+        if isStale { return String(localized: "Older") }
+        if reading.isCompacted { return String(localized: "Median") }
+        if reading.provenance == .derived { return reading.provenance.title }
+        return value.kind.shortTitle
     }
 
     private var rectangular: some View {
@@ -178,3 +191,30 @@ private struct WorkoutComplicationView: View {
         .accessibilityHint("Open workout controls. Does not start recording.")
     }
 }
+
+#if DEBUG
+/// A current, an older, and a compacted heart rate, so the gauge and its Older and Median
+/// labels can be checked in Xcode. Preview-only: nothing here reaches the shared cache.
+private enum ComplicationPreviewEntries {
+    static func entry(value: Double, age: TimeInterval, compacted: Bool = false) -> MeasurementEntry {
+        let now = Date.now
+        let snapshot = WatchSnapshot(generatedAt: now, metrics: [WatchMetric(
+            kind: .heartRate,
+            readings: [WatchSourceReading(id: "preview", sourceName: "Example source", value: value,
+                                         timestamp: now.addingTimeInterval(-age),
+                                         provenance: .measured, isCompacted: compacted)],
+            omittedSourceCount: 0,
+            comparison: WatchComparison(readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: 3_600)
+        )])
+        return MeasurementEntry(date: now, value: WatchComplicationValue(kind: .heartRate, snapshot: snapshot))
+    }
+}
+
+#Preview("Circular gauge", as: .accessoryCircular) {
+    HeartSyncMeasurementWidget()
+} timeline: {
+    ComplicationPreviewEntries.entry(value: 72, age: 60)
+    ComplicationPreviewEntries.entry(value: 72, age: 6 * 3_600)
+    ComplicationPreviewEntries.entry(value: 68, age: 120, compacted: true)
+}
+#endif

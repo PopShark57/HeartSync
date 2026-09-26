@@ -122,7 +122,7 @@ struct PairwiseTimelineChart: View {
         .chartXAxis {
             AxisMarks(preset: .aligned) { _ in
                 AxisGridLine()
-                AxisValueLabel(format: MetricDetailChart.axisFormat(span: snapshot.interval.duration))
+                AxisValueLabel(format: HeartSyncTheme.Chart.axisFormat(span: snapshot.interval.duration))
             }
         }
         .chartYAxis { AxisMarks(position: .leading) }
@@ -355,7 +355,7 @@ struct PairwiseObservationCallout: View {
             Text("A \u{2212} B \(PairwiseSnapshot.signed(observation.signedDifference, kind: kind)) \(kind.unit)")
                 .foregroundStyle(observation.severity.tint)
             Text(observation.timing.title)
-                .foregroundStyle(observation.timing.supportsConclusion ? Color.secondary : Color.orange)
+                .foregroundStyle(observation.timing.supportsConclusion ? Color.secondary : HeartSyncTheme.Chart.cautionInk)
             if isOutsideLimits {
                 Text("Outside the observed 95% limits")
             }

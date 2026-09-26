@@ -1,3 +1,4 @@
+import Charts
 import SwiftUI
 
 struct WatchWorkoutView: View {
@@ -5,6 +6,9 @@ struct WatchWorkoutView: View {
     @State private var activity = WatchWorkoutActivity.other
     @State private var indoors = false
     @State private var confirmDiscard = false
+    /// True in Always On. Heart rate and elapsed time stay prominent; everything secondary
+    /// dims, and the trend is hidden, following Apple's Always On guidance.
+    @Environment(\.isLuminanceReduced) private var isLuminanceReduced
 
     var body: some View {
         List {
@@ -34,11 +38,19 @@ struct WatchWorkoutView: View {
                 Section(workout.activityTitle) {
                     TimelineView(.periodic(from: .now, by: 1)) { timeline in
                         VStack(alignment: .leading, spacing: 8) {
-                            Label("Heart rate", systemImage: "heart.fill").foregroundStyle(.pink)
+                            Label("Heart rate", systemImage: "heart.fill")
+                                .foregroundStyle(isLuminanceReduced ? AnyShapeStyle(.secondary) : AnyShapeStyle(.pink))
                             Text(workout.heartRate.map { MetricKind.heartRate.format($0.value) } ?? "—")
                                 .font(.system(.largeTitle, design: .rounded).bold())
                                 .monospacedDigit()
+                                // Treated like the complications: redacted when the wearer's
+                                // privacy settings hide sensitive data on a lowered wrist,
+                                // otherwise kept prominent. See WatchApp/README.md.
+                                .privacySensitive()
                             Text("bpm").font(.caption).foregroundStyle(.secondary)
+                            if !isLuminanceReduced {
+                                WorkoutHeartRateTrendChart(points: workout.heartRateTrend.points(at: timeline.date))
+                            }
                             if workout.phase == .paused {
                                 Text("Paused · last reading").foregroundStyle(.orange)
                             } else if let reading = workout.heartRate, !reading.isCurrent(at: timeline.date) {
@@ -52,6 +64,7 @@ struct WatchWorkoutView: View {
                                 .accessibilityLabel("Elapsed time")
                         }
                         .accessibilityElement(children: .combine)
+                        .opacity(isLuminanceReduced ? 0.85 : 1)
                     }
                 }
                 if workout.phase.isCollecting {
@@ -113,5 +126,39 @@ struct WatchWorkoutView: View {
         case .saving: "Saving to Health…"
         default: "Working…"
         }
+    }
+}
+
+/// Five minutes of the workout's heart rate: no axes, broken at gaps, a dot for a lone
+/// sample. It is context for the number above, not a measurement of its own, so VoiceOver
+/// hears one summary instead of every sample.
+private struct WorkoutHeartRateTrendChart: View {
+    let points: [WorkoutHeartRateTrend.Point]
+
+    var body: some View {
+        if points.count >= 2 {
+            Chart(points) { point in
+                LineMark(
+                    x: .value("Time", point.date),
+                    y: .value("Heart rate", point.bpm),
+                    series: .value("Run", point.segment)
+                )
+                .interpolationMethod(.monotone)
+                .foregroundStyle(.pink)
+            }
+            .chartXAxis(.hidden)
+            .chartYAxis(.hidden)
+            .chartYScale(domain: .automatic(includesZero: false))
+            .frame(height: 34)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(summary)
+        }
+    }
+
+    private var summary: String {
+        let values = points.map(\.bpm)
+        let low = Int((values.min() ?? 0).rounded())
+        let high = Int((values.max() ?? 0).rounded())
+        return "Heart rate over the last five minutes, \(low) to \(high) bpm"
     }
 }

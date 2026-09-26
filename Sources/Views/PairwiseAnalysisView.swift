@@ -210,7 +210,7 @@ struct PairwiseAnalysisView: View {
                         selectedObservationStart: $selectedObservationStart,
                         step: { offset in step(by: offset, in: snapshot) }
                     )
-                    .frame(height: 250)
+                    .heartSyncChartHeight(HeartSyncTheme.Chart.pairTimelineHeight)
                     .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 8, trailing: 12))
                     .accessibilityIdentifier("pairwise.timeline")
                     deviceLegend
@@ -228,7 +228,7 @@ struct PairwiseAnalysisView: View {
                         selectedObservationStart: $selectedObservationStart,
                         step: { offset in step(by: offset, in: snapshot) }
                     )
-                    .frame(height: 280)
+                    .heartSyncChartHeight(HeartSyncTheme.Chart.blandAltmanHeight)
                     .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 8, trailing: 12))
                     .accessibilityIdentifier("pairwise.difference")
                     differenceLegend

@@ -49,6 +49,13 @@ final class AppModel {
             startupState = .ready
             return
         }
+        if Self.chartGalleryEnabled {
+            // A month of in-memory readings for judging charts; nothing is saved and no
+            // transport starts, as with the pairwise demo.
+            DebugChartGallery.populate(store: store, estimateSourceID: Self.estimateSourceID, now: .now)
+            startupState = .ready
+            return
+        }
         if let scenario = Self.uiTestScenario {
             switch scenario {
             case .loading:
@@ -177,7 +184,7 @@ final class AppModel {
     /// Called when the app returns to the foreground.
     func refresh() async {
         #if DEBUG
-        guard !Self.pairwiseDemoEnabled else { return }
+        guard !Self.pairwiseDemoEnabled, !Self.chartGalleryEnabled else { return }
         #endif
         guard hasStarted else {
             await start()
@@ -218,7 +225,7 @@ final class AppModel {
 
     func enterBackground() async {
         #if DEBUG
-        guard !Self.pairwiseDemoEnabled else { return }
+        guard !Self.pairwiseDemoEnabled, !Self.chartGalleryEnabled else { return }
         #endif
         bluetooth.stopScan()
         await store.saveNow()
@@ -459,10 +466,14 @@ final class AppModel {
     }
 
     static let pairwiseDemoEnabled = ProcessInfo.processInfo.arguments.contains("--pairwise-demo")
+    /// Launch with `--chart-gallery` for thirty days of in-memory chart fixtures
+    /// (`DebugChartGallery`): four sources, gaps, estimates, and compacted windows.
+    static let chartGalleryEnabled = ProcessInfo.processInfo.arguments.contains("--chart-gallery")
     static let uiTestScenario = UITestScenario.requested
-    static let debugDataIsolationEnabled = pairwiseDemoEnabled || uiTestScenario != nil
+    static let debugDataIsolationEnabled = pairwiseDemoEnabled || chartGalleryEnabled || uiTestScenario != nil
     #else
     static let pairwiseDemoEnabled = false
+    static let chartGalleryEnabled = false
     static let debugDataIsolationEnabled = false
     #endif
 

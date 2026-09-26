@@ -606,7 +606,9 @@ private struct SourceRow: View {
             }
 
             if !source.observedMetrics.isEmpty {
-                HStack(spacing: 5) {
+                // Wraps instead of overflowing: a Health writer can report seven metrics,
+                // which does not fit one line at a compact width and large text.
+                FlowLayout(spacing: 5, lineSpacing: 5) {
                     ForEach(orderedMetrics, id: \.self) { kind in
                         Text(kind.shortTitle)
                             .font(.caption2.weight(.medium))

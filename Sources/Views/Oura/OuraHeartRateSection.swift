@@ -97,21 +97,28 @@ struct OuraHeartRateChart: View {
                 )
                 .foregroundStyle(
                     LinearGradient(
-                        colors: [.pink.opacity(0.24), .pink.opacity(0.02)],
+                        colors: [
+                            HeartSyncTheme.Chart.heartRateInk.opacity(0.24),
+                            HeartSyncTheme.Chart.heartRateInk.opacity(0.02),
+                        ],
                         startPoint: .top,
                         endPoint: .bottom
                     )
                 )
                 .interpolationMethod(.monotone)
+                // The fill repeats the line; VoiceOver reads each sample once, below.
+                .accessibilityHidden(true)
 
                 LineMark(
                     x: .value("Time", point.date),
                     y: .value("Heart rate", point.bpm),
                     series: .value("Segment", point.segment)
                 )
-                .foregroundStyle(.pink)
+                .foregroundStyle(HeartSyncTheme.Chart.heartRateInk)
                 .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
                 .interpolationMethod(.monotone)
+                .accessibilityLabel(point.date.formatted(date: .omitted, time: .shortened))
+                .accessibilityValue("\(Int(point.bpm.rounded())) bpm")
 
                 // A sample alone between two holes has no line; the dot keeps it visible.
                 if point.isIsolated {
@@ -119,8 +126,9 @@ struct OuraHeartRateChart: View {
                         x: .value("Time", point.date),
                         y: .value("Heart rate", point.bpm)
                     )
-                    .foregroundStyle(.pink)
+                    .foregroundStyle(HeartSyncTheme.Chart.heartRateInk)
                     .symbolSize(24)
+                    .accessibilityHidden(true)
                 }
             }
 
@@ -134,7 +142,7 @@ struct OuraHeartRateChart: View {
                     x: .value("Time", selected.date),
                     y: .value("Heart rate", selected.bpm)
                 )
-                .foregroundStyle(.pink)
+                .foregroundStyle(HeartSyncTheme.Chart.heartRateInk)
                 .symbolSize(70)
                 .accessibilityHidden(true)
                 .annotation(
@@ -158,6 +166,8 @@ struct OuraHeartRateChart: View {
         .chartYAxis {
             AxisMarks(position: .leading)
         }
+        .chartYAxisLabel("bpm")
+        .accessibilityChartDescriptor(OuraHeartRateAudioGraph(points: series.points.map { ($0.date, $0.bpm) }))
         .chartXAxis {
             AxisMarks(values: .automatic(desiredCount: 4)) { _ in
                 AxisGridLine()
@@ -181,6 +191,6 @@ struct OuraHeartRateChart: View {
             selectedID = series.point(nearest: raw, within: tolerance)?.id
         }
         .sensoryFeedback(.selection, trigger: selectedID) { _, new in new != nil }
-        .frame(height: 210)
+        .heartSyncChartHeight(HeartSyncTheme.Chart.ouraHeartRateHeight)
     }
 }

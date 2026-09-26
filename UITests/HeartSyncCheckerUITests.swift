@@ -41,6 +41,21 @@ final class HeartSyncCheckerUITests: XCTestCase {
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
+    /// Keeps a screenshot in the `.xcresult`, so a pull request's CI artefact shows what
+    /// the UI looked like (improvement 41).
+    private func attachScreenshot(_ name: String, of application: XCUIApplication) {
+        let attachment = XCTAttachment(screenshot: application.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    override func tearDown() {
+        // A test that rotated the device must not leave the next one in landscape.
+        XCUIDevice.shared.orientation = .portrait
+        super.tearDown()
+    }
+
     private func waitForDisappearance(of candidate: XCUIElement, timeout: TimeInterval = 5) -> Bool {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == false"),
@@ -334,6 +349,60 @@ final class HeartSyncCheckerUITests: XCTestCase {
 
         // The score cards carry their fortnight, spoken as one sentence.
         XCTAssertTrue(scrollUpToElement(anyElement(containing: "Last 14 days", in: application), in: application, attempts: 10))
+        attachScreenshot("Oura charts", of: application)
+    }
+
+    /// Improvement 36: with sources but none connected, Now shows cards and trends and no
+    /// Sources header, and nothing claims to be live.
+    func testNowWithoutConnectedSourcesHidesTheSourcesHeader() {
+        let application = launchPairwiseDemo()
+        XCTAssertTrue(application.buttons["Now"].waitForExistence(timeout: 5))
+        application.buttons["Now"].tap()
+
+        let trend = element("now.sparkline.heartRate", in: application)
+        XCTAssertTrue(trend.waitForExistence(timeout: 5))
+        XCTAssertTrue(trend.label.hasPrefix("Trend over the last hour."), trend.label)
+        XCTAssertFalse(element("now.sources", in: application).exists)
+        XCTAssertFalse(application.staticTexts["Live sources"].exists)
+        XCTAssertFalse(anyElement(containing: ", live", in: application).exists)
+
+        // The card's way into history meets the 44-point minimum.
+        let history = application.buttons["History and agreement for Heart Rate"]
+        XCTAssertTrue(history.exists)
+        XCTAssertGreaterThanOrEqual(history.frame.height, 44)
+        attachScreenshot("Now, no connected sources", of: application)
+    }
+
+    /// Improvement 41: screenshots of the main chart screens from a month of fixture data,
+    /// in portrait and landscape. CI also runs this on an iPad simulator for the layouts
+    /// of improvement 38.
+    func testChartGalleryScreenshots() {
+        let application = XCUIApplication()
+        application.launchArguments = ["--chart-gallery"]
+        application.launch()
+        XCTAssertTrue(application.buttons["Now"].waitForExistence(timeout: 10))
+        application.buttons["Now"].tap()
+        XCTAssertTrue(element("now.sparkline.heartRate", in: application).waitForExistence(timeout: 10))
+        attachScreenshot("Now", of: application)
+
+        application.buttons["Compare"].tap()
+        openHeartRate(in: application)
+        let range = element("metric.range", in: application)
+        XCTAssertTrue(range.waitForExistence(timeout: 10))
+        range.buttons["30D"].tap()
+        XCTAssertTrue(element("metric.chart", in: application).waitForExistence(timeout: 10))
+        attachScreenshot("Metric detail, 30 days", of: application)
+
+        let pair = element("metric.pair", in: application)
+        XCTAssertTrue(scrollToElement(pair, in: application))
+        pair.tap()
+        XCTAssertTrue(element("pairwise.range", in: application).waitForExistence(timeout: 10))
+        attachScreenshot("Pairwise", of: application)
+
+        XCUIDevice.shared.orientation = .landscapeLeft
+        attachScreenshot("Pairwise, landscape", of: application)
+        application.buttons["Now"].tap()
+        attachScreenshot("Now, landscape", of: application)
     }
 
     func testSavedSessionPeriodReachesDetailAndPair() {

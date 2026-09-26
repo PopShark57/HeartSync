@@ -1,3 +1,4 @@
+import Charts
 import Combine
 import SwiftUI
 
@@ -61,10 +62,22 @@ struct DashboardView: View {
                         )
                     } else {
                         ScrollView {
-                            LazyVStack(spacing: 16) {
-                                summaryHeader
-                                ForEach(snapshot.metrics) { summary in
-                                    MetricCard(summary: summary)
+                            VStack(alignment: .leading, spacing: 16) {
+                                sourcesHeader
+                                // One column on iPhone; as many 320-point columns as fit on
+                                // iPad or in landscape.
+                                LazyVGrid(
+                                    columns: [GridItem(.adaptive(minimum: 320), spacing: 16, alignment: .top)],
+                                    spacing: 16
+                                ) {
+                                    ForEach(snapshot.metrics) { summary in
+                                        MetricCard(
+                                            summary: summary,
+                                            isBluetoothStreaming: summary.rows.contains {
+                                                streamingSourceIDs.contains($0.source.id)
+                                            }
+                                        )
+                                    }
                                 }
                             }
                             .padding(.horizontal)
@@ -87,7 +100,11 @@ struct DashboardView: View {
                 )
                 try? await Task.sleep(for: .seconds(wait))
                 guard !Task.isCancelled else { return }
-                snapshot = DashboardSnapshot(store: model.store, now: .now)
+                snapshot = DashboardSnapshot(
+                    store: model.store,
+                    now: .now,
+                    sparklineCache: snapshot?.sparklineCache ?? [:]
+                )
                 lastLoadedAt = .now
                 lastRetryToken = retryToken
             }
@@ -113,41 +130,93 @@ struct DashboardView: View {
         }
     }
 
-    private var summaryHeader: some View {
-        let connected = model.store.enabledSources.filter { source in
+    /// Bluetooth sources whose connection is currently streaming.
+    private var streamingSourceIDs: Set<String> {
+        Set(model.store.enabledSources.compactMap { source in
+            guard source.transport == .bluetooth,
+                  case .streaming = model.bluetooth.connectionState(forSource: source.id)
+            else { return nil }
+            return source.id
+        })
+    }
+
+    /// Enabled sources with an active connection or authorization, each with what it may
+    /// honestly claim. Only a streaming Bluetooth source is Live.
+    private var sourceChips: [(source: DataSource, status: SourceChipStatus)] {
+        let streaming = streamingSourceIDs
+        return model.store.enabledSources.compactMap { source in
+            let lastSyncedAt: Date?
             switch source.transport {
-            case .bluetooth: model.bluetooth.connectionState(forSource: source.id).isActive
-            case .healthKit: model.healthKit.availability == .authorized
-            case .oura:      model.oura.status.isConnected
-            case .manual:    false
+            case .bluetooth:
+                guard model.bluetooth.connectionState(forSource: source.id).isActive else { return nil }
+                lastSyncedAt = nil
+            case .healthKit:
+                guard model.healthKit.availability == .authorized else { return nil }
+                lastSyncedAt = model.healthKit.lastSyncedAt
+            case .oura:
+                guard model.oura.status.isConnected else { return nil }
+                lastSyncedAt = model.oura.lastSyncedAt
+            case .manual:
+                return nil
             }
+            let status = SourceChipStatus.resolve(
+                transport: source.transport,
+                isStreaming: streaming.contains(source.id),
+                lastSyncedAt: lastSyncedAt
+            )
+            return (source, status)
         }
-        return VStack(alignment: .leading, spacing: 10) {
-            Text("Live sources")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-                .tracking(0.6)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(connected) { source in
-                        HStack(spacing: 6) {
-                            SourceDot(color: source.color, size: 8)
-                            Text(source.displayName)
-                                .font(.caption.weight(.medium))
-                                .lineLimit(1)
+    }
+
+    /// Hidden entirely when nothing qualifies: an empty row under a title says nothing.
+    @ViewBuilder
+    private var sourcesHeader: some View {
+        let chips = sourceChips
+        if !chips.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Sources")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                    .tracking(0.6)
+                    .accessibilityAddTraits(.isHeader)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(chips, id: \.source.id) { chip in
+                            SourceChip(source: chip.source, status: chip.status, now: now)
                         }
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 7)
-                        .background(source.color.opacity(0.14), in: Capsule())
-                        .overlay(Capsule().strokeBorder(source.color.opacity(0.22), lineWidth: 0.8))
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel("\(source.displayName), connected")
                     }
                 }
             }
+            .padding(.top, 6)
+            .accessibilityIdentifier("now.sources")
         }
-        .padding(.top, 6)
+    }
+}
+
+/// One source in the Sources header, with a status it can support.
+private struct SourceChip: View {
+    var source: DataSource
+    var status: SourceChipStatus
+    var now: Date
+
+    var body: some View {
+        let title = status.title(relativeTo: now)
+        HStack(spacing: 6) {
+            SourceDot(color: source.color, size: 8)
+            Text(source.displayName)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+            Text(title)
+                .font(.caption2.weight(status == .live ? .semibold : .regular))
+                .foregroundStyle(status == .live ? AnyShapeStyle(source.color) : AnyShapeStyle(.secondary))
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .background(source.color.opacity(0.14), in: Capsule())
+        .overlay(Capsule().strokeBorder(source.color.opacity(0.22), lineWidth: 0.8))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(source.displayName), \(title.lowercased())")
     }
 }
 
@@ -159,22 +228,38 @@ struct DashboardView: View {
 /// screen's single snapshot, so drawing it costs no store reads.
 private struct MetricCard: View {
     var summary: MetricSummary
+    /// A Bluetooth source on this card is streaming right now.
+    var isBluetoothStreaming: Bool
 
     /// Keeps the larger Now numerals while still tracking Dynamic Type (fixed 34pt does not).
     @ScaledMetric(relativeTo: .largeTitle) private var headlineSize: CGFloat = 34
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
-                Label(summary.kind.title, systemImage: summary.kind.systemImage)
-                    .font(.headline)
-                    .foregroundStyle(summary.kind.tint)
+                Label {
+                    Text(summary.kind.title)
+                } icon: {
+                    // Pulses only for a genuinely streaming Bluetooth heart rate. SF Symbol
+                    // effects follow Reduce Motion on their own.
+                    Image(systemName: summary.kind.systemImage)
+                        .symbolEffect(
+                            .pulse,
+                            options: .repeating,
+                            isActive: summary.kind == .heartRate && isBluetoothStreaming
+                        )
+                }
+                .font(.headline)
+                .foregroundStyle(summary.kind.tint)
                 Spacer()
                 if let headline = summary.headline {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text(summary.kind.format(headline))
                             .font(.system(size: headlineSize, weight: .bold, design: .rounded))
                             .monospacedDigit()
+                            .contentTransition(reduceMotion ? .identity : .numericText(value: headline))
+                            .animation(reduceMotion ? nil : .snappy, value: headline)
                         Text(summary.kind.unit)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
@@ -198,6 +283,13 @@ private struct MetricCard: View {
                 }
             } else if let detail = summary.notComparedDetail {
                 ComparisonUnavailableNote(detail: detail)
+            }
+
+            if let sparkline = summary.sparkline {
+                SparklineView(
+                    sparkline: sparkline,
+                    sources: Dictionary(summary.rows.map { ($0.source.id, $0.source) }, uniquingKeysWith: { first, _ in first })
+                )
             }
 
             VStack(spacing: 2) {
@@ -230,10 +322,14 @@ private struct MetricCard: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 9)
+                // Apple's minimum hit target is 44 × 44 points.
+                .frame(minHeight: 44)
                 .background(summary.kind.tint.opacity(0.10), in: Capsule())
+                .contentShape(Capsule())
             }
             .buttonStyle(.plain)
             .foregroundStyle(summary.kind.tint)
+            .accessibilityLabel("History and agreement for \(summary.kind.title)")
         }
         .metricCard(tint: summary.kind.tint)
     }
@@ -245,5 +341,51 @@ private struct MetricCard: View {
         return summary.comparison == nil
             ? "\(summary.kind.title), latest reading \(formatted)"
             : "\(summary.kind.title), window consensus \(formatted)"
+    }
+}
+
+// MARK: - Sparkline
+
+/// An axis-free trend: the gap rules of every other chart (`ChartSegmentation`), windowed
+/// medians only, a monotone line that cannot overshoot, and a pinned domain so a quiet
+/// stretch stays empty. It is not interactive; the full chart is one tap away.
+private struct SparklineView: View {
+    var sparkline: Sparkline
+    var sources: [String: DataSource]
+
+    var body: some View {
+        Chart {
+            ForEach(sparkline.series) { series in
+                let color = sources[series.sourceID]?.color ?? .secondary
+                let isolated = series.isolated
+                ForEach(Array(series.points.enumerated()), id: \.offset) { index, point in
+                    LineMark(
+                        x: .value("Time", point.date),
+                        y: .value(sparkline.kind.title, point.value),
+                        series: .value(
+                            "Series",
+                            ChartSegmentation.key(series: series.sourceID, segment: series.segments[index])
+                        )
+                    )
+                    .interpolationMethod(.monotone)
+                    .lineStyle(StrokeStyle(lineWidth: 1.6, lineCap: .round))
+                    .foregroundStyle(color)
+                    if isolated.contains(index) {
+                        PointMark(x: .value("Time", point.date), y: .value(sparkline.kind.title, point.value))
+                            .symbolSize(14)
+                            .foregroundStyle(color)
+                    }
+                }
+            }
+        }
+        .chartXScale(domain: sparkline.start...sparkline.through)
+        .chartYScale(domain: .automatic(includesZero: false))
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartLegend(.hidden)
+        .frame(height: HeartSyncTheme.Chart.sparklineHeight)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(sparkline.spokenSummary(names: sources.mapValues(\.displayName)))
+        .accessibilityIdentifier("now.sparkline.\(sparkline.kind.rawValue)")
     }
 }

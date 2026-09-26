@@ -52,6 +52,30 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/HeartSyncChecker-DerivedData" \
             CODE_SIGNING_ALLOWED=NO
 
+      # Improvement 41: the same screenshot tour on an iPad, for the regular-width layouts.
+      # Reuses the build above; its .xcresult lands beside the iPhone one and is uploaded.
+      - name: Select an available iPad simulator
+        shell: bash
+        run: |
+          ipad_id="$(
+            xcrun simctl list devices available -j |
+            python3 -c 'import json,sys; data=json.load(sys.stdin)["devices"]; runtimes=sorted(((tuple(map(int,key.rsplit("iOS-",1)[1].split("-"))),devices) for key,devices in data.items() if ".iOS-" in key and tuple(map(int,key.rsplit("iOS-",1)[1].split("-"))) >= (18,)),reverse=True); print(next((device["udid"] for _,devices in runtimes for device in devices if device["name"].startswith("iPad")), ""))'
+          )"
+          echo "HEARTSYNC_IPAD_ID=$ipad_id" >> "$GITHUB_ENV"
+
+      - name: Capture iPad screenshots
+        if: env.HEARTSYNC_IPAD_ID != ''
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project HeartSyncChecker.xcodeproj \
+            -scheme HeartSyncChecker \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$HEARTSYNC_IPAD_ID" \
+            -derivedDataPath "$RUNNER_TEMP/HeartSyncChecker-DerivedData" \
+            -only-testing:HeartSyncCheckerUITests/HeartSyncCheckerUITests/testChartGalleryScreenshots \
+            CODE_SIGNING_ALLOWED=NO
+
       - name: Upload test result
         if: always()
         uses: actions/upload-artifact@v4

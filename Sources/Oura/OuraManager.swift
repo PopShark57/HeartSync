@@ -948,6 +948,20 @@ final class OuraManager {
     /// non-wear, daily scores and nightly values with one missing day each, and a day of
     /// heart rate with an upload gap. In memory only: nothing is fetched or persisted.
     func injectChartFixtureForUITesting(now: Date = .now) {
+        let fixture = Self.chartFixtureSnapshot(now: now)
+        snapshot = fixture
+        status = .connected(email: "demo@example.com")
+        endpointStates[.heartRate] = .available(fixture.heartRates.count)
+        endpointStates[.detailedSleep] = .available(fixture.sleeps.count)
+        endpointStates[.dailyReadiness] = .available(fixture.readiness.count)
+        endpointStates[.dailySleep] = .available(fixture.sleepScores.count)
+        endpointStates[.dailyActivity] = .available(fixture.activities.count)
+        lastSyncSummary = "Fixture data"
+    }
+
+    /// The documents behind `injectChartFixtureForUITesting`, also used by the Oura
+    /// previews so they draw exactly what the UI test checks.
+    nonisolated static func chartFixtureSnapshot(now: Date = .now) -> OuraSnapshot {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? calendar.timeZone
         let today = calendar.startOfDay(for: now)
@@ -1049,14 +1063,7 @@ final class OuraManager {
             )
         }
 
-        snapshot = fixture
-        status = .connected(email: "demo@example.com")
-        endpointStates[.heartRate] = .available(fixture.heartRates.count)
-        endpointStates[.detailedSleep] = .available(fixture.sleeps.count)
-        endpointStates[.dailyReadiness] = .available(fixture.readiness.count)
-        endpointStates[.dailySleep] = .available(fixture.sleepScores.count)
-        endpointStates[.dailyActivity] = .available(fixture.activities.count)
-        lastSyncSummary = "Fixture data"
+        return fixture
     }
     #endif
 

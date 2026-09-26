@@ -33,6 +33,8 @@ struct RootView: View {
                 SettingsView()
             }
         }
+        // iPad gets a sidebar that can collapse to a tab bar; iPhone keeps its tab bar.
+        .tabViewStyle(.sidebarAdaptable)
         .tint(HeartSyncTheme.accent)
         .safeAreaInset(edge: .top) {
             if let notice = model.startupNotice {

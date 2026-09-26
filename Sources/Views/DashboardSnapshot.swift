@@ -43,8 +43,142 @@ struct MetricSummary: Identifiable {
     /// Why no verdict is shown, when more than one source reported but they were not
     /// comparable. Mutually exclusive with `comparison`.
     var notComparedDetail: String?
+    /// Trend of the sources on this card. Nil when no source has two windows to join.
+    var sparkline: Sparkline? = nil
 
     var id: MetricKind { kind }
+}
+
+// MARK: - Sparkline
+
+/// A small, axis-free trend for one Now card: one line per source, drawn from the median of
+/// each completed comparison window and broken wherever a window is missing.
+///
+/// It stops at the start of the current window. A window still filling is not a result yet,
+/// and stopping there lets the sparkline be read once per window instead of once per
+/// reading, which keeps the 1 Hz reload of the Now screen bounded (item 29).
+struct Sparkline: Equatable, Sendable {
+    struct Point: Equatable, Sendable {
+        var date: Date
+        var value: Double
+    }
+
+    struct Series: Identifiable, Equatable, Sendable {
+        var sourceID: String
+        var points: [Point]
+        /// Gap segment of each point; see `ChartSegmentation`.
+        var segments: [Int]
+
+        var id: String { sourceID }
+        /// Points a line cannot reach, drawn as dots so a lone window is still visible.
+        var isolated: Set<Int> { ChartSegmentation.isolatedPositions(segments) }
+    }
+
+    var kind: MetricKind
+    var series: [Series]
+    /// The pinned x domain: the whole span, so a quiet stretch stays visibly empty.
+    var start: Date
+    var through: Date
+
+    /// The last hour for fast metrics, the last fourteen days for daily ones.
+    static func span(for kind: MetricKind) -> TimeInterval {
+        kind.comparisonWindow < 3_600 ? 3_600 : 14 * 86_400
+    }
+
+    /// Plain-language span for the spoken summary.
+    static func spanTitle(for kind: MetricKind) -> String {
+        span(for: kind) <= 3_600 ? "the last hour" : "the last 14 days"
+    }
+
+    /// Builds the trend for `sourceIDs`, in that order, from readings of `kind`.
+    ///
+    /// Returns nil when no source has at least two windows: a single point is not a trend.
+    static func build(
+        kind: MetricKind,
+        readings: [Reading],
+        sourceIDs: [String],
+        through: Date
+    ) -> Sparkline? {
+        let window = kind.comparisonWindow
+        let start = through.addingTimeInterval(-span(for: kind))
+        let wanted = Set(sourceIDs)
+        var buckets: [String: [Date: [Double]]] = [:]
+        for reading in readings where reading.kind == kind && wanted.contains(reading.sourceID) {
+            let bucket = ComparisonEngine.floorToWindow(reading.midpoint, size: window)
+            guard bucket >= start, bucket < through else { continue }
+            buckets[reading.sourceID, default: [:]][bucket, default: []].append(reading.value)
+        }
+        let series = sourceIDs.compactMap { sourceID -> Series? in
+            guard let byBucket = buckets[sourceID], !byBucket.isEmpty else { return nil }
+            let points = byBucket.keys.sorted().map { bucket in
+                Point(date: bucket, value: ComparisonEngine.median(byBucket[bucket] ?? []))
+            }
+            let segments = ChartSegmentation.segments(
+                for: points.map(\.date),
+                threshold: ChartSegmentation.windowThreshold(windowSize: window)
+            )
+            return Series(sourceID: sourceID, points: points, segments: segments)
+        }
+        guard series.contains(where: { $0.points.count >= 2 }) else { return nil }
+        return Sparkline(kind: kind, series: series, start: start, through: through)
+    }
+
+    /// One sentence per source for VoiceOver: first and last window, and the range.
+    func spokenSummary(names: [String: String]) -> String {
+        let parts = series.map { series -> String in
+            let name = names[series.sourceID] ?? series.sourceID
+            guard let first = series.points.first, let last = series.points.last else { return name }
+            let values = series.points.map(\.value)
+            let low = values.min() ?? first.value
+            let high = values.max() ?? first.value
+            let gaps = Set(series.segments).count - 1
+            var text = "\(name): \(kind.formatWithUnit(first.value)) to \(kind.formatWithUnit(last.value)), range \(kind.format(low)) to \(kind.formatWithUnit(high))"
+            if gaps > 0 { text += ", \(gaps) gap\(gaps == 1 ? "" : "s")" }
+            return text
+        }
+        return "Trend over \(Self.spanTitle(for: kind)). " + parts.joined(separator: ". ")
+    }
+}
+
+/// A cached trend, reused until the next comparison window closes or the sources change.
+/// Caches "no trend" too, so a metric without one is not re-read every second.
+struct SparklineCacheEntry: Sendable {
+    var through: Date
+    var sourceIDs: [String]
+    var sparkline: Sparkline?
+}
+
+// MARK: - Source status
+
+/// What a source chip on Now may claim.
+///
+/// Only a transport that streams (`SourceTransport.isLive`, today Bluetooth) can be Live,
+/// and only while its connection is actually streaming. Apple Health and Oura are pulled,
+/// so the most they can say is when they last synced.
+enum SourceChipStatus: Equatable, Sendable {
+    case live
+    case synced(Date)
+    case waiting
+
+    static func resolve(transport: SourceTransport, isStreaming: Bool, lastSyncedAt: Date?) -> Self {
+        if transport.isLive {
+            return isStreaming ? .live : .waiting
+        }
+        return lastSyncedAt.map(Self.synced) ?? .waiting
+    }
+
+    func title(relativeTo now: Date) -> String {
+        switch self {
+        case .live:
+            "Live"
+        case .synced(let date):
+            now.timeIntervalSince(date) < 60
+                ? "Synced just now"
+                : "Synced \(WindowLabel.elapsed(now.timeIntervalSince(date))) ago"
+        case .waiting:
+            "Waiting"
+        }
+    }
 }
 
 // MARK: - Snapshot
@@ -62,6 +196,9 @@ struct MetricSummary: Identifiable {
 @MainActor
 struct DashboardSnapshot {
     let metrics: [MetricSummary]
+    /// Trends by metric, handed to the next snapshot so a trend is re-read only when its
+    /// window closes.
+    let sparklineCache: [MetricKind: SparklineCacheEntry]
     /// Set when a history read failed. The cards are then missing for want of data, and the
     /// screen must say so rather than showing "waiting for data".
     let queryFailure: HealthStoreQueryError?
@@ -101,7 +238,8 @@ struct DashboardSnapshot {
     init(
         store: HealthStore,
         now: Date,
-        lookback: (MetricKind) -> TimeInterval = DashboardSnapshot.lookback(for:)
+        lookback: (MetricKind) -> TimeInterval = DashboardSnapshot.lookback(for:),
+        sparklineCache previousCache: [MetricKind: SparklineCacheEntry] = [:]
     ) {
         // A minute of forward tolerance so a reading whose timestamp is slightly ahead of
         // the clock is not excluded from its own current window.
@@ -116,6 +254,7 @@ struct DashboardSnapshot {
         let liveByKind = Dictionary(grouping: live.valueOrEmpty, by: \.kind)
 
         var summaries: [MetricSummary] = []
+        var cache: [MetricKind: SparklineCacheEntry] = [:]
         for kind in MetricKind.allCases {
             let windowed = store.readingsOutcome(
                 kind: kind,
@@ -124,16 +263,52 @@ struct DashboardSnapshot {
             failure = failure ?? windowed.error
             let readings = Self.union(windowed.valueOrEmpty, liveByKind[kind] ?? [])
             guard !readings.isEmpty,
-                  let summary = Self.summary(kind: kind, readings: readings, store: store, now: now)
+                  var summary = Self.summary(kind: kind, readings: readings, store: store, now: now)
             else { continue }
+            let entry = Self.sparklineEntry(
+                kind: kind,
+                sourceIDs: summary.rows.map(\.source.id),
+                store: store,
+                now: now,
+                previous: previousCache[kind]
+            )
+            if let entry { cache[kind] = entry }
+            summary.sparkline = entry?.sparkline
             summaries.append(summary)
         }
 
+        self.sparklineCache = cache
         self.queryFailure = failure
         self.metrics = summaries.sorted { lhs, rhs in
             if lhs.kind.isContinuous != rhs.kind.isContinuous { return lhs.kind.isContinuous }
             return Self.order(of: lhs.kind) < Self.order(of: rhs.kind)
         }
+    }
+
+    /// Reuses the previous trend while its window is still open, otherwise reads the span
+    /// once through the per-metric index. A failed read shows no trend and is not cached, so
+    /// the next reload tries again; the card's values are unaffected.
+    private static func sparklineEntry(
+        kind: MetricKind,
+        sourceIDs: [String],
+        store: HealthStore,
+        now: Date,
+        previous: SparklineCacheEntry?
+    ) -> SparklineCacheEntry? {
+        let through = ComparisonEngine.floorToWindow(now, size: kind.comparisonWindow)
+        if let previous, previous.through == through, previous.sourceIDs == sourceIDs {
+            return previous
+        }
+        let outcome = store.readingsOutcome(
+            kind: kind,
+            in: DateInterval(start: through.addingTimeInterval(-Sparkline.span(for: kind)), end: through)
+        )
+        guard outcome.error == nil else { return nil }
+        return SparklineCacheEntry(
+            through: through,
+            sourceIDs: sourceIDs,
+            sparkline: Sparkline.build(kind: kind, readings: outcome.valueOrEmpty, sourceIDs: sourceIDs, through: through)
+        )
     }
 
     /// Both reads can return the same reading; each is kept once.
