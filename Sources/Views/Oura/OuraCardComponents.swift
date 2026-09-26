@@ -204,12 +204,15 @@ struct OuraCategoricalRibbon: View {
     var values: [Character]
     var colors: [Character: Color]
     var fallback: Color
+    /// Codes drawn hatched as well as filled, so they are identifiable without colour.
+    var patterned: Set<Character> = []
     var accessibilityText: String
 
     var body: some View {
         Canvas { context, size in
             guard !values.isEmpty else { return }
             let width = size.width / CGFloat(values.count)
+            var patternedArea = Path()
             for (index, value) in values.enumerated() {
                 let rect = CGRect(
                     x: CGFloat(index) * width,
@@ -218,6 +221,14 @@ struct OuraCategoricalRibbon: View {
                     height: size.height
                 )
                 context.fill(Path(rect), with: .color(colors[value] ?? fallback))
+                if patterned.contains(value) { patternedArea.addRect(rect) }
+            }
+            guard !patternedArea.isEmpty else { return }
+            // One hatch across the whole ribbon, clipped to the patterned intervals, so a
+            // run of adjacent intervals reads as one continuous stretch.
+            context.drawLayer { layer in
+                layer.clip(to: patternedArea)
+                layer.stroke(OuraHatch.path(in: size, spacing: 5), with: .color(OuraHatch.ink), lineWidth: 1)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 7))
@@ -232,20 +243,59 @@ struct OuraCategoricalRibbon: View {
 
 struct OuraRibbonLegend: View {
     var items: [(String, Color)]
+    /// Titles whose ribbon intervals are hatched; their swatches are hatched to match.
+    var patterned: Set<String> = []
 
     var body: some View {
         HStack(spacing: 12) {
             ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                 HStack(spacing: 4) {
-                    Circle()
-                        .fill(item.1)
-                        .frame(width: 7, height: 7)
+                    if patterned.contains(item.0) {
+                        HatchedSwatch(fill: item.1)
+                    } else {
+                        Circle()
+                            .fill(item.1)
+                            .frame(width: 7, height: 7)
+                    }
                     Text(item.0)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
         }
+    }
+
+    private struct HatchedSwatch: View {
+        var fill: Color
+
+        var body: some View {
+            Canvas { context, size in
+                let outline = Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 2)
+                context.fill(outline, with: .color(fill))
+                context.clip(to: outline)
+                context.stroke(OuraHatch.path(in: size, spacing: 3), with: .color(OuraHatch.ink), lineWidth: 1)
+            }
+            .frame(width: 10, height: 10)
+            .accessibilityHidden(true)
+        }
+    }
+}
+
+/// The diagonal hatch that marks a ribbon category independently of its colour.
+enum OuraHatch {
+    /// Dark enough to read on the pale fills it marks, in either appearance.
+    static var ink: Color { .black.opacity(0.4) }
+
+    /// Parallel diagonals covering `size`, `spacing` points apart.
+    static func path(in size: CGSize, spacing: CGFloat) -> Path {
+        var hatch = Path()
+        var x = -size.height
+        while x < size.width {
+            hatch.move(to: CGPoint(x: x, y: size.height))
+            hatch.addLine(to: CGPoint(x: x + size.height, y: 0))
+            x += spacing
+        }
+        return hatch
     }
 }
 

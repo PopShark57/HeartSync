@@ -6,6 +6,15 @@ struct DevicesView: View {
     @State private var showingScanner = false
     @State private var showingOuraSetup = false
     @State private var renamingSource: DataSource?
+    /// A removal waiting for its confirmation. Nothing is deleted until the dialog's
+    /// destructive button is pressed; a swipe or a menu item only proposes it.
+    @State private var removal: RemovalProposal?
+    @State private var exportPayload: ReadingsExportPayload?
+    /// Held apart from `exportPayload`, which the sheet clears before `onDismiss` runs, so
+    /// the temporary export is still known when the time comes to delete it.
+    @State private var exportDirectory: URL?
+    @State private var exportError: String?
+    @State private var isExporting = false
 
     var body: some View {
         NavigationStack {
@@ -43,7 +52,153 @@ struct DevicesView: View {
             .sheet(item: $renamingSource) { source in
                 RenameSourceView(source: source)
             }
+            // Attached to the list rather than to a row, swipe button, or menu item: those
+            // are transient and can be gone before a dialog they own is presented.
+            .confirmationDialog(
+                removal?.consequence.title ?? "Remove device?",
+                isPresented: Binding(
+                    get: { removal != nil },
+                    set: { if !$0 { removal = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: removal
+            ) { proposal in
+                removalActions(proposal)
+            } message: { proposal in
+                Text(proposal.consequence.message)
+            }
+            .sheet(item: $exportPayload, onDismiss: discardExport) { payload in
+                ReadingsShareSheet(items: [payload.url])
+                    .ignoresSafeArea()
+            }
+            .alert(
+                "Export failed",
+                isPresented: Binding(
+                    get: { exportError != nil },
+                    set: { if !$0 { exportError = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { exportError = nil }
+            } message: {
+                Text(exportError ?? "The export could not be prepared.")
+            }
+            .overlay {
+                if isExporting {
+                    ProgressView("Preparing export\u{2026}")
+                        .padding()
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: HeartSyncTheme.compactCornerRadius))
+                }
+            }
         }
+    }
+
+    // MARK: Removal
+
+    /// The dialog's buttons. Deleting is one choice among several: exporting first and the
+    /// two non-destructive alternatives sit beside it, because someone reaching for Remove
+    /// often wants a noisy device gone from one comparison, not its history destroyed.
+    @ViewBuilder
+    private func removalActions(_ proposal: RemovalProposal) -> some View {
+        Button(proposal.consequence.confirmTitle, role: .destructive) {
+            confirmRemoval(proposal)
+        }
+        if proposal.consequence.offersExport, let source = proposal.source {
+            Button("Export its readings first") { exportBeforeRemoval(source) }
+        }
+        if let source = proposal.source {
+            if source.transport == .bluetooth, source.isEnabled {
+                Button("Pause collecting instead") { setCollecting(false, source: source) }
+            }
+            if !isHiddenFromComparison(source) {
+                Button("Hide from comparisons instead") {
+                    model.settings.snapshot.setComparisonHidden(true, forSource: source.id)
+                }
+            }
+        }
+        Button("Cancel", role: .cancel) {}
+    }
+
+    /// Reads the numbers the dialog states. A failed count is passed on as unknown, which
+    /// the wording reports as unknown rather than as "no readings".
+    private func proposeRemoval(_ source: DataSource) {
+        let history = model.store.sourceHistorySummaryOutcome(sourceID: source.id).value
+        removal = RemovalProposal(
+            source: source,
+            consequence: .make(
+                action: source.id == DataSource.ouraSourceID ? .disconnectOura : .removeSource,
+                source: source,
+                history: history
+            )
+        )
+    }
+
+    private func proposeOuraDisconnect() {
+        if let source = model.store.source(id: DataSource.ouraSourceID) {
+            proposeRemoval(source)
+        } else {
+            removal = RemovalProposal(
+                source: nil,
+                consequence: .make(action: .disconnectOura, source: nil, history: nil)
+            )
+        }
+    }
+
+    private func confirmRemoval(_ proposal: RemovalProposal) {
+        removal = nil
+        if let source = proposal.source {
+            model.removeSource(source)
+        } else {
+            model.oura.disconnect()
+        }
+    }
+
+    /// Writes this source's rows to a temporary CSV and opens the share sheet. The removal
+    /// is not performed; the user comes back to Remove once the file is safe.
+    private func exportBeforeRemoval(_ source: DataSource) {
+        removal = nil
+        isExporting = true
+        Task { @MainActor in
+            defer { isExporting = false }
+            do {
+                let filename = "HeartSync-\(Self.fileSafe(source.displayName))-readings.csv"
+                guard let payload = try ReadingsExportPayload.prepare(
+                    store: model.store,
+                    sourceID: source.id,
+                    filename: filename
+                ) else {
+                    exportError = "There are no stored readings from \(source.displayName) to export."
+                    return
+                }
+                exportDirectory = payload.directory
+                exportPayload = payload
+            } catch {
+                exportError = "HeartSync could not export the readings. \(error.localizedDescription) Nothing was deleted or changed."
+            }
+        }
+    }
+
+    /// Removes the temporary export once the share sheet is gone, whatever the user did.
+    private func discardExport() {
+        if let exportDirectory {
+            try? FileManager.default.removeItem(at: exportDirectory)
+        }
+        exportDirectory = nil
+        exportPayload = nil
+    }
+
+    private func setCollecting(_ enabled: Bool, source: DataSource) {
+        model.store.setEnabled(enabled, forSource: source.id)
+        if enabled {
+            model.bluetooth.reconnect(sourceID: source.id)
+        } else {
+            model.bluetooth.disconnect(sourceID: source.id)
+        }
+    }
+
+    private static func fileSafe(_ name: String) -> String {
+        let allowed = name.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "-" }
+        let collapsed = String(allowed).split(separator: "-").joined(separator: "-")
+        return collapsed.isEmpty ? "device" : collapsed
     }
 
     // MARK: Bluetooth
@@ -64,9 +219,12 @@ struct DevicesView: View {
                     hrvProgress: bluetoothDetailText(for: source)
                 )
                 .accessibilityIdentifier("source.\(source.id)")
-                .swipeActions(edge: .trailing) {
+                // No full swipe: with it, one long gesture performed Remove and deleted the
+                // device's whole history, which for Bluetooth cannot be downloaded again.
+                // Remove now only proposes; the dialog states what would be deleted.
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                     Button(role: .destructive) {
-                        model.removeSource(source)
+                        proposeRemoval(source)
                     } label: { Label("Remove", systemImage: "trash") }
 
                     Button {
@@ -81,12 +239,7 @@ struct DevicesView: View {
                     // nothing about the connection — the label says so rather than leaving
                     // them to discover the difference by losing data.
                     Button(source.isEnabled ? "Pause collecting" : "Resume collecting") {
-                        model.store.setEnabled(!source.isEnabled, forSource: source.id)
-                        if source.isEnabled {
-                            model.bluetooth.disconnect(sourceID: source.id)
-                        } else {
-                            model.bluetooth.reconnect(sourceID: source.id)
-                        }
+                        setCollecting(!source.isEnabled, source: source)
                     }
                     if isHiddenFromComparison(source) {
                         Button("Show in comparisons") {
@@ -99,7 +252,7 @@ struct DevicesView: View {
                     }
                     Button("Reconnect") { model.bluetooth.reconnect(sourceID: source.id) }
                     Button("Rename") { renamingSource = source }
-                    Button("Remove", role: .destructive) { model.removeSource(source) }
+                    Button("Remove\u{2026}", role: .destructive) { proposeRemoval(source) }
                 }
             }
 
@@ -212,8 +365,8 @@ struct DevicesView: View {
                         statusText: healthSourceStatus(source),
                         statusColor: .secondary
                     )
-                    .swipeActions(edge: .trailing) {
-                        Button(role: .destructive) { model.removeSource(source) } label: {
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button(role: .destructive) { proposeRemoval(source) } label: {
                             Label("Remove", systemImage: "trash")
                         }
                     }
@@ -341,13 +494,9 @@ struct DevicesView: View {
                 }
 
                 Button("Disconnect Oura", role: .destructive) {
-                    if let source = model.store.source(id: DataSource.ouraSourceID) {
-                        model.removeSource(source)
-                    } else {
-                        model.oura.disconnect()
-                    }
+                    proposeOuraDisconnect()
                 }
-                .accessibilityHint("Removes the Oura authorization and its readings from this device")
+                .accessibilityHint("Asks before removing the Oura authorization and its readings from this device")
             } else {
                 Button {
                     showingOuraSetup = true
@@ -372,6 +521,15 @@ struct DevicesView: View {
     private var estimateSources: [DataSource] {
         model.store.sources.filter { $0.transport == .manual }
     }
+}
+
+/// A removal the user has asked for but not yet confirmed.
+private struct RemovalProposal: Identifiable {
+    /// Nil only for disconnecting an Oura account that has not stored anything yet.
+    var source: DataSource?
+    var consequence: SourceRemovalConsequence
+
+    var id: String { source?.id ?? "oura.disconnect" }
 }
 
 /// One configured source in the list.

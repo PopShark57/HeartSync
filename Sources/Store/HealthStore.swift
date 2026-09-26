@@ -488,6 +488,29 @@ final class HealthStore {
             .map { rows in enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows }
     }
 
+    /// Readings of every metric that end at or after `end`, limited to midpoints in `range`.
+    ///
+    /// For live screens: a reading is current by its *end*, and a long interval reading —
+    /// an overnight average that finished minutes ago — has a midpoint hours back, outside
+    /// any short midpoint window. Reading through the `end` index finds those without
+    /// scanning days of history.
+    func readingsOutcome(
+        endingAtOrAfter end: Date,
+        midpointIn range: DateInterval,
+        enabledOnly: Bool = true
+    ) -> HealthStoreQueryOutcome<[Reading]> {
+        _ = dataGeneration
+        guard loadState == .loaded else {
+            guard persistenceEnabled else {
+                return .success(unavailableBuffer.filter { $0.end >= end && range.contains($0.midpoint) })
+            }
+            return .failure(.notLoaded)
+        }
+        let enabled = enabledOnly ? Set(enabledSources.map(\.id)) : nil
+        return query { try $0.readings(endingAtOrAfter: end, midpointIn: range) }
+            .map { rows in enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows }
+    }
+
     func readings(kind: MetricKind, in range: DateInterval? = nil, enabledOnly: Bool = true) -> [Reading] {
         guard loadState == .loaded || !persistenceEnabled else {
             return unavailableBuffer.filter { $0.kind == kind }
@@ -514,11 +537,36 @@ final class HealthStore {
     func readingsPageOutcome(
         kind: MetricKind? = nil,
         in range: DateInterval? = nil,
+        sourceID: String? = nil,
         limit: Int = 1_000,
         offset: Int = 0
     ) -> HealthStoreQueryOutcome<[Reading]> {
         _ = dataGeneration
-        return query { try $0.readings(kind: kind, range: range, limit: limit, offset: offset) }
+        return query {
+            try $0.readings(kind: kind, range: range, sourceID: sourceID, limit: limit, offset: offset)
+        }
+    }
+
+    /// What removing one source would delete, stated before anything is deleted.
+    struct SourceHistorySummary: Equatable, Sendable {
+        /// Stored rows for the source. After compaction a row can be a window median, so
+        /// this counts what the database holds, not how many measurements were ever taken.
+        var readingCount: Int
+        /// Midpoint of the earliest stored reading, or nil when nothing is stored.
+        var earliest: Date?
+    }
+
+    /// Row count and earliest stored reading for one source, from the source index.
+    ///
+    /// A failure is returned rather than a zero: a removal confirmation that said "no
+    /// readings" because the count could not be read would understate what is deleted.
+    func sourceHistorySummaryOutcome(sourceID: String) -> HealthStoreQueryOutcome<SourceHistorySummary> {
+        _ = dataGeneration
+        guard loadState == .loaded || !persistenceEnabled else { return .failure(.notLoaded) }
+        return query { database in
+            let history = try database.sourceHistory(sourceID: sourceID)
+            return SourceHistorySummary(readingCount: history.count, earliest: history.earliestMidpoint)
+        }
     }
 
     /// Whole-history read for the explicit export. Throws rather than returning an empty
@@ -854,12 +902,15 @@ final class HealthStore {
     /// CSV is indistinguishable from a complete one once it has been shared, so a partial
     /// export must not survive.
     ///
+    /// - Parameter sourceID: limits the file to one source's rows, for the export offered
+    ///   before that source is removed. Nil exports the whole history.
     /// - Parameter shouldContinue: consulted between pages; returning false cancels the
     ///   export and removes the partial file.
     /// - Returns: the number of data rows written.
     @discardableResult
     func writeExportCSV(
         to url: URL,
+        sourceID: String? = nil,
         pageSize: Int = 5_000,
         shouldContinue: (Int) -> Bool = { _ in true }
     ) throws -> Int {
@@ -883,7 +934,7 @@ final class HealthStore {
                     abort()
                     throw CancellationError()
                 }
-                let page = try readingsPageOutcome(limit: pageSize, offset: offset).get()
+                let page = try readingsPageOutcome(sourceID: sourceID, limit: pageSize, offset: offset).get()
                 if page.isEmpty { break }
                 let chunk = Self.exportRows(readings: page, sources: sources)
                 try handle.write(contentsOf: Data(chunk.utf8))

@@ -64,6 +64,57 @@ struct ComparisonSessionsView: View {
     }
 }
 
+/// States that a saved session's fixed span is in force, and whether its data has moved.
+///
+/// Shown on Compare and on both detail screens opened from it, in place of the rolling range
+/// picker. A drill-down from "Morning walk, 07:00–08:00" must analyse those seconds and say
+/// so; showing the picker there would imply the last 24 hours, a different analysis.
+struct ComparisonSessionBanner: View {
+    @Environment(AppModel.self) private var model
+    var session: ComparisonSession
+    /// What changed since the session was last opened. Compare computes it on open.
+    var revisitNotice: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(session.displayTitle, systemImage: "bookmark.fill")
+                .font(.subheadline.weight(.semibold))
+            Text("\(session.interval.start.formatted(date: .abbreviated, time: .shortened)) \u{2013} \(session.interval.end.formatted(date: .omitted, time: .shortened))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !session.context.isEmpty {
+                Text(session.context)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text("Saved session: this analysis covers exactly these times, not a rolling range.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            // A saved session is a saved *selection*. Data for its period keeps arriving,
+            // so a revisit says when the result is no longer the one that was seen.
+            if let revisitNotice {
+                Label(revisitNotice, systemImage: "arrow.down.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            let missing = session.missingSourceIDs(in: model.store.sources)
+            if !missing.isEmpty {
+                Label(
+                    "\(missing.count) saved \(missing.count == 1 ? "device is" : "devices are") no longer set up, so this is not the comparison that was saved.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct SessionRow: View {
     @Environment(AppModel.self) private var model
     var session: ComparisonSession

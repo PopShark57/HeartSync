@@ -66,6 +66,24 @@ enum DebugAnalysisFixtures {
         }
     }
 
+    /// A saved session over five of the eight paired heart-rate minutes above.
+    ///
+    /// The rolling 24-hour range holds all eight, so a drill-down that fell back to the
+    /// picker instead of the session would visibly analyse a different period. Pass the same
+    /// `now` that `populate` used.
+    static func demoSession(now: Date = .now) -> ComparisonSession {
+        let minute = ComparisonEngine.floorToWindow(now.addingTimeInterval(-12 * 60), size: 60)
+        return ComparisonSession(
+            id: UUID(stableFrom: "demo.session.walk"),
+            title: "Demo walk",
+            context: "walk",
+            interval: DateInterval(start: minute, end: minute.addingTimeInterval(5 * 60 - 1)),
+            sourceIDs: [sourceAID, sourceBID],
+            metric: .heartRate,
+            createdAt: now
+        )
+    }
+
     private static func append(
         _ store: HealthStore,
         _ sourceID: String,

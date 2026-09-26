@@ -5,35 +5,61 @@ import SwiftUI
 /// statistics for that metric.
 struct MetricDetailView: View {
     @Environment(AppModel.self) private var model
-    var kind: MetricKind
-    var initialRange: TimeRange = .day
+    let kind: MetricKind
+    /// A saved session whose exact span this screen analyses, or nil for a rolling preset.
+    let session: ComparisonSession?
 
-    @State private var range: TimeRange = .day
+    /// Seeded once, in `init`. `onAppear` runs again when a pushed pair view is popped, so
+    /// assigning the initial range there reset the user's choice on every Back.
+    @State private var range: TimeRange
     /// Presentation only. Estimated values are drawn as dashed lines when this is on; they
     /// are never fed into a comparison verdict either way \u{2014} see `MetricDetailSnapshot`.
     @State private var showEstimates = true
     /// Bumped by the retry button so the load key changes and the query runs again.
     @State private var retryToken = 0
     @State private var snapshot: MetricDetailSnapshot?
+    /// The last completed load, so a reload caused only by new data can be coalesced.
+    @State private var lastLoadedKey: LoadKey?
+    @State private var lastLoadedAt: Date?
+
+    init(kind: MetricKind, initialRange: TimeRange = .day, session: ComparisonSession? = nil) {
+        self.kind = kind
+        self.session = session
+        _range = State(initialValue: initialRange)
+    }
+
+    /// The span analysed: a saved session's fixed seconds when one is open, otherwise the
+    /// rolling preset. Opening "Morning walk" must not quietly show the last 24 hours.
+    private var period: ComparisonPeriod {
+        session.map { .fixed($0.interval) } ?? .rolling(range)
+    }
 
     /// Everything the snapshot depends on. An unrelated view update leaves this unchanged
     /// and reuses the resolved snapshot instead of re-reading and re-windowing the range.
     private struct LoadKey: Hashable {
         var generation: Int
-        var kind: MetricKind
-        var range: TimeRange
-        var showEstimates: Bool
         var hrvQualityCount: Int
+        var kind: MetricKind
+        var period: ComparisonPeriod
+        var showEstimates: Bool
         var retryToken: Int
+
+        /// True when `other` asks the same question and only the data may have changed.
+        func sameSelection(as other: LoadKey) -> Bool {
+            var aligned = other
+            aligned.generation = generation
+            aligned.hrvQualityCount = hrvQualityCount
+            return aligned == self
+        }
     }
 
     private var loadKey: LoadKey {
         LoadKey(
             generation: model.store.changeToken,
-            kind: kind,
-            range: range,
-            showEstimates: showEstimates,
             hrvQualityCount: isHRV ? model.bluetooth.hrvQuality.count : 0,
+            kind: kind,
+            period: period,
+            showEstimates: showEstimates,
             retryToken: retryToken
         )
     }
@@ -62,22 +88,30 @@ struct MetricDetailView: View {
         }
         .navigationTitle(kind.title)
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { range = initialRange }
         // Cancels a superseded load and rejects a late one, so a slow month-range result
         // cannot replace a newer hour-range selection.
         .task(id: loadKey) {
             let key = loadKey
-            try? await Task.sleep(for: .milliseconds(16))
+            // A changed question loads after one frame; new data alone is coalesced, so a
+            // 1 Hz strap does not re-read and re-window a month on every reading.
+            let wait = LiveReloadPolicy.delay(
+                dataOnly: lastLoadedKey.map { key.sameSelection(as: $0) } ?? false,
+                elapsed: lastLoadedAt.map { Date.now.timeIntervalSince($0) },
+                minimumInterval: LiveReloadPolicy.minimumInterval(for: period)
+            )
+            try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }
             let resolved = MetricDetailSnapshot(
                 store: model.store,
                 kind: kind,
-                range: range,
+                period: period,
                 includeEstimates: showEstimates,
                 hrvQuality: isHRV ? model.bluetooth.hrvQuality : [:]
             )
             guard !Task.isCancelled, key == loadKey else { return }
             snapshot = resolved
+            lastLoadedKey = key
+            lastLoadedAt = .now
         }
     }
 
@@ -85,11 +119,23 @@ struct MetricDetailView: View {
     private func content(_ snapshot: MetricDetailSnapshot) -> some View {
         List {
             Section {
-                Picker("Range", selection: $range) {
-                    ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
+                // A saved session's span is fixed, so the rolling picker is replaced rather
+                // than left to imply a range this screen is not analysing.
+                if let session {
+                    ComparisonSessionBanner(session: session)
+                        .accessibilityIdentifier("metric.session")
+                } else {
+                    Picker("Range", selection: $range) {
+                        ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                    .accessibilityIdentifier("metric.range")
                 }
-                .pickerStyle(.segmented)
-                .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+
+                if snapshot.generation != model.store.changeToken {
+                    SnapshotLagNote(resolvedAt: snapshot.resolvedAt)
+                }
 
                 if snapshot.hasEstimatedReadings {
                     Toggle("Show estimated values", isOn: $showEstimates)
@@ -123,7 +169,7 @@ struct MetricDetailView: View {
                 Text(kind.title)
             } footer: {
                 if !snapshot.bandPoints.isEmpty {
-                    Text("The shaded band spans the highest and lowest device reading in each \(WindowLabel.length(snapshot.bucketSize)) window. A wide band means your devices disagree at that moment.")
+                    Text("The shaded band spans the highest and lowest device reading in each \(WindowLabel.length(snapshot.bucketSize)) window, coloured by that window's agreement. A wide band means your devices disagree at that moment. Lines and band break where a device, or a second device to compare with, did not report.")
                 }
             }
 
@@ -133,7 +179,7 @@ struct MetricDetailView: View {
                         PerSourceStatsRow(kind: kind, entry: entry)
                     }
                 } header: {
-                    Text("Per device, \(range.title.lowercased())")
+                    Text("Per device, \(periodPhrase(snapshot.period))")
                 } footer: {
                     Text("These summarise one median per device per \(WindowLabel.length(snapshot.bucketSize)) window \u{2014} the same windows the chart draws. They are not raw sample statistics: readings older than the compaction age are stored as one median per window, so the original minimum, maximum and mean no longer exist. Where the original sample count was recorded it is shown separately; where it was not, it is shown as unknown.")
                 }
@@ -143,15 +189,19 @@ struct MetricDetailView: View {
                 Section {
                     ForEach(snapshot.pairwiseAnalyses) { analysis in
                         NavigationLink {
+                            // Carries the session too, so a pair opened from a saved
+                            // session analyses — and exports — the session's own span.
                             PairwiseAnalysisView(
                                 kind: kind,
                                 sourceAID: analysis.sourceA,
                                 sourceBID: analysis.sourceB,
-                                initialRange: range
+                                initialRange: range,
+                                session: session
                             )
                         } label: {
                             PairwiseAnalysisRow(analysis: analysis)
                         }
+                        .accessibilityIdentifier("metric.pair")
                     }
                 } header: {
                     Text("Device pairs")
@@ -189,13 +239,28 @@ struct MetricDetailView: View {
     private func chart(_ snapshot: MetricDetailSnapshot) -> some View {
         Chart {
             ForEach(snapshot.bandPoints) { band in
-                AreaMark(
-                    x: .value("Time", band.date),
-                    yStart: .value("Low", band.low),
-                    yEnd: .value("High", band.high)
-                )
-                .foregroundStyle(band.severity.tint.opacity(0.16))
-                .interpolationMethod(.monotone)
+                if band.isIsolated {
+                    // One compared window between gaps: an area needs two points, so it is
+                    // drawn as a short bar spanning that window's spread.
+                    RuleMark(
+                        x: .value("Time", band.date),
+                        yStart: .value("Low", band.low),
+                        yEnd: .value("High", band.high)
+                    )
+                    .foregroundStyle(band.severity.tint.opacity(0.35))
+                    .lineStyle(StrokeStyle(lineWidth: 4, lineCap: .round))
+                } else {
+                    // Keyed per run: the band breaks where nothing was compared and where
+                    // the severity changes, since an area series takes a single style.
+                    AreaMark(
+                        x: .value("Time", band.date),
+                        yStart: .value("Low", band.low),
+                        yEnd: .value("High", band.high),
+                        series: .value("Band", band.seriesKey)
+                    )
+                    .foregroundStyle(band.severity.tint.opacity(0.16))
+                    .interpolationMethod(.monotone)
+                }
             }
 
             // Every mark keys on `sourceID`, never on the display name. Two devices called
@@ -229,7 +294,7 @@ struct MetricDetailView: View {
         .chartXAxis {
             AxisMarks(preset: .aligned) { _ in
                 AxisGridLine()
-                AxisValueLabel(format: axisFormat)
+                AxisValueLabel(format: axisFormat(snapshot.period.displayRange))
             }
         }
         .chartYAxis {
@@ -252,7 +317,8 @@ struct MetricDetailView: View {
     private func legendEntries(_ snapshot: MetricDetailSnapshot) -> some View {
         ForEach(snapshot.series) { entry in
             HStack(spacing: 5) {
-                SourceDot(color: entry.color, size: 8)
+                // The same shape the chart plots, so the key works without colour.
+                SourceSymbolGlyph(symbol: entry.symbol, color: entry.color)
                 Text(entry.label)
                     .font(.caption2)
                     .lineLimit(1)
@@ -263,11 +329,19 @@ struct MetricDetailView: View {
         Spacer(minLength: 0)
     }
 
-    private var axisFormat: Date.FormatStyle {
-        switch range {
+    /// Keyed on the snapshot's period rather than the picker, so a saved session's span is
+    /// labelled at the zoom that fits it.
+    private func axisFormat(_ displayRange: TimeRange) -> Date.FormatStyle {
+        switch displayRange {
         case .hour, .sixHours: .dateTime.hour().minute()
         case .day:             .dateTime.hour()
         case .week, .month:    .dateTime.month(.abbreviated).day()
         }
+    }
+
+    /// "last 24 hours", or "saved session" for a fixed span. A formatted date is not
+    /// lowercased: that would mangle month names in some languages.
+    private func periodPhrase(_ period: ComparisonPeriod) -> String {
+        period.rollingRange.map { $0.title.lowercased() } ?? "saved session"
     }
 }

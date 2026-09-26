@@ -25,5 +25,29 @@ enum DebugUITestFixtures {
             ))
         }
     }
+
+    /// Two Bluetooth sensors with twelve readings each, so a removal test can show that
+    /// cancelling changes nothing and confirming deletes exactly one source's rows.
+    static let removalSourceIDs = [
+        "22222222-2222-2222-2222-222222222222",
+        "33333333-3333-3333-3333-333333333333",
+    ]
+
+    static func populateRemoval(store: HealthStore) {
+        let names = ["Demo Chest Strap", "Demo Finger Sensor"]
+        let now = Date.now
+        for (index, id) in removalSourceIDs.enumerated() {
+            store.upsert(DataSource(id: id, displayName: names[index], transport: .bluetooth))
+            for minute in 0..<12 {
+                _ = store.append(Reading(
+                    id: UUID(stableFrom: "ui-removal-\(id)-\(minute)"),
+                    sourceID: id,
+                    kind: .heartRate,
+                    value: 64 + Double(minute % 4),
+                    start: now.addingTimeInterval(-Double(minute + 1) * 60)
+                ))
+            }
+        }
+    }
 }
 #endif

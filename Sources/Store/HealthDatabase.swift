@@ -157,12 +157,44 @@ final class HealthDatabase {
         return try decodedRows(sql, bindings: bindings, as: Reading.self)
     }
 
+    /// Readings that end at or after `end`, of every metric, whose midpoint lies in `range`.
+    ///
+    /// Answered from the `end` index. The midpoint bounds are written `+midpoint` so SQLite
+    /// cannot trade the `end` index for a composite one: filtering by metric here instead
+    /// would let it pick `(kind, midpoint)` and scan that metric's whole history to find
+    /// the last few minutes.
+    func readings(endingAtOrAfter end: Date, midpointIn range: DateInterval) throws -> [Reading] {
+        try decodedRows(
+            "SELECT payload FROM readings WHERE end >= ? AND +midpoint >= ? AND +midpoint <= ? ORDER BY end, rowid",
+            bindings: [
+                .double(end.timeIntervalSince1970),
+                .double(range.start.timeIntervalSince1970),
+                .double(range.end.timeIntervalSince1970),
+            ],
+            as: Reading.self
+        )
+    }
+
     func latest(kind: MetricKind, sourceID: String) throws -> Reading? {
         try decodedRows(
             "SELECT payload FROM readings WHERE kind = ? AND source_id = ? ORDER BY end DESC, rowid DESC LIMIT 1",
             bindings: [.text(kind.rawValue), .text(sourceID)],
             as: Reading.self
         ).first
+    }
+
+    /// Stored rows and the earliest observation for one source, answered from the
+    /// `(source_id, midpoint)` index without decoding a payload. This is exactly the set
+    /// `removeSource(id:)` deletes, so a confirmation can state it before anything happens.
+    func sourceHistory(sourceID: String) throws -> (count: Int, earliestMidpoint: Date?) {
+        try checkInjectedQueryFailure("read source history")
+        let statement = try prepare("SELECT COUNT(*), MIN(midpoint) FROM readings WHERE source_id = ?")
+        defer { sqlite3_finalize(statement) }
+        try bind([.text(sourceID)], to: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw error("read source history") }
+        let count = Int(sqlite3_column_int64(statement, 0))
+        guard sqlite3_column_type(statement, 1) != SQLITE_NULL else { return (count, nil) }
+        return (count, Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)))
     }
 
     func lastDataDate(sourceID: String) throws -> Date? {

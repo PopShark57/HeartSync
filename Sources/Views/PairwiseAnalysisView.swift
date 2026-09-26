@@ -13,9 +13,16 @@ struct PairwiseAnalysisView: View {
     let kind: MetricKind
     let sourceAID: String
     let sourceBID: String
+    /// A saved session whose exact span this screen analyses and exports, or nil.
+    let session: ComparisonSession?
 
     @State private var range: TimeRange
+    /// The only state a drag writes. Everything it is compared against lives in `snapshot`.
     @State private var selectedObservationStart: Date?
+    @State private var snapshot: PairwiseSnapshot?
+    @State private var retryToken = 0
+    @State private var lastLoadedKey: LoadKey?
+    @State private var lastLoadedAt: Date?
     @State private var sharePayload: PairwiseSharePayload?
     @State private var shareDirectory: URL?
     @State private var exportError: String?
@@ -24,31 +31,148 @@ struct PairwiseAnalysisView: View {
         kind: MetricKind,
         sourceAID: String,
         sourceBID: String,
-        initialRange: TimeRange = .day
+        initialRange: TimeRange = .day,
+        session: ComparisonSession? = nil
     ) {
         self.kind = kind
         self.sourceAID = min(sourceAID, sourceBID)
         self.sourceBID = max(sourceAID, sourceBID)
+        self.session = session
         _range = State(initialValue: initialRange)
     }
 
+    /// The span analysed: a saved session's fixed seconds, otherwise the rolling preset.
+    private var period: ComparisonPeriod {
+        session.map { .fixed($0.interval) } ?? .rolling(range)
+    }
+
+    /// Everything the snapshot depends on. Selection is deliberately absent: a drag must
+    /// never cause a store read or a re-analysis.
+    private struct LoadKey: Hashable {
+        var generation: Int
+        var kind: MetricKind
+        var sourceA: String
+        var sourceB: String
+        var period: ComparisonPeriod
+        var retryToken: Int
+
+        /// True when `other` asks the same question and only the data may have changed.
+        func sameSelection(as other: LoadKey) -> Bool {
+            var aligned = other
+            aligned.generation = generation
+            return aligned == self
+        }
+    }
+
+    private var loadKey: LoadKey {
+        LoadKey(
+            generation: model.store.changeToken,
+            kind: kind,
+            sourceA: sourceAID,
+            sourceB: sourceBID,
+            period: period,
+            retryToken: retryToken
+        )
+    }
+
     var body: some View {
-        let currentAnalysis = analysis
-        let points = plotted(currentAnalysis)
-        // Both of these read the store/Bluetooth manager, so they are resolved once per
-        // render alongside the analysis rather than from inside a computed property that
-        // several subviews would each re-evaluate.
+        Group {
+            if let snapshot {
+                content(snapshot)
+            } else {
+                List {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Loading comparison\u{2026}")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityIdentifier("pairwise.loading")
+                }
+            }
+        }
+        .navigationTitle(kind.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: range) {
+            selectedObservationStart = nil
+        }
+        // Cancels a superseded load and rejects a late one. New data alone is coalesced,
+        // so a live strap does not re-analyse a month once a second.
+        .task(id: loadKey) {
+            let key = loadKey
+            let wait = LiveReloadPolicy.delay(
+                dataOnly: lastLoadedKey.map { key.sameSelection(as: $0) } ?? false,
+                elapsed: lastLoadedAt.map { Date.now.timeIntervalSince($0) },
+                minimumInterval: LiveReloadPolicy.minimumInterval(for: period)
+            )
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled else { return }
+            let resolved = PairwiseSnapshot(
+                store: model.store,
+                kind: kind,
+                sourceA: sourceAID,
+                sourceB: sourceBID,
+                period: period
+            )
+            guard !Task.isCancelled, key == loadKey else { return }
+            snapshot = resolved
+            lastLoadedKey = key
+            lastLoadedAt = .now
+        }
+        .sheet(item: $sharePayload, onDismiss: discardShareFiles) { payload in
+            PairwiseActivityView(items: payload.urls)
+                .ignoresSafeArea()
+        }
+        .alert(
+            "Export unavailable",
+            isPresented: Binding(
+                get: { exportError != nil },
+                set: { if !$0 { exportError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { exportError = nil }
+        } message: {
+            Text(exportError ?? "The export could not be prepared.")
+        }
+    }
+
+    @ViewBuilder
+    private func content(_ snapshot: PairwiseSnapshot) -> some View {
+        let currentAnalysis = snapshot.analysis
+        // These read the store/Bluetooth manager's small in-memory state, so they are
+        // resolved once per render rather than from inside a computed property that several
+        // subviews would each re-evaluate. None of them touches the database.
         let sensingNote = sensingDifferenceNote
         let relationshipNote = sourceRelationshipNote
         let beatQuality = hrvBeatQuality()
 
         List {
             Section {
-                Picker("Range", selection: $range) {
-                    ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
+                // A saved session's span is fixed, so the rolling picker is replaced rather
+                // than left to imply a range this screen is not analysing.
+                if let session {
+                    ComparisonSessionBanner(session: session)
+                        .accessibilityIdentifier("pairwise.session")
+                } else {
+                    Picker("Range", selection: $range) {
+                        ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                    .accessibilityIdentifier("pairwise.range")
                 }
-                .pickerStyle(.segmented)
-                .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                if snapshot.generation != model.store.changeToken {
+                    SnapshotLagNote(resolvedAt: snapshot.resolvedAt)
+                }
+            }
+
+            if let failure = snapshot.queryFailure {
+                // A failed read is not "no overlapping windows"; that would be a claim about
+                // the user's devices that this screen cannot support.
+                Section {
+                    HistoryUnavailableView(error: failure) { retryToken &+= 1 }
+                        .accessibilityIdentifier("pairwise.unavailable")
+                }
             }
 
             Section {
@@ -60,28 +184,33 @@ struct PairwiseAnalysisView: View {
                 Text("A signed difference is always Device A minus Device B. Estimates are excluded, and raw samples are reduced to one median per aligned window.")
             }
 
-            if currentAnalysis.observations.isEmpty {
+            if snapshot.queryFailure != nil {
+                // Already stated above; drawing empty charts here would contradict it.
+                EmptyView()
+            } else if currentAnalysis.observations.isEmpty {
                 Section {
                     EmptyStateView(
                         systemImage: "rectangle.on.rectangle.slash",
                         title: "No overlapping windows",
-                        message: "These devices never reported inside the same aligned \(windowDescription(currentAnalysis.windowSize)) window in this range. Widen the range, or wear both devices at the same time."
+                        message: session == nil
+                            ? "These devices never reported inside the same aligned \(windowDescription(currentAnalysis.windowSize)) window in this range. Widen the range, or wear both devices at the same time."
+                            : "These devices never reported inside the same aligned \(windowDescription(currentAnalysis.windowSize)) window during this saved session."
                     )
                 }
             } else {
                 Section {
-                    pairedTimeline(currentAnalysis, points: points)
+                    pairedTimeline(snapshot)
                         .frame(height: 250)
                         .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 8, trailing: 12))
                     deviceLegend
                 } header: {
                     Text("Paired values")
                 } footer: {
-                    Text("Each line connects the per-window medians for one device. Drag across the chart to inspect the nearest paired window.\(thinningNote(currentAnalysis, points: points))")
+                    Text("Each line connects the per-window medians for one device. Drag across the chart to inspect the nearest paired window.\(snapshot.thinningNote)")
                 }
 
                 Section {
-                    blandAltmanChart(currentAnalysis, points: points)
+                    blandAltmanChart(snapshot)
                         .frame(height: 280)
                         .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 8, trailing: 12))
                     differenceLegend
@@ -91,9 +220,9 @@ struct PairwiseAnalysisView: View {
                     Text("The horizontal position is the mean of the two device values. The vertical position is A minus B. Limits of agreement describe these observations; they are not inferential confidence intervals.")
                 }
 
-                if let selected = selectedObservation(in: points) {
+                if let selected = snapshot.observation(startingAt: selectedObservationStart) {
                     Section("Selected paired window") {
-                        selectedObservationCard(selected, analysis: currentAnalysis)
+                        selectedObservationCard(selected, snapshot: snapshot)
                     }
                 }
             }
@@ -149,45 +278,16 @@ struct PairwiseAnalysisView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .navigationTitle(kind.title)
-        .navigationBarTitleDisplayMode(.inline)
-        .onChange(of: range) {
-            selectedObservationStart = nil
-        }
-        .sheet(item: $sharePayload, onDismiss: discardShareFiles) { payload in
-            PairwiseActivityView(items: payload.urls)
-                .ignoresSafeArea()
-        }
-        .alert(
-            "Export unavailable",
-            isPresented: Binding(
-                get: { exportError != nil },
-                set: { if !$0 { exportError = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) { exportError = nil }
-        } message: {
-            Text(exportError ?? "The export could not be prepared.")
-        }
-    }
-
-    private var analysis: PairwiseAnalysis {
-        let interval = range.interval
-        return ComparisonEngine.pairwiseAnalysis(
-            from: model.store.readings(kind: kind, in: interval),
-            kind: kind,
-            sourceA: sourceAID,
-            sourceB: sourceBID,
-            range: interval
-        )
     }
 
     private var sourceA: DataSource? { model.store.source(id: sourceAID) }
     private var sourceB: DataSource? { model.store.source(id: sourceBID) }
     private var sourceAName: String { model.store.displayName(forSource: sourceAID) }
     private var sourceBName: String { model.store.displayName(forSource: sourceBID) }
-    private var sourceAColor: Color { sourceA?.color ?? .blue }
-    private var sourceBColor: Color { sourceB?.color ?? .orange }
+    /// A removed source falls back to validated palette slots, never to a system hue that
+    /// could collide with a device or with the agreement scale.
+    private var sourceAColor: Color { sourceA?.color ?? DataSource.palette[0] }
+    private var sourceBColor: Color { sourceB?.color ?? DataSource.palette[1] }
 
     // MARK: - Evidence
 
@@ -353,32 +453,57 @@ struct PairwiseAnalysisView: View {
 
     // MARK: - Charts
 
-    private func pairedTimeline(
-        _ analysis: PairwiseAnalysis,
-        points: [PairwiseObservation]
-    ) -> some View {
-        Chart {
-            ForEach(points, id: \.start) { observation in
+    /// A's and B's mark shapes: each device's own slot shape, split apart in the rare case
+    /// that two devices share a palette slot.
+    private var pairSymbols: (a: SourceSymbol, b: SourceSymbol) {
+        switch (sourceA, sourceB) {
+        case let (a?, b?):
+            let symbols = MetricDetailSnapshot.symbols(for: [a, b])
+            return (symbols[0], symbols[1])
+        case let (a?, nil):
+            return (a.symbol, a.symbol == .square ? .circle : .square)
+        case let (nil, b?):
+            return (b.symbol == .circle ? .square : .circle, b.symbol)
+        case (nil, nil):
+            return (.circle, .square)
+        }
+    }
+
+    private func pairedTimeline(_ snapshot: PairwiseSnapshot) -> some View {
+        let points = snapshot.plotted
+        let selected = snapshot.observation(startingAt: selectedObservationStart)
+        let symbols = pairSymbols
+
+        return Chart {
+            ForEach(Array(points.enumerated()), id: \.element.start) { position, observation in
+                // Keyed per segment, not per device: a stretch with no paired window is a
+                // gap in the comparison, and the line must not run through it.
+                let segment = snapshot.timelineSegments[position]
+                let isSelected = selectedObservationStart == observation.start
+
                 LineMark(
                     x: .value("Window", observation.start),
                     y: .value(kind.title, observation.sourceA.value),
-                    series: .value("Device", analysis.sourceA)
+                    series: .value("Device", ChartSegmentation.key(series: "A", segment: segment))
                 )
                 .foregroundStyle(sourceAColor)
                 .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
                 .interpolationMethod(.monotone)
 
+                // Every window keeps its point, so an isolated pairing stays visible after
+                // the line breaks around it. Shape as well as colour separates A from B.
                 PointMark(
                     x: .value("Window", observation.start),
                     y: .value(kind.title, observation.sourceA.value)
                 )
                 .foregroundStyle(sourceAColor)
-                .symbolSize(selectedObservationStart == observation.start ? 80 : 28)
+                .symbol(symbols.a.chartSymbol)
+                .symbolSize(isSelected ? 80 : 28)
 
                 LineMark(
                     x: .value("Window", observation.start),
                     y: .value(kind.title, observation.sourceB.value),
-                    series: .value("Device", analysis.sourceB)
+                    series: .value("Device", ChartSegmentation.key(series: "B", segment: segment))
                 )
                 .foregroundStyle(sourceBColor)
                 .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
@@ -389,78 +514,131 @@ struct PairwiseAnalysisView: View {
                     y: .value(kind.title, observation.sourceB.value)
                 )
                 .foregroundStyle(sourceBColor)
-                .symbolSize(selectedObservationStart == observation.start ? 80 : 28)
+                .symbol(symbols.b.chartSymbol)
+                .symbolSize(isSelected ? 80 : 28)
             }
 
-            if let selected = selectedObservation(in: points) {
+            // "A" and "B" at the line ends, the higher label above and the lower below, so
+            // the two lines can be told apart without comparing colours at all.
+            if let last = points.last {
+                let aIsHigher = last.sourceA.value >= last.sourceB.value
+                lineEndLabel("A", value: last.sourceA.value, at: last.start, above: aIsHigher, color: sourceAColor)
+                lineEndLabel("B", value: last.sourceB.value, at: last.start, above: !aIsHigher, color: sourceBColor)
+            }
+
+            if let selected {
                 RuleMark(x: .value("Selected window", selected.start))
-                    .foregroundStyle(.secondary.opacity(0.7))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .foregroundStyle(HeartSyncTheme.Chart.secondaryReferenceInk.opacity(0.7))
+                    .lineStyle(HeartSyncTheme.Chart.selection)
             }
         }
         .chartLegend(.hidden)
-        .chartYScale(domain: timelineYDomain(points))
+        .chartYScale(domain: snapshot.timelineYDomain)
         .chartXAxis {
             AxisMarks(preset: .aligned) { _ in
                 AxisGridLine()
-                AxisValueLabel(format: axisFormat)
+                AxisValueLabel(format: axisFormat(snapshot.period.displayRange))
             }
         }
         .chartYAxis { AxisMarks(position: .leading) }
-        .chartOverlay { proxy in timelineSelectionOverlay(proxy: proxy, points: points) }
+        .chartOverlay { proxy in timelineSelectionOverlay(proxy: proxy, snapshot: snapshot) }
         .accessibilityLabel("Paired value timeline for \(sourceAName) and \(sourceBName)")
         .accessibilityHint("Drag across the chart to select the nearest paired window")
     }
 
-    private func blandAltmanChart(
-        _ analysis: PairwiseAnalysis,
-        points: [PairwiseObservation]
-    ) -> some View {
-        Chart {
+    /// An invisible anchor at a line's last point that carries its "A" or "B" label.
+    private func lineEndLabel(
+        _ text: String,
+        value: Double,
+        at date: Date,
+        above: Bool,
+        color: Color
+    ) -> some ChartContent {
+        PointMark(
+            x: .value("Window", date),
+            y: .value(kind.title, value)
+        )
+        .symbolSize(0)
+        .annotation(
+            position: above ? .top : .bottom,
+            spacing: 4,
+            overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))
+        ) {
+            Text(text)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(color)
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func blandAltmanChart(_ snapshot: PairwiseSnapshot) -> some View {
+        let points = snapshot.plotted
+        let selected = snapshot.observation(startingAt: selectedObservationStart)
+
+        return Chart {
+            // Reference lines are neutral ink told apart by dash pattern and weight. Hue is
+            // reserved for devices and for the agreement scale, so no statistic can be
+            // mistaken for a device line on the timeline above.
             RuleMark(y: .value("Zero difference", 0))
-                .foregroundStyle(.secondary)
-                .lineStyle(StrokeStyle(lineWidth: 1))
+                .foregroundStyle(HeartSyncTheme.Chart.secondaryReferenceInk)
+                .lineStyle(HeartSyncTheme.Chart.zeroDifference)
 
-            toleranceRules(kind.agreement.warn, label: "Warning", color: .orange, dash: [6, 4])
-            toleranceRules(kind.agreement.alert, label: "Major", color: .red, dash: [2, 4])
+            toleranceRules(kind.agreement.warn, label: "Warning", style: HeartSyncTheme.Chart.warningTolerance)
+            toleranceRules(kind.agreement.alert, label: "Major", style: HeartSyncTheme.Chart.majorTolerance)
 
-            if let stats = analysis.statistics {
+            if let stats = snapshot.analysis.statistics {
                 RuleMark(y: .value("Mean bias", stats.meanBias))
-                    .foregroundStyle(.blue)
-                    .lineStyle(StrokeStyle(lineWidth: 2))
+                    .foregroundStyle(HeartSyncTheme.Chart.referenceInk)
+                    .lineStyle(HeartSyncTheme.Chart.meanBias)
 
                 RuleMark(y: .value("Lower 95% limit", stats.limitsOfAgreement.lowerBound))
-                    .foregroundStyle(.purple)
-                    .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [8, 4]))
+                    .foregroundStyle(HeartSyncTheme.Chart.referenceInk)
+                    .lineStyle(HeartSyncTheme.Chart.limitsOfAgreement)
 
                 RuleMark(y: .value("Upper 95% limit", stats.limitsOfAgreement.upperBound))
-                    .foregroundStyle(.purple)
-                    .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [8, 4]))
+                    .foregroundStyle(HeartSyncTheme.Chart.referenceInk)
+                    .lineStyle(HeartSyncTheme.Chart.limitsOfAgreement)
             }
 
             ForEach(points, id: \.start) { observation in
+                let outside = snapshot.isOutsideLimits(observation)
                 PointMark(
                     x: .value("Paired mean", observation.pairedMean),
                     y: .value("A minus B", observation.signedDifference)
                 )
-                .foregroundStyle(differenceColor(observation, analysis: analysis))
-                .symbolSize(differenceSymbolSize(observation, analysis: analysis))
+                .foregroundStyle(observation.severity.tint)
+                .symbolSize(differenceSymbolSize(observation, outside: outside))
+
+                // Outside the limits is a statistical fact, so it is marked in the limits'
+                // own neutral ink: a ring, rather than a hue that a device also wears.
+                if outside {
+                    PointMark(
+                        x: .value("Paired mean", observation.pairedMean),
+                        y: .value("A minus B", observation.signedDifference)
+                    )
+                    .symbol {
+                        Circle()
+                            .strokeBorder(HeartSyncTheme.Chart.referenceInk, lineWidth: 1.5)
+                            .frame(width: 15, height: 15)
+                    }
+                    .accessibilityHidden(true)
+                }
             }
 
-            if let selected = selectedObservation(in: points) {
+            if let selected {
                 RuleMark(x: .value("Selected paired mean", selected.pairedMean))
-                    .foregroundStyle(.secondary.opacity(0.55))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .foregroundStyle(HeartSyncTheme.Chart.secondaryReferenceInk.opacity(0.55))
+                    .lineStyle(HeartSyncTheme.Chart.selection)
             }
         }
         .chartLegend(.hidden)
-        .chartXScale(domain: blandAltmanXDomain(points))
-        .chartYScale(domain: blandAltmanYDomain(analysis, points: points))
+        .chartXScale(domain: snapshot.differenceXDomain)
+        .chartYScale(domain: snapshot.differenceYDomain)
         .chartXAxisLabel("Paired mean (\(kind.unit))")
         .chartYAxisLabel("A − B (\(kind.unit))")
         .chartXAxis { AxisMarks(preset: .aligned) }
         .chartYAxis { AxisMarks(position: .leading) }
-        .chartOverlay { proxy in differenceSelectionOverlay(proxy: proxy, points: points) }
+        .chartOverlay { proxy in differenceSelectionOverlay(proxy: proxy, snapshot: snapshot) }
         .accessibilityLabel("Bland Altman plot of Device A minus Device B")
         .accessibilityHint("Drag across the chart to select the observation with the nearest paired mean")
     }
@@ -469,20 +647,21 @@ struct PairwiseAnalysisView: View {
     private func toleranceRules(
         _ tolerance: Double,
         label: String,
-        color: Color,
-        dash: [CGFloat]
+        style: StrokeStyle
     ) -> some ChartContent {
         RuleMark(y: .value("Positive \(label) tolerance", tolerance))
-            .foregroundStyle(color.opacity(0.7))
-            .lineStyle(StrokeStyle(lineWidth: 1, dash: dash))
+            .foregroundStyle(HeartSyncTheme.Chart.secondaryReferenceInk)
+            .lineStyle(style)
         RuleMark(y: .value("Negative \(label) tolerance", -tolerance))
-            .foregroundStyle(color.opacity(0.7))
-            .lineStyle(StrokeStyle(lineWidth: 1, dash: dash))
+            .foregroundStyle(HeartSyncTheme.Chart.secondaryReferenceInk)
+            .lineStyle(style)
     }
 
+    /// Selection writes one date. The nearest window comes from a binary search over starts
+    /// the snapshot sorted when it loaded, so a drag never reads the store or re-analyses.
     private func timelineSelectionOverlay(
         proxy: ChartProxy,
-        points: [PairwiseObservation]
+        snapshot: PairwiseSnapshot
     ) -> some View {
         GeometryReader { geometry in
             Rectangle()
@@ -495,9 +674,7 @@ struct PairwiseAnalysisView: View {
                             let frame = geometry[plotFrame]
                             let plotX = value.location.x - frame.origin.x
                             guard let date: Date = proxy.value(atX: plotX) else { return }
-                            selectedObservationStart = points.min {
-                                abs($0.start.timeIntervalSince(date)) < abs($1.start.timeIntervalSince(date))
-                            }?.start
+                            selectedObservationStart = snapshot.observation(nearestStart: date)?.start
                         }
                 )
         }
@@ -505,7 +682,7 @@ struct PairwiseAnalysisView: View {
 
     private func differenceSelectionOverlay(
         proxy: ChartProxy,
-        points: [PairwiseObservation]
+        snapshot: PairwiseSnapshot
     ) -> some View {
         GeometryReader { geometry in
             Rectangle()
@@ -518,55 +695,68 @@ struct PairwiseAnalysisView: View {
                             let frame = geometry[plotFrame]
                             let plotX = value.location.x - frame.origin.x
                             guard let pairedMean: Double = proxy.value(atX: plotX) else { return }
-                            selectedObservationStart = points.min {
-                                abs($0.pairedMean - pairedMean) < abs($1.pairedMean - pairedMean)
-                            }?.start
+                            selectedObservationStart = snapshot.observation(nearestPairedMean: pairedMean)?.start
                         }
                 )
         }
     }
 
     private var deviceLegend: some View {
-        ViewThatFits(in: .horizontal) {
+        let symbols = pairSymbols
+        return ViewThatFits(in: .horizontal) {
             HStack(spacing: 16) {
-                sourceLegend(name: "A  \(sourceAName)", color: sourceAColor)
-                sourceLegend(name: "B  \(sourceBName)", color: sourceBColor)
+                sourceLegend(label: "A", name: sourceAName, color: sourceAColor, symbol: symbols.a)
+                sourceLegend(label: "B", name: sourceBName, color: sourceBColor, symbol: symbols.b)
                 Spacer(minLength: 0)
             }
             VStack(alignment: .leading, spacing: 6) {
-                sourceLegend(name: "A  \(sourceAName)", color: sourceAColor)
-                sourceLegend(name: "B  \(sourceBName)", color: sourceBColor)
+                sourceLegend(label: "A", name: sourceAName, color: sourceAColor, symbol: symbols.a)
+                sourceLegend(label: "B", name: sourceBName, color: sourceBColor, symbol: symbols.b)
             }
         }
     }
 
-    private func sourceLegend(name: String, color: Color) -> some View {
+    private func sourceLegend(label: String, name: String, color: Color, symbol: SourceSymbol) -> some View {
         HStack(spacing: 6) {
-            SourceDot(color: color, size: 8)
-            Text(name).font(.caption2).lineLimit(1)
+            SourceSymbolGlyph(symbol: symbol, color: color)
+            Text("\(label)  \(name)").font(.caption2).lineLimit(1)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Device \(label), \(name), \(symbol.accessibilityName) marks")
     }
 
     private var differenceLegend: some View {
         VStack(alignment: .leading, spacing: 5) {
-            legendRule(color: .blue, label: "Mean bias")
-            legendRule(color: .purple, label: "95% limits of agreement", dashed: true)
-            legendRule(color: .orange, label: "Warning tolerance", dashed: true)
-            legendRule(color: .red, label: "Major tolerance", dashed: true)
+            legendRule(ink: HeartSyncTheme.Chart.referenceInk, style: HeartSyncTheme.Chart.meanBias, label: "Mean bias")
+            legendRule(ink: HeartSyncTheme.Chart.referenceInk, style: HeartSyncTheme.Chart.limitsOfAgreement, label: "95% limits of agreement")
+            legendRule(ink: HeartSyncTheme.Chart.secondaryReferenceInk, style: HeartSyncTheme.Chart.warningTolerance, label: "Warning tolerance")
+            legendRule(ink: HeartSyncTheme.Chart.secondaryReferenceInk, style: HeartSyncTheme.Chart.majorTolerance, label: "Major tolerance")
             HStack(spacing: 6) {
-                Circle().fill(.purple).frame(width: 7, height: 7)
-                Text("Purple point: outside the observed 95% limits")
+                Circle()
+                    .strokeBorder(HeartSyncTheme.Chart.referenceInk, lineWidth: 1.5)
+                    .frame(width: 11, height: 11)
+                    .accessibilityHidden(true)
+                Text("Ringed point: outside the observed 95% limits")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                HStack(spacing: 2) {
+                    ForEach([DiscrepancySeverity.agreeing, .notable, .major], id: \.self) { severity in
+                        Circle().fill(severity.tint).frame(width: 7, height: 7)
+                    }
+                }
+                .accessibilityHidden(true)
+                Text("Point colour: agreement for that window, from within tolerance to major")
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
         }
     }
 
-    private func legendRule(color: Color, label: String, dashed: Bool = false) -> some View {
+    private func legendRule(ink: Color, style: StrokeStyle, label: String) -> some View {
         HStack(spacing: 6) {
-            Capsule()
-                .fill(color)
-                .frame(width: 22, height: dashed ? 2 : 3)
+            ReferenceLineSwatch(ink: ink, style: style)
             Text(label)
         }
         .font(.caption2)
@@ -575,7 +765,7 @@ struct PairwiseAnalysisView: View {
 
     private func selectedObservationCard(
         _ observation: PairwiseObservation,
-        analysis: PairwiseAnalysis
+        snapshot: PairwiseSnapshot
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(observation.start, format: .dateTime.month(.abbreviated).day().hour().minute().second())
@@ -625,10 +815,10 @@ struct PairwiseAnalysisView: View {
                 Text("A \(observation.sourceA.provenance.title)  ·  B \(observation.sourceB.provenance.title)")
             }
 
-            if outsideLimits(observation, analysis: analysis) {
-                Label("Outside the observed 95% limits of agreement", systemImage: "circle.dashed.inset.filled")
+            if snapshot.isOutsideLimits(observation) {
+                Label("Outside the observed 95% limits of agreement", systemImage: "circle.dashed")
                     .font(.caption)
-                    .foregroundStyle(.purple)
+                    .foregroundStyle(.primary)
             }
         }
         .font(.caption)
@@ -636,91 +826,10 @@ struct PairwiseAnalysisView: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func timelineYDomain(_ points: [PairwiseObservation]) -> ClosedRange<Double> {
-        let values = points.flatMap { [$0.sourceA.value, $0.sourceB.value] }
-        guard let low = values.min(), let high = values.max() else { return kind.displayRange }
-        let padding = max((high - low) * 0.15, max(kind.agreement.warn * 0.2, 0.1))
-        return (low - padding)...(high + padding)
-    }
-
-    private func blandAltmanXDomain(_ points: [PairwiseObservation]) -> ClosedRange<Double> {
-        let values = points.map(\.pairedMean)
-        guard let low = values.min(), let high = values.max() else { return kind.displayRange }
-        let padding = max((high - low) * 0.15, max(kind.agreement.warn * 0.2, 0.1))
-        return (low - padding)...(high + padding)
-    }
-
-    private func blandAltmanYDomain(
-        _ analysis: PairwiseAnalysis,
-        points: [PairwiseObservation]
-    ) -> ClosedRange<Double> {
-        var values = points.map(\.signedDifference)
-        values += [0, kind.agreement.warn, -kind.agreement.warn, kind.agreement.alert, -kind.agreement.alert]
-        if let limits = analysis.statistics?.limitsOfAgreement {
-            values += [analysis.statistics?.meanBias ?? 0, limits.lowerBound, limits.upperBound]
-        }
-        let low = values.min() ?? -kind.agreement.alert
-        let high = values.max() ?? kind.agreement.alert
-        let padding = max((high - low) * 0.12, 0.1)
-        return (low - padding)...(high + padding)
-    }
-
-    private func differenceColor(
-        _ observation: PairwiseObservation,
-        analysis: PairwiseAnalysis
-    ) -> Color {
-        if outsideLimits(observation, analysis: analysis) { return .purple }
-        return observation.severity.tint
-    }
-
-    private func differenceSymbolSize(
-        _ observation: PairwiseObservation,
-        analysis: PairwiseAnalysis
-    ) -> CGFloat {
+    private func differenceSymbolSize(_ observation: PairwiseObservation, outside: Bool) -> CGFloat {
         if selectedObservationStart == observation.start { return 115 }
-        if outsideLimits(observation, analysis: analysis) || observation.severity != .agreeing { return 75 }
+        if outside || observation.severity != .agreeing { return 75 }
         return 42
-    }
-
-    private func outsideLimits(
-        _ observation: PairwiseObservation,
-        analysis: PairwiseAnalysis
-    ) -> Bool {
-        guard let limits = analysis.statistics?.limitsOfAgreement else { return false }
-        return !limits.contains(observation.signedDifference)
-    }
-
-    private func selectedObservation(in points: [PairwiseObservation]) -> PairwiseObservation? {
-        guard let selectedObservationStart else { return nil }
-        return points.first { $0.start == selectedObservationStart }
-    }
-
-    // MARK: - Plot thinning
-
-    /// Swift Charts emits one mark per observation per series, and a 30-day range of a
-    /// 60-second metric can pair tens of thousands of windows. Statistics, the evidence
-    /// card, and the export always use every paired window; only the drawn set is thinned.
-    private static let maximumPlottedObservations = 500
-
-    /// Extra points kept regardless of the even sampling, so thinning cannot hide the
-    /// outliers a Bland–Altman plot exists to show.
-    private static let maximumPlottedExtremes = 60
-
-    private func plotted(_ analysis: PairwiseAnalysis) -> [PairwiseObservation] {
-        analysis.plotSample(
-            limit: Self.maximumPlottedObservations,
-            extremes: Self.maximumPlottedExtremes
-        )
-    }
-
-    /// Says so when the chart is not showing every paired window. Silently drawing a
-    /// subset would misrepresent how much evidence the analysis actually rests on.
-    private func thinningNote(
-        _ analysis: PairwiseAnalysis,
-        points: [PairwiseObservation]
-    ) -> String {
-        guard points.count < analysis.observations.count else { return "" }
-        return " Showing \(points.count) of \(analysis.observations.count) paired windows for legibility, including the widest differences; every window is used for the statistics and the export."
     }
 
     // MARK: - Sensing technology
@@ -1003,8 +1112,10 @@ struct PairwiseAnalysisView: View {
         return "\(Int(seconds))-second"
     }
 
-    private var axisFormat: Date.FormatStyle {
-        switch range {
+    /// Keyed on the analysed period rather than the picker, so a saved session is labelled
+    /// at the zoom that fits its span.
+    private func axisFormat(_ displayRange: TimeRange) -> Date.FormatStyle {
+        switch displayRange {
         case .hour, .sixHours: .dateTime.hour().minute()
         case .day:             .dateTime.hour()
         case .week, .month:    .dateTime.month(.abbreviated).day()

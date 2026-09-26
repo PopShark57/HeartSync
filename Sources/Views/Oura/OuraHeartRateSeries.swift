@@ -17,7 +17,8 @@ import Foundation
 ///
 /// Nothing here averages, interpolates, or invents a value: every plotted point is one of
 /// Oura's own samples, and a sample whose timestamp cannot be parsed is dropped rather than
-/// plotted at a guessed time.
+/// plotted at a guessed time. The chart keeps that promise too: it draws with monotone
+/// interpolation, which never overshoots a sample, and breaks at each hole in the series.
 struct OuraHeartRateSeries {
 
     /// One plotted sample, carrying Oura's own bpm value.
@@ -27,6 +28,12 @@ struct OuraHeartRateSeries {
         var id: String
         var date: Date
         var bpm: Double
+        /// Line segment. It advances wherever the ring left a hole — charging, removal, an
+        /// upload that never came — so the line and its fill stop instead of bridging it.
+        var segment: Int = 0
+        /// A sample with no neighbour on either side of a hole. A line needs two points, so
+        /// the chart draws this one as a dot.
+        var isIsolated: Bool = false
     }
 
     /// Samples actually drawn, oldest first. Thinned from `sampleCount` when the window
@@ -87,7 +94,20 @@ struct OuraHeartRateSeries {
         let low = values.min()
         let high = values.max()
 
-        self.points = Self.thinned(recent, limit: Self.maximumPlottedSamples)
+        // Gaps are measured on the drawn points, so thinning's own stride never reads as a
+        // hole: only spacing well beyond the series' usual cadence breaks the line.
+        var plotted = Self.thinned(recent, limit: Self.maximumPlottedSamples)
+        let dates = plotted.map(\.date)
+        let segments = ChartSegmentation.segments(
+            for: dates,
+            threshold: ChartSegmentation.medianSpacingThreshold(for: dates) ?? 0
+        )
+        let isolated = ChartSegmentation.isolatedPositions(segments)
+        for index in plotted.indices {
+            plotted[index].segment = segments[index]
+            plotted[index].isIsolated = isolated.contains(index)
+        }
+        self.points = plotted
         self.sampleCount = recent.count
         self.lowest = low.map { Int($0) }
         self.highest = high.map { Int($0) }

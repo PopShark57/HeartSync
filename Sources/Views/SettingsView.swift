@@ -88,6 +88,7 @@ struct SettingsView: View {
                         Text("\(model.store.readingCount)").foregroundStyle(.secondary)
                     }
                     .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("data.storedReadings")
                     Button("Clear local cache; data may resync", role: .destructive) {
                         resetProposal = .clearForResync
                     }
