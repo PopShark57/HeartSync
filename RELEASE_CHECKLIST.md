@@ -86,6 +86,30 @@ version, app commit, sensor models and firmware, date, and tester beside the rel
   confirming must delete exactly that source's readings. Disconnect Oura must state the
   14-day resync.
 
+## Interactive charts
+
+- [ ] On metric detail, the pair timeline, the Bland–Altman plot, and the Oura charts,
+  start a vertical swipe on the chart and confirm the list scrolls. Then scrub sideways
+  and confirm the list does not take the touch over mid-scrub. One external report saw
+  that with `chartXSelection` inside an iPhone scroll view; record the result either way.
+- [ ] Scrub metric detail from its first window to its last. The callout must stay inside
+  the chart at both ends, in light and dark appearance, at the largest accessibility text
+  size, in landscape, and on iPad. Each new window must tick once. Lifting the finger keeps
+  the callout; touching empty plot area or Clear selection removes it.
+- [ ] Zoom a week of heart rate to one hour. The caption must read "1-minute medians", the
+  pan buttons must stop at both ends, and a rolling range must keep the newest readings
+  reachable while data arrives.
+- [ ] Select a period by dragging, check its evidence, and save it as a session. Reopen the
+  session from Compare and confirm the same bounds and the same pair statistics.
+- [ ] On a Bland–Altman plot with an outlier above a dense cluster, tap the outlier and
+  confirm it is the one selected. A tap in empty plot area clears the selection.
+- [ ] With VoiceOver, step the pair screen with the Next and Previous paired window actions,
+  and read metric-detail points, hypnogram stages, and movement classes with their times.
+  Confirm each score and biomarker card reads its fourteen-day sentence.
+- [ ] On the Oura tab, confirm the hypnogram rows (Awake at the top, Deep at the bottom),
+  the Non-wear legend entry, gaps for missing trend days, and temperature deviation drawn
+  around zero and labelled "from baseline".
+
 ## Interface and accessibility
 
 - [ ] Run the complete UI suite, including the doubled-string pseudo-localization launch.

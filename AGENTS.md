@@ -321,14 +321,17 @@ Preserve these comparison rules:
 - Insufficient evidence and out-of-tolerance data can never be presented as green merely because an alert preference is disabled.
 - Bland-Altman limits use sample variance.
 - UI chart thinning is presentation-only; statistics and exports use the full paired set.
-- Compare, metric detail, the pair screen, and Now each resolve one immutable snapshot per load in `.task(id:)`: `ComparisonSnapshot`, `MetricDetailSnapshot`, `PairwiseSnapshot`, and `DashboardSnapshot`. All subviews share one resolved interval, gestures change only lightweight `@State`, and late results are rejected. Reloads caused only by new data are coalesced by `LiveReloadPolicy`: once a second on Now, and at most 30 per chart bucket elsewhere. A screen that trails ingest says so with `SnapshotLagNote`.
+- Compare, metric detail, the pair screen, and Now each resolve one immutable snapshot per load in `.task(id:)`: `ComparisonSnapshot`, `MetricDetailSnapshot`, `PairwiseSnapshot`, and `DashboardSnapshot`. All subviews share one resolved interval, gestures change only lightweight `@State`, and late results are rejected. Reloads caused only by new data are coalesced by `LiveReloadPolicy`: once a second on Now, and at most 30 per chart bucket elsewhere. A screen that trails ingest says so with `SnapshotLagNote`. Metric detail's zoomed span (`MetricZoomSnapshot`) and chosen period (`MetricPeriodEvidence`) load the same way, each under its own key. A selection is never part of a load key, so a scrub never reads the store.
 - A saved session's `ComparisonPeriod` travels with every drill-down. Screens opened from a session show `ComparisonSessionBanner`, never the rolling range picker.
+- Zoom changes only what a chart draws. `ChartViewport` re-reads the visible span at its own bucket, never finer than the metric's comparison window. Statistics, pairs, and the per-device table keep describing the whole analysed period.
+- A period brushed on the metric-detail chart is evidence for exactly those seconds. `MetricPeriodEvidence` uses the same read and engine call as metric detail does for a saved session over them. `ChartViewport.snappedPeriod` rounds both ends to whole seconds, because the sessions archive stores ISO-8601 dates without fractions; a saved period then reopens with identical bounds.
 
 Preserve measurement semantics:
 
 - Measured, derived, and estimated provenance are distinct.
 - Oura `average_hrv` maps to RMSSD, not HealthKit SDNN.
-- Oura temperature deviation is not an absolute body-temperature reading and must not be compared as one.
+- Oura temperature deviation is not an absolute body-temperature reading and must not be compared as one. Its trend is drawn around a zero baseline and labelled as a deviation.
+- The Oura hypnogram, movement, and trend charts draw Oura's cached classifications and daily values as they are. Runs are timed from `bedtime_start` or from the activity day's `timestamp`, which is optional because older caches lack it. Without a start time a card keeps its untimed ribbon; never guess a clock. Undefined codes and missing days are gaps. Trends read only cached documents and add no request or scope.
 - VO2 max and blood-pressure models stay labelled as estimates, keep their disclaimers, and stay outside device-disagreement claims.
 - A comparison measures agreement between devices; it does not establish which device is a medical reference standard.
 
@@ -345,6 +348,16 @@ The application is SwiftUI-first and targets iOS 18:
 - Keep large point sets bounded for chart rendering with the existing thinning approach; do not thin analysis/export inputs.
 - Break every line, band, and area at data gaps with `ChartSegmentation`, keying series by segment, and draw isolated samples as points. Use `.monotone` or `.linear` interpolation; never use a curve that can overshoot the samples.
 - Draw statistical reference lines (bias, limits, zero, tolerances) in the neutral ink and dash tokens of `HeartSyncTheme.Chart`, never in a hue a device could wear. Give each source its slot's shape as well as its colour (`DataSource.symbol`, `SourceSymbolGlyph` in legends).
+- Make an interactive chart a view of its own (`MetricDetailChart`, `PairwiseTimelineChart`, `PairwiseDifferenceChart`, `OuraTimelineChart`, `OuraTrendChart`, `OuraHeartRateChart`), so a touch-move re-evaluates only the chart. Lookups during a scrub use arrays sorted once per load (`ChartLookup`); nothing reads the store or scans every mark per frame.
+- Scrub with `chartXSelection(value:)` and the sticky rule:
+  - snap to the nearest drawn item within `ChartLookup.selectionRadius` (22 pt, converted to seconds from the measured width);
+  - keep the selection when the finger lifts;
+  - clear it on a touch in empty plot area.
+
+  A two-dimensional plot selects with a tap in `chartOverlay` and a screen-space nearest-point search. Tick `.sensoryFeedback(.selection, trigger:)` on the snapped item, not the raw value. Fit callouts inside the chart with `overflowResolution` `.fit(to: .chart)` on both axes.
+- Pin each history chart's x domain with `chartXScale(domain:)`, so an empty stretch stays visibly empty. Zoom and pan move that pinned domain through `ChartViewport` and buttons. Do not switch to `chartScrollableAxes` or `chartXVisibleDomain` without re-testing FB12584128 (the selection annotation disappears) and FB14091989 (changing the visible domain jumps the chart).
+- Give every chart gesture a path that needs no gesture: buttons (zoom, pan, Previous and Next, Clear selection) or named accessibility actions. Label each plotted item for VoiceOver with its value and caveats, and hide the lines, bands, and callouts that repeat it.
+- A `List` row that holds several buttons needs `.buttonStyle(.borderless)`; otherwise a tap anywhere in the row triggers all of them.
 - Removing a source or disconnecting Oura goes through the confirmation dialog in `DevicesView`, which states the consequence with `SourceRemovalConsequence`. Never attach a destructive action to a full swipe.
 
 UIKit is used only where the platform API requires it:
@@ -461,12 +474,16 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/HRVFilterTests.swift`: 20 tests covering artefact filtering, body-location versus technology metadata, accumulator thresholds, and rate limiting.
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
 - `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
-- `UITests/HeartSyncCheckerUITests.swift`: 10 deterministic flows:
+- `UITests/HeartSyncCheckerUITests.swift`: 13 deterministic flows:
   - recovery and settings;
   - device actions, including removal that asks first and deletes only that device;
   - retention and evidence;
   - drill-down range and saved-session period;
+  - metric-detail zoom, the stated bucket, and a chart period's Save as session sheet;
+  - pair selection stepped with Next and cleared, without a drag;
   - Oura partial failure;
+  - the Oura hypnogram, movement, heart-rate, and fourteen-day trend charts
+    (`--ui-test-ouraCharts`);
   - pseudo-localization.
 - `Tests/HistoryOutcomeTests.swift`: 12 tests covering query outcomes after a successful
   startup (failure versus emptiness, retry, export failing visibly, paged export) and the
@@ -489,9 +506,22 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   consequence wording for each transport.
 - `Tests/DrillDownPeriodTests.swift`: 6 tests covering fixed-period resolution: a saved
   session's seconds reach metric detail, the pair analysis, and its export unchanged.
-- `Tests/PairwiseSnapshotTests.swift`: 8 tests covering the pairwise snapshot: engine
-  equality, binary-search lookups against a linear scan, thinning disclosure, and query
-  failure.
+- `Tests/PairwiseSnapshotTests.swift`: 13 tests covering the pairwise snapshot: engine
+  equality, binary-search and two-dimensional screen-space lookups against a linear scan,
+  a stacked outlier selected on its own, empty-area taps, window stepping, the spoken
+  summary, the pinned timeline domain, thinning disclosure, and query failure.
+- `Tests/MetricDetailSelectionTests.swift`: 12 tests covering the metric-detail scrub:
+  every window selectable (first and last included), empty-area touches, the callout's
+  order, flags, and tolerance wording (never "agree"), estimates kept out of the spread,
+  the callout's spread equal to the band, and the pinned x domain.
+- `Tests/ChartZoomTests.swift`: 13 tests covering `ChartViewport` zoom, pan, and the live
+  edge, the finer re-read at the zoomed bucket and its failure, period snapping to buckets
+  and whole seconds, and the brushed period's statistics and saved bounds matching a saved
+  session's.
+- `Tests/OuraChartTests.swift`: 16 tests covering timed sleep-stage and movement runs,
+  undefined codes as gaps, legacy caches without `timestamp`, legend coverage including
+  non-wear, fourteen-day trends (gaps, first document per day, main sleep, spoken summary,
+  temperature as a signed deviation), the chart UI fixture, and heart-rate selection.
 - `Tests/LiveReloadTests.swift`: 8 tests covering the reload-coalescing rule and the
   bounded Now read, which shows the same values and verdicts as the two-day read.
 - `Tests/ChartGapTests.swift`: 12 tests covering shared gap segmentation for the band,
@@ -519,8 +549,11 @@ and copy or symlink the real source files into it — `Sources/Store`, `Sources/
 `Sources/Analysis`, `Sources/Views/MetricDetailSnapshot.swift`,
 `Sources/Views/ComparisonEmptyReason.swift`, the other Foundation-only view projections
 (`DashboardSnapshot`, `PairwiseSnapshot`, `ChartSegmentation`, `LiveReloadPolicy`,
-`SourceRemovalConsequence`, `WindowLabel`, `Oura/OuraSleepStage`), `Shared`, plus
-`Sources/Bluetooth/GATT.swift` for `BodySensorLocation`. That closure builds for macOS and runs the store, analysis,
+`SourceRemovalConsequence`, `WindowLabel`, `ChartLookup`, `ChartViewport`,
+`MetricChartProjection`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
+`Oura/OuraMovementClass`, `Oura/OuraDailyTrend`), `Shared`, plus
+`Sources/Bluetooth/GATT.swift` for `BodySensorLocation`. The Oura timeline and trend
+projections also need the Foundation-only DTOs in `Sources/Oura/OuraClient.swift`. That closure builds for macOS and runs the store, analysis,
 export, presentation-projection and watch-lifecycle suites. It cannot compile the SwiftUI
 screens (they import UIKit), the Oura stack (AuthenticationServices), or `WatchApp`. Never
 add `Package.swift` to the repository itself.
@@ -573,6 +606,8 @@ Use additional validation by area:
 | Export/share | Verify CSV/summary tests, share-sheet presentation, correct metadata, and temporary-directory cleanup after dismissal. |
 
 `--pairwise-demo` is a Debug-only launch argument that installs deterministic in-memory fixtures and skips normal archive loading and all transports. It is the preferred safe UI fixture mode, but it does not validate persistence, Bluetooth, HealthKit, or Oura.
+
+`--ui-test-ouraCharts` is the Debug-only UI-test scenario for the Oura charts. It installs fourteen days of in-memory Oura documents, with a charging gap, a missing night, and a missing readiness day, and fetches and persists nothing. Like the other `--ui-test-*` scenarios, it does not validate the Oura API or OAuth.
 
 ## Fragile and Tightly Coupled Areas
 
