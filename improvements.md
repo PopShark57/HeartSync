@@ -1,6 +1,812 @@
 # HeartSync improvement roadmap
 
-## Current follow-up review (2026-09-08)
+Newest review first. Earlier reviews and their implementation notes are retained below as
+history; their "Observed behavior" paragraphs describe the checkout they reviewed.
+
+## Current review: visuals, charts, and interaction (2026-09-26)
+
+Reviewed `main` at commit
+[`9d611f54c8d94a3f2835e1c1ad3cc0d17f51e352`](https://github.com/PopShark57/HeartSync/commit/9d611f54c8d94a3f2835e1c1ad3cc0d17f51e352),
+with emphasis on visual design, chart interactivity, and screen-level UX on iPhone, iPad,
+and Apple Watch. Numbering continues from item 25.
+
+This is a source review. Nothing was built or launched: the review ran in a Linux
+container with no Xcode, simulator, or device. Each item states its basis:
+
+- **Observed defect:** read directly from the code at the commit above.
+- **Measured:** the colour-vision simulation in item 31 (script in the appendix).
+- **Performance risk:** inferred from where and how often code runs; not profiled.
+- **Design proposal:** a product/UI recommendation.
+
+Swift Charts, SwiftUI, watchOS, and Oura API claims were checked against Apple's WWDC
+sessions, Apple documentation, and the Oura schema; sources are listed at the end of this
+section. One claim was dropped after checking: watchOS allows a workout app with an active
+session to update once per second in Always On, so the workout timer's 1-second
+`TimelineView` is not a defect.
+
+### Priorities and suggested sequence
+
+| Item | Priority | Improvement | Basis | Size |
+| --- | --- | --- | --- | --- |
+| 26 | P1 | Confirm before a swipe or button deletes a device's history | Observed defect | S |
+| 27 | P1 | Keep the chosen range and a saved session's period when drilling down | Observed defect | S–M |
+| 28 | P1 | Stop re-running the pairwise analysis on every drag frame | Observed performance risk | M |
+| 29 | P1 | Bound and coalesce the live screens' reloads during ingest | Performance risk; measure on device | M |
+| 30 | P1 | Break every chart line and band across data gaps; no overshooting curves | Observed honesty gap | S |
+| 31 | P1 | Fix colour collisions for colour-blind readers and between meanings | Measured | M |
+| 32 | P2 | Make the metric-detail chart scrubbable with an inline callout | Design proposal | M |
+| 33 | P2 | Add pan, zoom, and period selection to history charts | Design proposal (+ observed axis gap) | M–L |
+| 34 | P2 | Rebuild pairwise-chart selection on the native selection API | Design proposal (+ observed gaps) | M |
+| 35 | P2 | Turn the Oura cards into real charts: heart rate, hypnogram, 14-day trends | Design proposal (+ observed legend gap) | M–L |
+| 36 | P2 | Give the Now tab sparklines, motion, and honest "live" labelling | Design proposal (+ observed wording issue) | M |
+| 37 | P2 | Make dense charts work with VoiceOver, Audio Graphs, and Dynamic Type | Accessibility gap | M |
+| 38 | P2 | Adapt layouts for iPad and landscape | Design proposal | M |
+| 39 | P2 | Consolidate visual tokens, chart styling, and loading feedback | Polish and maintainability | S–M |
+| 40 | P2 | Adopt Always On guidance and gauges on the watch | Design proposal | S–M |
+| 41 | P2 | Add previews, chart fixtures, and screenshot artefacts for UI work | Developer experience | M |
+
+**P1** here means fix first: data loss, wrong analysis period, misleading drawing, or work
+that interactive charts would make worse. **P2** is the interactive and visual roadmap
+itself (items 32–36 are the core of it). Most P2 items depend on the P1 fixes.
+
+Suggested order:
+
+1. 26 and 27 are small and self-contained.
+2. Do 28 and 29 before 32–35. Selection re-evaluates a chart's `body` on every touch-move,
+   so expensive work has to leave `body` before charts become interactive.
+3. Land 30 and 31 before adding new charts, so new charts inherit the corrected gap and
+   colour conventions. The shared chart-style tokens in 39 can land with 31.
+4. The richer fixtures in 41 make every later item easier to check visually. Start them
+   early.
+
+### 26. Confirm before a swipe or button deletes a device's history
+
+**Observed behavior**
+
+In [DevicesView.swift](Sources/Views/DevicesView.swift#L67), Bluetooth rows (L67) and
+Apple Health rows (L215) attach `.swipeActions(edge: .trailing)` with a destructive
+**Remove** as the first action. `allowsFullSwipe` defaults to `true`, so one long swipe
+performs Remove with no second tap. `AppModel.removeSource` calls
+`HealthStore.remove(sourceID:)`, which runs `DELETE FROM readings WHERE source_id = ?`
+([HealthDatabase.swift](Sources/Store/HealthDatabase.swift#L249)). A single gesture
+therefore permanently deletes every stored reading from that device. Bluetooth-only
+history cannot be downloaded again.
+
+**Disconnect Oura** (L343) also deletes the Oura readings immediately. A later sync
+restores only the 14-day window.
+
+Settings already stages retention shortening and both reset actions behind a preview and
+a confirmation. These two paths skip that protection.
+
+**Improve it**
+
+- Set `allowsFullSwipe: false` on these rows, or make the first trailing action
+  non-destructive (Rename or Pause).
+- Route Remove and Disconnect through a `confirmationDialog` that states the consequence
+  in numbers. For example: "Deletes 48,210 readings from Polar H10 recorded since 3 Aug.
+  Bluetooth history cannot be downloaded again." Offer an export first, as
+  `RetentionConfirmationView` does.
+- Put the non-destructive alternatives in the same dialog. **Pause collecting** and
+  **Hide from comparisons** already exist.
+- As a separate product decision, consider splitting "forget this device" from "delete
+  its history".
+
+**Done when**
+
+A full swipe cannot delete data. A UI test proves that Cancel leaves the source and its
+reading count unchanged, and that confirming removes exactly that source's readings.
+
+### 27. Keep the chosen range and a saved session's period when drilling down
+
+**Observed behavior**
+
+- [MetricDetailView.swift](Sources/Views/MetricDetailView.swift#L65) sets
+  `.onAppear { range = initialRange }`. `onAppear` runs again when a pushed view is popped.
+  Choosing **7D**, opening a device pair, and tapping Back resets the chart to the range
+  it was opened with. `PairwiseAnalysisView` already seeds its `@State` in `init` (L32),
+  which is the correct pattern.
+- With a saved session open, Compare still passes the rolling picker value into detail
+  ([CompareView.swift](Sources/Views/CompareView.swift#L151)).
+  `MetricDetailView` and `PairwiseAnalysisView` accept only a `TimeRange`. Opening Heart
+  rate from "Morning walk, 3 Sep 07:00–08:00" shows the last 24 hours instead. That is a
+  different analysis from the one the session banner describes.
+
+**Improve it**
+
+- Seed `range` in `init` with `State(initialValue:)` and delete the `onAppear` assignment.
+- Pass `ComparisonPeriod` (already used by Compare) down to both detail screens. Show the
+  session banner there and hide the rolling picker, as Compare does.
+- Resolve the interval once per snapshot and store it on the snapshot. Today
+  `TimeRange.interval` is re-evaluated relative to `.now` in several places (see 33).
+
+**Done when**
+
+Back-navigation preserves the selected range. Opening a metric and a pair from a saved
+session analyses exactly the session's seconds, and an export from there carries that
+span. UI tests cover both paths.
+
+### 28. Stop re-running the pairwise analysis on every drag frame
+
+**Observed behavior and risk**
+
+`PairwiseAnalysisView.body` starts with `let currentAnalysis = analysis`
+([PairwiseAnalysisView.swift](Sources/Views/PairwiseAnalysisView.swift#L36)). The
+computed `analysis` property (L174–183) runs three steps on the main actor:
+
+1. It reads every reading of the metric in the range from SQLite.
+2. It decodes those rows.
+3. It runs `ComparisonEngine.pairwiseAnalysis`.
+
+Both chart overlays write `selectedObservationStart` from a
+`DragGesture(minimumDistance: 0)` (L492, L515) on every drag change. Each change
+re-evaluates `body`. Scrubbing a 30-day heart-rate pair therefore re-queries and
+re-windows the whole range on every touch-move event.
+
+Two more effects:
+
+- `body` also re-runs on every store change while the screen is open.
+- `range.interval` is relative to `.now`, so each pass analyses a slightly different
+  span. A window at the leading edge can disappear mid-drag.
+
+Item 21 moved Compare and metric detail to a cancellable `.task(id:)` snapshot. This screen
+was not converted.
+
+**Improve it**
+
+- Build an immutable `PairwiseSnapshot` (analysis, plotted sample, axis domains, notes)
+  in `.task(id:)`, keyed like `MetricDetailView.LoadKey`. Selection should then change only
+  lightweight `@State`.
+- Precompute sorted plotted window starts in the snapshot. Nearest-point lookup during a
+  drag then becomes a binary search instead of an O(n) `min` over all points (L498).
+  Item 34 covers the Bland–Altman plot's 2-D lookup.
+- Leave statistics and export on the full observation set. Only where and how often the
+  work runs changes.
+
+**Done when**
+
+A Time Profiler trace on a device with a month of 1 Hz data shows no store query or
+pairwise analysis during a scrub. Selection tracks the finger at display rate. Existing
+analysis and export tests pass unchanged.
+
+### 29. Bound and coalesce the live screens' reloads during ingest
+
+**Observed behavior and risk**
+
+- `DashboardView.body` builds `DashboardSnapshot` inline
+  ([DashboardView.swift](Sources/Views/DashboardView.swift#L29)). It reads **all
+  readings of all metrics** for `lookback`, which is twice the longest comparison window:
+  48 hours (L184, L199). Heart rate, SpO₂, respiratory rate, and temperature use
+  60-second windows, and the rows show only the last 15 minutes.
+- `readingsOutcome(in:)` reads the observed `dataGeneration`
+  ([HealthStore.swift](Sources/Store/HealthStore.swift#L481)). Bluetooth readings are
+  ingested one at a time (`ingest([reading])`,
+  [AppModel.swift](Sources/App/AppModel.swift#L107)), and each one bumps that value.
+- Together: with one heart-rate strap (commonly about 1 Hz), the Now tab can re-read and
+  decode up to two days of rows, for every metric, about once a second.
+- `MetricDetailView` and `CompareView` include `store.changeToken` in their `LoadKey`.
+  A 30-day chart is therefore re-read and re-windowed on the main actor 16 ms after every
+  Bluetooth reading as well.
+
+This review did not measure a hitch. The existing device performance bundle measures
+ingestion and indexed queries, but not these screens while live ingest is running.
+
+**Improve it**
+
+- Query each metric with its own lookback: twice its `comparisonWindow`, plus the
+  15-minute live window. Fast metrics then read minutes of data instead of two days.
+  Daily metrics can use a `latest`-style indexed query.
+- Move the Now snapshot to the same `.task(id:)` pattern and throttle live reloads. For
+  example: at most once a second on Now, and once per chart bucket (or every 30 s) for
+  ranges of 24 hours or longer. Where a chart lags ingest, say so with a small "Updated
+  12 s ago" note.
+- Add a performance test that ingests a simulated 1 Hz source while Now and a 30-day
+  detail screen are open, with an explicit main-thread budget.
+
+**Done when**
+
+Device measurements show Now and metric detail within the chosen main-thread budget
+during 1 Hz ingest with two weeks of history. Displayed values and verdicts are unchanged.
+
+### 30. Break every chart line and band across data gaps; no overshooting curves
+
+**Observed behavior**
+
+Item 20 added gap segmentation to the metric-detail lines (`MetricDetailSnapshot.segmented`,
+[MetricDetailSnapshot.swift](Sources/Views/MetricDetailSnapshot.swift#L301)). Three
+drawings still show continuity that was never measured:
+
+- **Disagreement band.** `bandPoints` (L209) carry no segment key. The `AreaMark` band is
+  one continuous area, interpolated across windows where fewer than two devices reported.
+  It shades "disagreement" over time when nothing was compared.
+- **Pairwise timeline.** Each device is one series keyed only by source ID
+  ([PairwiseAnalysisView.swift](Sources/Views/PairwiseAnalysisView.swift#L365), L381).
+  The line joins paired windows hours apart. After thinning (500 of N windows), it also
+  joins samples that were never adjacent.
+- **Oura heart rate.** [OuraHeartRateSection.swift](Sources/Views/Oura/OuraHeartRateSection.swift#L54)
+  uses `.catmullRom` interpolation (L54, L62) on one series. Catmull-Rom curves can
+  overshoot and draw peaks and dips that no sample had; `.monotone` preserves the data's
+  monotonicity. That contradicts the series' own contract, "Nothing here averages,
+  interpolates, or invents a value"
+  ([OuraHeartRateSeries.swift](Sources/Views/Oura/OuraHeartRateSeries.swift#L18)). The
+  line also runs straight through the ring's charging gap.
+
+**Improve it**
+
+- Generalise `segmented` into a shared helper that takes a series key and a gap threshold.
+  Apply it to:
+  - the band, using `AreaMark(x:yStart:yEnd:series:)`;
+  - the pairwise timeline, with the threshold taken from `windowSize` (and from the
+    thinning stride when the plot is thinned);
+  - Oura heart rate, with the threshold at a multiple of the median sample spacing.
+- Use `.monotone` or `.linear` for Oura heart rate, consistent with the other charts.
+- Keep isolated observations visible as `PointMark`s, as metric detail already does.
+
+**Done when**
+
+Projection tests (like the existing segmentation test in `PresentationIdentityTests`)
+show separate segments across a mid-range gap for the band, the pairwise timeline, and
+Oura heart rate. An on-screen check confirms that no drawn curve rises above the highest
+sample or falls below the lowest.
+
+### 31. Fix colour collisions for colour-blind readers and between meanings
+
+**Measured**
+
+`DataSource.palette` is documented as "Distinct, colour-blind-tolerant hues"
+([DataSource.swift](Sources/Model/DataSource.swift#L151)). The six entries were
+simulated with the Machado et al. (2009) colour-vision model at full severity, and the
+pairwise difference was measured as ΔE in CAM02-UCS (Python `colorspacious`; script in the
+appendix). As a rule of thumb, a ΔE below about 10 is hard to separate at chart-mark sizes.
+
+| Pair | Normal | Protan | Deutan | Tritan |
+| --- | ---: | ---: | ---: | ---: |
+| Source 0 blue vs source 3 purple | 33.3 | **7.0** | **6.8** | 40.1 |
+| Source 2 green vs source 4 rose | 60.6 | 30.0 | **4.8** | 67.2 |
+| Source 1 orange vs source 4 rose | 20.5 | 28.1 | 17.8 | **5.8** |
+| Source 2 green vs source 5 teal | 24.6 | 28.3 | 28.2 | **4.4** |
+| Oura sleep: deep (`.indigo`) vs REM (`.purple`) | 24.1 | **4.1** | 11.5 | 38.2 |
+
+Metric detail compensates with per-source symbols. The pairwise timeline does not: A and B
+are both drawn as the default circle and differ by colour only. The Oura sleep ribbon also
+relies on colour alone.
+
+Colour also carries two meanings on one screen. In
+[PairwiseAnalysisView.swift](Sources/Views/PairwiseAnalysisView.swift#L429), the
+timeline colours the devices from the palette. The Bland–Altman plot directly below uses
+`.blue` for mean bias and `.purple` for the limits of agreement and for out-of-limit
+points (L429–437, L631). Those match palette sources 0 and 3 almost exactly (normal-vision
+ΔE 0.1 and 0.3), so "Device A" and "mean bias" share a colour.
+
+Palette orange and green also sit near the severity orange and green (normal-vision ΔE 16
+and 9.7). On metric detail, source lines are drawn over a severity-tinted band.
+
+**Improve it**
+
+- Re-derive the palette against a validator that enforces a minimum ΔE for every pair
+  under protan, deutan, and tritan simulation. Run the validator as a unit test. Because
+  `colorIndex` persists, change the colour at each index rather than renumbering, so every
+  device keeps its slot.
+- Assign each source's symbol from `colorIndex`, not from its position in the current
+  chart (MetricDetailSnapshot.swift L325, L356). Today a device's symbol changes when
+  another device enters or leaves the range. Use the same symbols on the pairwise timeline,
+  and add A and B labels at the line ends.
+- Reserve neutral ink (primary or secondary, told apart by dash pattern) for statistical
+  reference lines: bias, limits, and tolerances. They must never look like a device.
+- Encode sleep stages as a lightness ramp that follows sleep depth, and add a text or
+  pattern cue for Awake, so depth never depends on hue alone.
+- Add dark-appearance variants. The palette is fixed sRGB, while the system colours around
+  it adapt to dark mode.
+
+**Done when**
+
+An automated test enforces the chosen ΔE floor for every palette pair, and between the
+palette and the reserved reference colours, under all three simulations. Every chart that
+shows two sources distinguishes them by shape as well as colour.
+
+### 32. Make the metric-detail chart scrubbable with an inline callout
+
+**Observed behavior**
+
+The metric-detail chart ([MetricDetailView.swift](Sources/Views/MetricDetailView.swift#L189))
+has no selection, annotation, or gesture. Values can be estimated only from gridlines.
+The per-window facts the snapshot already computes cannot be read for a chosen moment:
+each device's window median, the band width, its severity, and the estimate and
+compacted flags.
+
+**Improve it**
+
+- Add `.chartXSelection(value:)` (iOS 17). The framework handles gesture recognition and
+  writes the selected x value to a binding. Snap the raw date to the nearest bucket with a
+  binary search over sorted bucket starts precomputed in the snapshot.
+- At the selected bucket, draw a `RuleMark` and enlarge that bucket's points. Attach an
+  annotation that fits within the chart horizontally, so the callout never clips at the
+  edges. The callout lists:
+  - the window's time span;
+  - each device's median, with its colour and symbol;
+  - the band width and severity;
+  - Estimate and Compacted flags, where they apply.
+- Play `.sensoryFeedback(.selection, trigger:)` on the snapped bucket, so each new window
+  ticks once rather than on every pixel.
+- Make legend entries toggles that emphasise one series (dimming the others) without
+  removing data.
+- Clear the selection on a range change and on a tap outside the plot. Label the callout
+  values as window medians, because that is what the chart draws.
+
+```swift
+@State private var selectedDate: Date?
+
+Chart {
+    // … existing band, LineMark, and PointMark content …
+
+    if let window = snapshot.window(nearest: selectedDate) {   // O(log n), precomputed
+        RuleMark(x: .value("Selected window", window.start))
+            .foregroundStyle(.secondary)
+            .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            .annotation(
+                position: .top,
+                spacing: 4,
+                overflowResolution: .init(x: .fit(to: .chart), y: .disabled)
+            ) {
+                SelectedWindowCallout(window: window, series: snapshot.series, kind: kind)
+            }
+    }
+}
+.chartXSelection(value: $selectedDate)
+.sensoryFeedback(.selection, trigger: snapshot.window(nearest: selectedDate)?.start)
+```
+
+**Done when**
+
+Scrubbing shows a callout for every bucket, including the first and last, without
+clipping. No store query runs during a scrub (depends on 28/29). VoiceOver can reach the
+same values (see 37). Estimated values stay labelled and never enter the band.
+
+### 33. Add pan, zoom, and period selection to history charts
+
+**Observed behavior**
+
+- Each range draws fixed buckets from `TimeRange.chartBucket`: 15-minute medians at 24H,
+  hourly at 7D, and 6-hour at 30D. A 20-minute episode inside a week cannot be inspected
+  except by switching to 1H, and 1H always ends at "now".
+- No history chart pins its x-axis domain; none calls `chartXScale`. The axis spans only
+  the data extent. A 7D chart with data from the last day looks like a one-day chart with
+  date labels, which hides the six empty days.
+- Creating a saved session requires typing a start and an end into two `DatePicker`s
+  ([ComparisonSessionsView.swift](Sources/Views/ComparisonSessionsView.swift#L132)).
+
+**Improve it**
+
+- Pin `.chartXScale(domain:)` to the snapshot's resolved interval, so empty spans stay
+  visibly empty.
+- Use the iOS 17 scrolling API:
+  - `.chartScrollableAxes(.horizontal)`;
+  - `.chartXVisibleDomain(length:)`, in seconds for a date axis;
+  - `.chartScrollPosition(x:)`;
+  - `.chartScrollTargetBehavior(.valueAligned(…))`, to snap to hours or days.
+
+  The API scrolls a fixed visible length and has no built-in pinch zoom. Implement zoom by
+  changing that length: from buttons, or from a `MagnifyGesture` that has been checked on
+  a device to coexist with `List` scrolling.
+- **Semantic zoom.** When the visible length shrinks, reload just the visible span at a
+  finer bucket, down to the metric's `comparisonWindow`. Zooming then reveals real detail
+  instead of magnifying 6-hour medians. State the current bucket, for example "15-minute
+  medians".
+- **Period selection.** `chartXSelection(range:)` exists, but on iOS its default gesture
+  is a two-finger tap, which few people will discover. A visible "Select period" mode is
+  easier: drag via `chartGesture` and `ChartProxy`. Show that span's pair evidence and
+  offer **Save as session…** pre-filled with its bounds. This delivers the guided capture
+  that item 22 deferred, directly from the chart.
+- An Apple Developer Forums report says annotation overflow resolution misbehaves
+  together with `chartScrollableAxes` on iOS 17. The reported workaround is
+  `y: .fit(to: .chart)`. Verify the callout from item 32 inside a scrolling chart.
+
+**Done when**
+
+A week of data can be panned and zoomed to a one-hour span drawn from one-minute medians,
+and the visible bucket is stated. A brushed period can be saved and reopened with
+identical bounds. The statistics for a brushed period match those of the same span opened
+as a saved session.
+
+### 34. Rebuild pairwise-chart selection on the native selection API
+
+**Observed behavior**
+
+The pairwise screen is the only interactive chart, and it does link its two charts:
+selecting a window highlights it in both. Five gaps remain:
+
+- **Scrolling.** Selection comes from a transparent `Rectangle` plus a
+  `DragGesture(minimumDistance: 0)` overlay
+  ([PairwiseAnalysisView.swift](Sources/Views/PairwiseAnalysisView.swift#L483), L483–527).
+  A zero-distance drag inside a `List` competes with vertical scrolling. Two charts of
+  250 and 280 pt cover much of the screen, where a swipe may start a selection instead of
+  a scroll. Verify on a device.
+- **Unreachable outliers.** The Bland–Altman overlay picks the point with the nearest
+  *paired mean* and ignores the vertical axis (L520–523). When many windows share a
+  similar mean (resting heart rate around 60–70 bpm), the outliers a Bland–Altman plot
+  exists to show cannot be selected apart from the dense cluster at the same x.
+- **Details off-screen.** The selected window's details appear in a separate section below
+  both charts (L94–98). They are off-screen while a finger is on the timeline.
+- **Selection feedback.** A selection cannot be cleared except by changing the range, and
+  there is no haptic feedback.
+- **VoiceOver.** The overlay is invisible to VoiceOver, and the accessibility hint tells
+  VoiceOver users to "Drag across the chart".
+
+**Improve it**
+
+- On the timeline, use `.chartXSelection(value:)`.
+- On the Bland–Altman plot, use `.chartGesture` with `ChartProxy` and pick the point
+  nearest in **screen space** in both x and y, so stacked outliers can be selected.
+- Add a compact on-chart callout (A, B, A − B, and the timing flag). Keep the full card
+  below for details.
+- Tap empty plot area to deselect, and add selection haptics.
+- Add accessibility actions that step the selection to the next or previous paired
+  window, and label each plotted observation. For example: "14:32, A 72, B 75, A minus B
+  −3 bpm, outside limits".
+
+**Done when**
+
+The list scrolls normally when a vertical swipe starts on a chart (device check). Any
+plotted point, including vertically stacked outliers, can be selected. VoiceOver users can
+step through windows. The selected window's key values are visible without scrolling.
+
+### 35. Turn the Oura cards into real charts: heart rate, hypnogram, 14-day trends
+
+**Observed behavior**
+
+- The Oura heart-rate chart is static; item 30 covers its interpolation and gaps.
+- The sleep and movement ribbons are `Canvas` drawings
+  ([OuraCardComponents.swift](Sources/Views/Oura/OuraCardComponents.swift#L203)) with no
+  time axis. A user cannot tell when a stage or activity class happened. VoiceOver hears
+  only "Sleep-stage timeline with 96 five-minute intervals".
+- In the movement ribbon, the colour map draws code `"0"` (Oura: non-wear) as grey
+  ([OuraMovementSection.swift](Sources/Views/Oura/OuraMovementSection.swift#L85)), but the
+  legend (L48) lists only Rest to High. Grey segments are unexplained.
+- The score and biomarker cards show only the latest value, although the cache keeps up to
+  14 days per collection (`OuraManager.sync(days: 14)`). There is no trend or baseline
+  context.
+
+**Improve it**
+
+- Draw the sleep ribbon as a Swift Charts hypnogram. Use one `RectangleMark` per run of
+  consecutive identical stages, timed from `bedtime_start` in five-minute steps. Order
+  stages conventionally (Awake on top, Deep at the bottom), add an hour axis, and add
+  `chartXSelection` to read, for example, "REM 02:10–02:35". Do the same for movement
+  over the activity day. Keep the "Oura's classification, not HeartSync's" wording.
+- Add **Non-wear** to the movement legend.
+- Add a 14-day sparkline or small bar chart to each score card (Readiness, Sleep,
+  Activity) and to relevant biomarkers (RMSSD, lowest heart rate, temperature deviation).
+  Highlight the latest day and let a tap reveal a day's value. Show missing days as gaps.
+  Draw temperature deviation around a zero baseline and label it as a deviation, never an
+  absolute temperature.
+- Make the heart-rate chart selectable (time plus bpm callout), with the gap handling
+  from item 30.
+
+**Done when**
+
+The stage or class at a chosen time can be read both visually and with VoiceOver. The
+legend covers every code the colour map draws. Trends use cached documents only, and add
+no new scopes or requests.
+
+### 36. Give the Now tab sparklines, motion, and honest "live" labelling
+
+**Observed behavior**
+
+- Each card shows only the latest value per device, with no trend.
+- Values change without transition. Nothing beyond a timestamp shows which sources are
+  actively streaming.
+- The **Live sources** header ([DashboardView.swift](Sources/Views/DashboardView.swift#L90))
+  counts every Apple Health source as live whenever HealthKit is authorised (L84), and
+  Oura whenever it is connected. VoiceOver reads each chip as "connected". This conflicts
+  with `SourceTransport.isLive`, whose documentation says only Bluetooth streams live and
+  that "the UI says so rather than showing a stale value as live". When no source
+  qualifies, the header title still renders above an empty row.
+- The only navigation on a card is the small "History and agreement" pill. Check it
+  against Apple's minimum hit target of 44 × 44 pt.
+
+**Improve it**
+
+- Add a sparkline to each card, per source colour, with no axes and the gap rules from
+  item 30: the last hour for fast metrics, the last 14 days for daily ones. Omit the
+  sparkline when there is a single point. The data comes from the bounded per-metric read
+  in item 29.
+- Animate value changes with `.contentTransition(.numericText(value:))`. Pulse the heart
+  glyph with `symbolEffect(.pulse)` only while a Bluetooth source is streaming; SF Symbol
+  effects honour Reduce Motion automatically.
+- Rename the header to **Sources**. Give each chip a status derived from `isLive` and
+  freshness: Live, Synced 5 min ago, or Waiting. Hide the header when it is empty.
+- Make the whole card the navigation target, or enlarge the pill to meet the minimum.
+
+**Done when**
+
+A card shows a trend that never implies unmeasured continuity. Apple Health and Oura
+chips never claim to be live. Motion is disabled under Reduce Motion, apart from the
+system's own symbol handling. A UI test covers the no-connected-sources state.
+
+### 37. Make dense charts work with VoiceOver, Audio Graphs, and Dynamic Type
+
+**Observed behavior**
+
+- Swift Charts builds an accessibility tree and an Audio Graph automatically. Metric
+  detail, however, emits a `LineMark` and a `PointMark` for every bucket of every source,
+  plus the band. Its marks carry no custom accessibility label or value, so the source
+  name, estimate, and compacted status are not spoken per point. Check on a device how
+  many elements VoiceOver visits on a 30-day chart.
+- `PairwiseAnalysisView` sets chart-level hints that ask the user to drag (see 34).
+- Chart heights are fixed at 240, 250, 280, and 210 pt. At accessibility text sizes the
+  axis labels grow while the plot shrinks. On iPad, charts stay phone-sized.
+- The metric-detail and Oura heart-rate charts have no y-axis unit. The Bland–Altman plot
+  has axis labels with units.
+
+**Improve it**
+
+- Give the `PointMark`s `.accessibilityLabel` and `.accessibilityValue`: source label,
+  time, value with unit, and Estimate or Compacted where relevant. Hide the duplicate line
+  and band marks from accessibility. Alternatively, supply an `accessibilityChartDescriptor`
+  that summarises one series per device for the Audio Graph.
+- Add `.chartYAxisLabel` with the metric's unit.
+- Scale chart height with Dynamic Type (`@ScaledMetric`) and with the available width on
+  iPad (`containerRelativeFrame` or an aspect ratio).
+
+**Done when**
+
+A VoiceOver pass at the largest accessibility text size can read each device's values on
+metric detail, pairwise, and Oura charts. The Audio Graph is available and names the
+series. No chart's plot area collapses at AX5.
+
+### 38. Adapt layouts for iPad and landscape
+
+**Observed behavior**
+
+`project.yml` targets iPhone and iPad (`TARGETED_DEVICE_FAMILY: "1,2"`) and declares every
+orientation, but no view reads a size class. Specifically:
+
+- The `TabView` in [RootView.swift](Sources/App/RootView.swift#L19) uses the default style.
+- Now is a single-column `LazyVStack` of cards.
+- Charts have fixed heights.
+- The metric chips in `SourceRow` are one non-wrapping `HStack`
+  ([DevicesView.swift](Sources/Views/DevicesView.swift#L407)). A HealthKit writer that
+  reports seven metrics can overflow a compact width at larger text sizes.
+
+**Improve it**
+
+- Apply `.tabViewStyle(.sidebarAdaptable)` (iOS 18). iPad gets a sidebar that can become
+  a tab bar; iPhone keeps its tab bar.
+- On Now, use `LazyVGrid(columns: [GridItem(.adaptive(minimum: 320))])`.
+- On Compare in a regular width, use a `NavigationSplitView`: metrics on the left, the
+  selected metric's detail on the right.
+- Replace the chip `HStack` with a small flow `Layout`.
+- Increase chart height in landscape on iPhone.
+
+**Done when**
+
+UI screenshots (see 41) of iPad in both orientations and iPhone in landscape show no
+clipped chips, charts use the extra space, and the sidebar lists the five destinations.
+
+### 39. Consolidate visual tokens, chart styling, and loading feedback
+
+**Observed behavior**
+
+- **Card styles.** The app uses two card vocabularies:
+  - `metricCard` on Now ([Theme.swift](Sources/Views/Theme.swift#L90)): glass material,
+    gradient, shadow, 22 pt radius;
+  - `ouraCard` on the Oura tab
+    ([OuraCardComponents.swift](Sources/Views/Oura/OuraCardComponents.swift#L17)): flat
+    secondary background, 16 pt radius.
+
+  The Oura header has its own gradient. Compare, Devices, and Settings are plain grouped
+  lists.
+- **Chart colours.** Chart code scatters hard-coded colours (`.blue`, `.purple`, `.orange`,
+  `.red`, `.pink`) instead of tokens.
+- **Loading feedback.** `CompareView.isLoading` is written (L12, L115–116) but never read.
+  After the first load, changing the range keeps showing the previous range's results,
+  with no "updating" cue, until the new snapshot lands. Metric detail behaves the same way.
+- **Duplicated chart styling.** Axis formats, heights, interpolation, and point sizes are
+  repeated across files. `axisFormat` is identical in `MetricDetailView` and
+  `PairwiseAnalysisView`.
+
+**Improve it**
+
+- Choose one card treatment for content cards. Add a `HeartSyncTheme.Chart` token group
+  (reference-line ink, tolerance dash patterns, band opacity, heights) and a shared
+  `axisFormat(for:)`. As `Theme.swift` already requires, keep semantic colours owned by
+  the model types.
+- While a load for a new key is in flight, show a small `ProgressView` in the section
+  header and dim the stale content.
+
+**Done when**
+
+Chart colours and dash patterns come from one place. A range change shows immediate
+feedback, and results never silently describe the previous range.
+
+### 40. Adopt Always On guidance and gauges on the watch
+
+**Observed behavior**
+
+- The watch app never reads `isLuminanceReduced`. Apple's Always On guidance is to
+  highlight what matters and hide what should stay private while luminance is reduced.
+- The complications already mark measurements `privacySensitive()`
+  ([HeartSyncComplications.swift](WatchComplications/Sources/HeartSyncComplications.swift#L50)),
+  but the workout screen's live heart rate stays readable on a wrist-down display.
+- The watch workout screen is a list of text, with no trend or zone context.
+- The circular complication is text-only (L53). Heart rate and SpO₂ suit a gauge.
+
+**Improve it**
+
+- Use `@Environment(\.isLuminanceReduced)` on the workout and dashboard screens: dim
+  secondary text and tints, and keep the heart rate and elapsed time prominent.
+- Decide whether live heart rate should be privacy-sensitive in Always On, consistent with
+  the complications, and document the decision.
+- Add a small five-minute heart-rate trend from the samples the workout builder already
+  delivers. Keep it in memory and add no new persistence. Any heart-rate zones based on
+  age-predicted maximum must be labelled as estimates.
+- Draw the circular complication as a `Gauge` with `.gaugeStyle(.accessoryCircular)`,
+  keeping the Older and Median labels.
+
+**Done when**
+
+On a physical watch, Always On shows the chosen reduced presentation during a workout. The
+circular complication renders as a gauge in tinted and full-colour faces, with the current
+freshness labels.
+
+### 41. Add previews, chart fixtures, and screenshot artefacts for UI work
+
+**Observed behavior**
+
+- No iOS or watch view has a `#Preview`, although `OuraDashboardView`'s header says its
+  sections take data slices "so the sections stay independently previewable".
+- `DebugAnalysisFixtures` holds 8 minutes of heart rate and 6 minutes of SpO₂ for two
+  sources. That proves the evidence flow, but it is not enough to judge gaps, thinning,
+  three or more sources, same-name series, estimates, compaction, or month ranges.
+- CI uploads the `.xcresult`, but the UI tests attach no screenshots, so a pull request
+  cannot show its visual changes.
+- The thinning caps (500 pairwise points, 240 Oura points) exist partly because every
+  point is a separate mark.
+
+**Improve it**
+
+- Add `#Preview`s for each chart view and each Oura section, fed from fixtures, in light,
+  dark, and large-text variants.
+- Add a Debug-only `--chart-gallery` fixture with 30 days of data: gaps, four sources
+  (two of them same-named), estimates, and compacted windows.
+- In UI tests, attach `XCTAttachment(screenshot:)` with `lifetime = .keepAlways` for key
+  screens, so the CI artefact shows the UI.
+- Evaluate the iOS 18 vectorized plots (`LinePlot`, `PointPlot`) for dense, uniformly
+  styled series such as Oura heart rate and the Bland–Altman cloud. Measure before
+  raising the caps. Keep per-mark APIs where marks need individual styling, such as
+  estimates and selection.
+
+**Done when**
+
+Chart and Oura views render in Xcode previews from fixtures. The CI artefact contains
+screenshots of Now, metric detail, pairwise, Oura, and an iPad layout.
+
+### UI strengths to preserve
+
+- One immutable snapshot per load, with `.task(id:)` cancellation and late-result
+  rejection, in Compare and metric detail.
+- Gap-segmented metric-detail lines, series keyed by stable source ID, disambiguated
+  labels, and a legend that speaks each symbol's name.
+- Linked selection between the two pairwise charts.
+- Explicit empty, unavailable, collecting, and insufficient-evidence states. Evidence is
+  never coloured green by default.
+- Thinning disclosed on screen, estimates drawn dashed and kept out of the band, and
+  compound VoiceOver labels on rows and cards.
+
+### Validation for this review
+
+- Read every file in `Sources/Views` and `Sources/App`, the watch app and complication
+  views, and the model, store, and analysis code that feeds them, at the commit above.
+- Ran the palette simulation in the appendix (Python 3, `colorspacious` 1.1.2).
+- Checked the API and platform claims against the sources below.
+- Did not build, run tests, launch a simulator, or use a device. This environment has no
+  Xcode. Each "Done when" paragraph is an acceptance criterion, not completed validation.
+- Changed only `improvements.md`. No Swift, schema, signing, capability, or user health
+  data was touched.
+
+### Sources
+
+- Apple, WWDC23: [Explore pie charts and interactivity in Swift Charts](https://developer.apple.com/videos/play/wwdc2023/10037/).
+  Covers `chartXSelection(value:)` and `chartXSelection(range:)` (iOS range default: a
+  two-finger tap), `chartAngleSelection`, `chartGesture`, `chartScrollableAxes`,
+  `chartXVisibleDomain`, `chartScrollPosition`, `chartScrollTargetBehavior`, and
+  annotation `overflowResolution`.
+- Apple Developer Forums: [RuleMark annotation not respecting overflow resolution with chartScrollableAxes](https://developer.apple.com/forums/thread/737244).
+- Apple, WWDC24: [Swift Charts: Vectorized and function plots](https://developer.apple.com/videos/play/wwdc2024/10155/).
+- Apple documentation: [`InterpolationMethod.monotone`](https://developer.apple.com/documentation/charts/interpolationmethod/monotone)
+  and [`AreaMark.init(x:yStart:yEnd:series:)`](https://developer.apple.com/documentation/charts/areamark/init(x:ystart:yend:series:)).
+- Apple, WWDC21: [Bring accessibility to charts in your app](https://developer.apple.com/videos/play/wwdc2021/10122/).
+  See also Create with Swift, [Making charts accessible with Swift Charts](https://www.createwithswift.com/making-charts-accessible-with-swift-charts/).
+- Apple, WWDC24: [Elevate your tab and sidebar experience in iPadOS](https://developer.apple.com/videos/play/wwdc2024/10147/),
+  and [`SidebarAdaptableTabViewStyle`](https://developer.apple.com/documentation/swiftui/sidebaradaptabletabviewstyle).
+- Apple documentation: [`ContentTransition.numericText(value:)`](https://developer.apple.com/documentation/swiftui/contenttransition/numerictext(value:)).
+  Use Your Loaf: [SwiftUI Sensory Feedback](https://useyourloaf.com/blog/swiftui-sensory-feedback/).
+- Use Your Loaf: [SwiftUI Swipe Actions](https://useyourloaf.com/blog/swiftui-swipe-actions/)
+  (`allowsFullSwipe` defaults to `true`; a full swipe performs the first action).
+- Mehmet Baykar: [SwiftUI NavigationStack view lifecycle patterns](https://mehmetbaykar.com/posts/swiftui-navigationstack-view-lifecycle/)
+  (`onAppear` fires again when a pushed view is popped).
+- Apple, WWDC21: [What's new in watchOS 8](https://developer.apple.com/videos/play/wwdc2021/10002/)
+  (`isLuminanceReduced`; apps with an active session may update once per second in
+  Always On; others once per minute).
+- Apple, WWDC22: [Go further with Complications in WidgetKit](https://developer.apple.com/videos/play/wwdc2022/10051/)
+  (accessory gauges).
+- Apple: [UI Design Dos and Don'ts](https://developer.apple.com/design/tips/) (44 × 44 pt
+  minimum hit target).
+- Oura API v2 schema field descriptions for `class_5_min` (0 = non-wear … 5 = high
+  activity) and `sleep_phase_5_min` (1 = deep … 4 = awake), as mirrored in the
+  [@pinta365/oura-api type documentation](https://jsr.io/@pinta365/oura-api/doc).
+  The [official Oura API reference](https://cloud.ouraring.com/v2/docs) could not be
+  fetched from this environment.
+
+### Appendix: palette colour-vision check
+
+<details>
+<summary>Python script used for item 31 (<code>pip install colorspacious</code>)</summary>
+
+```python
+"""Pairwise distinguishability of HeartSync chart colours under simulated colour-vision
+deficiency. Machado et al. (2009) model at severity 100, CAM02-UCS deltaE.
+Rule of thumb: deltaE below ~10 is hard to tell apart at chart-mark sizes."""
+from itertools import combinations
+
+import colorspacious as cs
+import numpy as np
+
+def rgb(r, g, b):  # 0...1 components, as written in DataSource.palette
+    return (r * 255, g * 255, b * 255)
+
+palette = {
+    "src0 blue":   rgb(0.00, 0.48, 1.00),
+    "src1 orange": rgb(1.00, 0.42, 0.21),
+    "src2 green":  rgb(0.20, 0.72, 0.47),
+    "src3 purple": rgb(0.69, 0.32, 0.87),
+    "src4 rose":   rgb(0.93, 0.26, 0.45),
+    "src5 teal":   rgb(0.12, 0.70, 0.78),
+}
+# Approximate iOS light-appearance system colours used as semantic tints on the same charts.
+semantic = {
+    "sev green (.green)":   (52, 199, 89),
+    "sev orange (.orange)": (255, 149, 0),
+    "sev red (.red)":       (255, 59, 48),
+    "bias (.blue)":         (0, 122, 255),
+    "LoA (.purple)":        (175, 82, 222),
+}
+sleep = {"deep (.indigo)": (88, 86, 214), "REM (.purple)": (175, 82, 222)}
+
+conditions = {
+    "normal": None,
+    "protan": {"name": "sRGB1+CVD", "cvd_type": "protanomaly", "severity": 100},
+    "deutan": {"name": "sRGB1+CVD", "cvd_type": "deuteranomaly", "severity": 100},
+    "tritan": {"name": "sRGB1+CVD", "cvd_type": "tritanomaly", "severity": 100},
+}
+
+def simulate(colour, condition):
+    unit = tuple(v / 255 for v in colour)
+    if condition is None:
+        return unit
+    return tuple(np.clip(cs.cspace_convert(unit, condition, "sRGB1"), 0, 1))
+
+def delta_e(a, b, condition):
+    return cs.deltaE(simulate(a, condition), simulate(b, condition), input_space="sRGB1")
+
+def report(title, pairs):
+    print(f"\n== {title} ==")
+    print(f"{'pair':44s}" + "".join(f"{name:>8s}" for name in conditions))
+    for (name_a, a), (name_b, b) in pairs:
+        values = [delta_e(a, b, condition) for condition in conditions.values()]
+        flag = "  <-- weak" if min(values) < 10 else ""
+        print(f"{name_a + ' vs ' + name_b:44s}" + "".join(f"{v:8.1f}" for v in values) + flag)
+
+report("Source palette, pairwise", list(combinations(palette.items(), 2)))
+report("Source palette vs semantic tints", [(p, s) for p in palette.items() for s in semantic.items()])
+report("Oura sleep ribbon", list(combinations(sleep.items(), 2)))
+```
+
+</details>
+
+---
+
+
+## Previous follow-up review (2026-09-08)
 
 Reviewed `main` at commit
 [`ca8f07a7993572722a0d09967f8a8c416acb4389`](https://github.com/PopShark57/HeartSync/commit/ca8f07a7993572722a0d09967f8a8c416acb4389),
