@@ -76,17 +76,137 @@ struct PairwiseSnapshotTests {
         }
     }
 
-    @Test("Nearest-paired-mean lookup matches a linear scan")
-    func nearestMeanMatchesLinearScan() {
+    /// The difference plot's own linear scales, as the chart maps values to points.
+    private func screenPosition(
+        _ observation: PairwiseObservation,
+        in resolved: PairwiseSnapshot,
+        size: CGSize = CGSize(width: 320, height: 280)
+    ) -> CGPoint {
+        let x = resolved.differenceXDomain, y = resolved.differenceYDomain
+        return CGPoint(
+            x: (observation.pairedMean - x.lowerBound) / (x.upperBound - x.lowerBound) * size.width,
+            y: (1 - (observation.signedDifference - y.lowerBound) / (y.upperBound - y.lowerBound)) * size.height
+        )
+    }
+
+    @Test("A tap on the difference plot selects the point nearest on screen, as a linear scan would")
+    func nearestPointMatchesLinearScan() {
         let resolved = snapshot(readings(minutes: 150))
-        let points = resolved.plotted
+        let positions = resolved.plotted.map { screenPosition($0, in: resolved) }
         for step in 0..<300 {
-            let probe = 55 + Double(step) * 0.17
-            let linear = points.min { abs($0.pairedMean - probe) < abs($1.pairedMean - probe) }
-            let found = resolved.observation(nearestPairedMean: probe)
-            // Ties may resolve to a different window with an identical distance.
-            #expect(abs((found?.pairedMean ?? .nan) - probe) == abs((linear?.pairedMean ?? .nan) - probe))
+            let tap = CGPoint(x: Double(step % 20) * 16.3, y: Double(step / 20) * 18.7)
+            let linear = positions.enumerated()
+                .map { (index: $0.offset, distance: hypot($0.element.x - tap.x, $0.element.y - tap.y)) }
+                .filter { $0.distance <= ChartLookup.selectionRadius }
+                .min { $0.distance < $1.distance }
+            let found = resolved.observation(nearestTo: tap, within: ChartLookup.selectionRadius) {
+                screenPosition($0, in: resolved)
+            }
+            // Ties may resolve to a different window at an identical distance.
+            if let linear, let found {
+                let distance = hypot(screenPosition(found, in: resolved).x - tap.x, screenPosition(found, in: resolved).y - tap.y)
+                #expect(abs(distance - linear.distance) < 1e-9)
+            } else {
+                #expect(linear == nil && found == nil)
+            }
         }
+    }
+
+    @Test("An outlier stacked above the cluster at the same paired mean can be selected on its own")
+    func stackedOutlierIsReachable() throws {
+        // Twenty windows agree closely around 70 bpm; one at the same paired mean differs by 20.
+        var input: [Reading] = []
+        for minute in 0..<21 {
+            let stamp = interval.start.addingTimeInterval(Double(minute) * 60 + 1)
+            let gap: Double = minute == 10 ? 20 : (minute.isMultiple(of: 2) ? 1 : -1)
+            input.append(Reading(sourceID: "a", kind: .heartRate, value: 70 + gap / 2, start: stamp))
+            input.append(Reading(sourceID: "b", kind: .heartRate, value: 70 - gap / 2, start: stamp.addingTimeInterval(4)))
+        }
+        let resolved = snapshot(input)
+        let outlier = try #require(resolved.plotted.first { $0.signedDifference == 20 })
+        let cluster = resolved.plotted.filter { $0.signedDifference != 20 }
+        // Every window shares the paired mean of 70, so a lookup on x alone cannot tell them apart.
+        #expect(resolved.plotted.allSatisfy { $0.pairedMean == 70 })
+
+        let tap = screenPosition(outlier, in: resolved)
+        let picked = resolved.observation(nearestTo: tap, within: ChartLookup.selectionRadius) {
+            screenPosition($0, in: resolved)
+        }
+        #expect(picked?.start == outlier.start)
+
+        let clusterTap = try #require(cluster.first.map { screenPosition($0, in: resolved) })
+        let pickedCluster = resolved.observation(nearestTo: clusterTap, within: ChartLookup.selectionRadius) {
+            screenPosition($0, in: resolved)
+        }
+        #expect(pickedCluster?.signedDifference != 20)
+    }
+
+    @Test("A tap in empty plot area selects nothing, on either chart")
+    func emptyAreaSelectsNothing() {
+        let resolved = snapshot(readings(minutes: 120, gapAfter: 60, gapMinutes: 300))
+        // Far from every drawn point on the difference plot.
+        let corner = resolved.observation(nearestTo: CGPoint(x: -500, y: -500), within: ChartLookup.selectionRadius) {
+            screenPosition($0, in: resolved)
+        }
+        #expect(corner == nil)
+
+        // In the middle of the five-hour gap on the timeline, with a ten-minute catchment.
+        let gapMiddle = interval.start.addingTimeInterval(60 * 60 + 150 * 60)
+        #expect(resolved.observation(nearestStart: gapMiddle, within: 600) == nil)
+        #expect(resolved.observation(nearestStart: gapMiddle) != nil)
+        let before = resolved.plotted[30]
+        #expect(resolved.observation(nearestStart: before.start.addingTimeInterval(10), within: 600)?.start == before.start)
+    }
+
+    @Test("Stepping walks the drawn windows in order and stops at either end")
+    func steppingWalksTheWindows() throws {
+        let resolved = snapshot(readings(minutes: 12))
+        let points = resolved.plotted
+        let first = try #require(points.first)
+        let last = try #require(points.last)
+
+        #expect(resolved.observation(steppingFrom: nil, by: 1)?.start == first.start)
+        #expect(resolved.observation(steppingFrom: nil, by: -1)?.start == last.start)
+        #expect(resolved.observation(steppingFrom: first.start, by: 1)?.start == points[1].start)
+        #expect(resolved.observation(steppingFrom: points[1].start, by: -1)?.start == first.start)
+        // No wrap-around: the ends hold.
+        #expect(resolved.observation(steppingFrom: first.start, by: -1)?.start == first.start)
+        #expect(resolved.observation(steppingFrom: last.start, by: 1)?.start == last.start)
+        #expect(resolved.observation(steppingFrom: first.start, by: 0) == nil)
+        #expect(snapshot([]).observation(steppingFrom: nil, by: 1) == nil)
+    }
+
+    @Test("Each window is spoken with both values, the signed difference, and its caveats")
+    func spokenSummaryNamesEverything() throws {
+        var input: [Reading] = []
+        for minute in 0..<12 {
+            let stamp = interval.start.addingTimeInterval(Double(minute) * 60 + 1)
+            let b: Double = minute == 11 ? 90 : 71
+            input.append(Reading(sourceID: "a", kind: .heartRate, value: 72, start: stamp))
+            input.append(Reading(sourceID: "b", kind: .heartRate, value: b, start: stamp.addingTimeInterval(4)))
+        }
+        let resolved = snapshot(input)
+        let typical = try #require(resolved.plotted.first)
+        let spoken = resolved.spokenSummary(typical)
+        #expect(spoken.contains("A 72"))
+        #expect(spoken.contains("B 71"))
+        #expect(spoken.contains("A minus B +1 bpm"))
+        #expect(!spoken.contains("outside limits"))
+
+        let outlier = try #require(resolved.plotted.last)
+        #expect(resolved.isOutsideLimits(outlier))
+        #expect(resolved.spokenSummary(outlier).contains("A minus B \u{2212}18 bpm"))
+        #expect(resolved.spokenSummary(outlier).contains("outside limits"))
+        #expect(PairwiseSnapshot.signed(0, kind: .heartRate) == "+0")
+    }
+
+    @Test("The timeline's x domain is the analysed span, so an unpaired stretch stays visible")
+    func timelineDomainIsPinned() {
+        let resolved = snapshot(readings(minutes: 30))
+        #expect(resolved.timelineXDomain.upperBound == interval.end)
+        #expect(resolved.timelineXDomain.lowerBound <= interval.start)
+        #expect(interval.start.timeIntervalSince(resolved.timelineXDomain.lowerBound) < 60)
+        #expect(resolved.plotted.allSatisfy { resolved.timelineXDomain.contains($0.start) })
     }
 
     @Test("Exact-start lookup finds plotted windows and nothing else")
@@ -113,7 +233,7 @@ struct PairwiseSnapshotTests {
         let resolved = snapshot([])
         #expect(resolved.plotted.isEmpty)
         #expect(resolved.observation(nearestStart: interval.start) == nil)
-        #expect(resolved.observation(nearestPairedMean: 70) == nil)
+        #expect(resolved.observation(nearestTo: .zero, within: 1_000) { _ in .zero } == nil)
         #expect(resolved.timelineYDomain == MetricKind.heartRate.displayRange)
     }
 

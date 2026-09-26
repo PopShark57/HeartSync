@@ -29,63 +29,15 @@ struct OuraHeartRateSection: View {
                 if series.points.isEmpty {
                     OuraInlineEmptyState(icon: "heart.slash", text: "No heart-rate samples in the current Oura cache.")
                 } else {
-                    chart(series)
+                    // Its own view: a scrub re-evaluates only the chart, never this body,
+                    // so the cached samples are not re-parsed on every touch-move.
+                    OuraHeartRateChart(series: series)
+                        .accessibilityIdentifier("oura.heartRate")
                     footer(series)
                 }
             }
             .ouraCard()
         }
-    }
-
-    private func chart(_ series: OuraHeartRateSeries) -> some View {
-        Chart(series.points) { point in
-            // Monotone, not Catmull-Rom: Catmull-Rom curves overshoot and drew peaks and
-            // dips no sample had, contradicting the series' own "invents no value" contract.
-            // Keyed per segment so the line and its fill stop at a hole in the series.
-            AreaMark(
-                x: .value("Time", point.date),
-                yStart: .value("Baseline", series.floor),
-                yEnd: .value("Heart rate", point.bpm),
-                series: .value("Segment", point.segment)
-            )
-            .foregroundStyle(
-                LinearGradient(
-                    colors: [.pink.opacity(0.24), .pink.opacity(0.02)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
-            .interpolationMethod(.monotone)
-
-            LineMark(
-                x: .value("Time", point.date),
-                y: .value("Heart rate", point.bpm),
-                series: .value("Segment", point.segment)
-            )
-            .foregroundStyle(.pink)
-            .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
-            .interpolationMethod(.monotone)
-
-            // A sample alone between two holes has no line; the dot keeps it visible.
-            if point.isIsolated {
-                PointMark(
-                    x: .value("Time", point.date),
-                    y: .value("Heart rate", point.bpm)
-                )
-                .foregroundStyle(.pink)
-                .symbolSize(24)
-            }
-        }
-        .chartYAxis {
-            AxisMarks(position: .leading)
-        }
-        .chartXAxis {
-            AxisMarks(values: .automatic(desiredCount: 4)) { _ in
-                AxisGridLine()
-                AxisValueLabel(format: .dateTime.hour().minute())
-            }
-        }
-        .frame(height: 210)
     }
 
     /// The range comes from every sample in the window, not only the drawn ones, and the
@@ -108,5 +60,127 @@ struct OuraHeartRateSection: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+        Text("Drag across the chart to read a sample's time and heart rate.")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+    }
+}
+
+/// The Oura heart-rate line with a selectable sample (improvement 35).
+///
+/// A drag snaps to the nearest drawn sample and shows its time and bpm; the selection stays
+/// after the finger lifts, and a touch in a gap the ring did not upload clears it. Every
+/// value shown is one of Oura's own samples — nothing is interpolated for the callout.
+struct OuraHeartRateChart: View {
+    let series: OuraHeartRateSeries
+
+    /// Raw value from `chartXSelection`: set while a finger is down, nil once it lifts.
+    @State private var rawSelection: Date?
+    @State private var selectedID: String?
+    /// Measured width, which turns the on-screen selection radius into seconds.
+    @State private var chartWidth: CGFloat = 0
+
+    var body: some View {
+        let selected = series.point(id: selectedID)
+
+        Chart {
+            ForEach(series.points) { point in
+                // Monotone, not Catmull-Rom: Catmull-Rom curves overshoot and drew peaks and
+                // dips no sample had, contradicting the series' own "invents no value"
+                // contract. Keyed per segment so the line and its fill stop at a hole in the
+                // series.
+                AreaMark(
+                    x: .value("Time", point.date),
+                    yStart: .value("Baseline", series.floor),
+                    yEnd: .value("Heart rate", point.bpm),
+                    series: .value("Segment", point.segment)
+                )
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [.pink.opacity(0.24), .pink.opacity(0.02)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .interpolationMethod(.monotone)
+
+                LineMark(
+                    x: .value("Time", point.date),
+                    y: .value("Heart rate", point.bpm),
+                    series: .value("Segment", point.segment)
+                )
+                .foregroundStyle(.pink)
+                .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
+                .interpolationMethod(.monotone)
+
+                // A sample alone between two holes has no line; the dot keeps it visible.
+                if point.isIsolated {
+                    PointMark(
+                        x: .value("Time", point.date),
+                        y: .value("Heart rate", point.bpm)
+                    )
+                    .foregroundStyle(.pink)
+                    .symbolSize(24)
+                }
+            }
+
+            if let selected {
+                RuleMark(x: .value("Selected sample", selected.date))
+                    .foregroundStyle(HeartSyncTheme.Chart.secondaryReferenceInk)
+                    .lineStyle(HeartSyncTheme.Chart.selection)
+                    .accessibilityHidden(true)
+
+                PointMark(
+                    x: .value("Time", selected.date),
+                    y: .value("Heart rate", selected.bpm)
+                )
+                .foregroundStyle(.pink)
+                .symbolSize(70)
+                .accessibilityHidden(true)
+                .annotation(
+                    position: .top,
+                    spacing: 6,
+                    overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))
+                ) {
+                    Text("\(selected.date.formatted(date: .omitted, time: .shortened)) · \(Int(selected.bpm)) bpm")
+                        .font(.caption2.weight(.semibold))
+                        .monospacedDigit()
+                        .fixedSize()
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(.regularMaterial, in: Capsule())
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+        // Pinned to the stated "last 24 hours in cache", so an upload gap stays visible.
+        .chartXScale(domain: series.domain ?? Date.now...Date.now)
+        .chartYAxis {
+            AxisMarks(position: .leading)
+        }
+        .chartXAxis {
+            AxisMarks(values: .automatic(desiredCount: 4)) { _ in
+                AxisGridLine()
+                AxisValueLabel(format: .dateTime.hour().minute())
+            }
+        }
+        .chartXSelection(value: $rawSelection)
+        .onGeometryChange(for: CGFloat.self) { geometry in
+            geometry.size.width
+        } action: { width in
+            chartWidth = width
+        }
+        .onChange(of: rawSelection) { _, raw in
+            // The finger lifting keeps the sample; a touch in a gap clears it.
+            guard let raw, let domain = series.domain else { return }
+            let tolerance = ChartLookup.timeTolerance(
+                points: ChartLookup.selectionRadius,
+                plotWidth: Double(chartWidth),
+                domain: domain
+            )
+            selectedID = series.point(nearest: raw, within: tolerance)?.id
+        }
+        .sensoryFeedback(.selection, trigger: selectedID) { _, new in new != nil }
+        .frame(height: 210)
     }
 }

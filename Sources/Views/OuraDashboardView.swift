@@ -172,12 +172,17 @@ struct OuraDashboardView: View {
         let readiness = snapshot.latestReadiness
         let sleep = snapshot.latestSleep
 
+        // Trends come from the documents already cached for the values above: no new
+        // request, no new scope, and a missing day stays a gap.
         OuraScoresSection(
             activity: activity,
             readiness: readiness,
             sleepScore: snapshot.latestSleepScore,
             resilience: snapshot.latestResilience,
-            stress: snapshot.latestStress
+            stress: snapshot.latestStress,
+            activityTrend: .activityScore(snapshot.activities),
+            readinessTrend: .readinessScore(snapshot.readiness),
+            sleepTrend: .sleepScore(snapshot.sleepScores)
         )
         OuraBiomarkersSection(
             heartRate: snapshot.latestHeartRate,
@@ -185,7 +190,10 @@ struct OuraDashboardView: View {
             readiness: readiness,
             oxygen: snapshot.latestOxygen,
             cardiovascularAge: snapshot.latestCardiovascularAge,
-            vo2Max: snapshot.latestVO2Max
+            vo2Max: snapshot.latestVO2Max,
+            lowestHeartRateTrend: .lowestHeartRate(snapshot.sleeps),
+            rmssdTrend: .rmssd(snapshot.sleeps),
+            temperatureDeviationTrend: .temperatureDeviation(snapshot.readiness)
         )
         OuraHeartRateSection(heartRates: snapshot.heartRates)
         OuraSleepSection(sleep: sleep)

@@ -18,6 +18,37 @@ final class HeartSyncCheckerUITests: XCTestCase {
         return candidate.exists && candidate.isHittable
     }
 
+    /// The opposite direction: a pushed screen keeps its list offset after Back, so a row
+    /// near the top can be out of view — and out of the accessibility tree — until the
+    /// list scrolls back up to it.
+    private func scrollUpToElement(
+        _ candidate: XCUIElement,
+        in application: XCUIApplication,
+        attempts: Int = 6
+    ) -> Bool {
+        for _ in 0..<attempts {
+            if candidate.exists && candidate.isHittable { return true }
+            application.swipeDown()
+        }
+        return candidate.exists && candidate.isHittable
+    }
+
+    private func waitForLabel(of candidate: XCUIElement, containing text: String, timeout: TimeInterval = 5) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", text),
+            object: candidate
+        )
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func waitForDisappearance(of candidate: XCUIElement, timeout: TimeInterval = 5) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: candidate
+        )
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
     @discardableResult
     private func launch(_ scenario: String, pseudoLocalized: Bool = false) -> XCUIApplication {
         let application = XCUIApplication()
@@ -217,11 +248,92 @@ final class HeartSyncCheckerUITests: XCTestCase {
         XCTAssertTrue(pairRange.waitForExistence(timeout: 5))
         XCTAssertTrue(pairRange.buttons["7D"].isSelected)
 
-        // …and Back no longer resets detail to the range it was first opened with.
+        // …and Back no longer resets detail to the range it was first opened with. The list
+        // keeps its offset below the picker, so scroll back up before reading it.
         application.navigationBars.buttons.element(boundBy: 0).tap()
-        XCTAssertTrue(detailRange.waitForExistence(timeout: 5))
+        XCTAssertTrue(scrollUpToElement(detailRange, in: application))
         XCTAssertTrue(detailRange.buttons["7D"].isSelected)
         XCTAssertFalse(detailRange.buttons["24H"].isSelected)
+    }
+
+    /// Improvements 32 and 33: zoom reloads at a finer bucket and says which, and a period
+    /// taken from the chart gets its own evidence and a Save as session… action.
+    func testMetricDetailZoomNamesItsBucketAndOffersAPeriod() {
+        let application = launchPairwiseDemo()
+        application.buttons["Compare"].tap()
+        openHeartRate(in: application)
+
+        let bucket = element("metric.bucket", in: application)
+        XCTAssertTrue(bucket.waitForExistence(timeout: 5))
+        XCTAssertTrue(waitForLabel(of: bucket, containing: "Showing 15-minute medians"), bucket.label)
+
+        let zoomIn = element("metric.zoomIn", in: application)
+        XCTAssertTrue(zoomIn.exists)
+        zoomIn.tap()
+        XCTAssertTrue(waitForLabel(of: bucket, containing: "Showing 5-minute medians"), bucket.label)
+        zoomIn.tap()
+        XCTAssertTrue(waitForLabel(of: bucket, containing: "Showing 1-minute medians"), bucket.label)
+        XCTAssertFalse(zoomIn.isEnabled)
+        XCTAssertTrue(element("metric.panEarlier", in: application).exists)
+
+        // The span shown becomes the selected period, with its own evidence.
+        element("metric.selectPeriod", in: application).tap()
+        let useSpan = element("metric.useVisibleSpan", in: application)
+        XCTAssertTrue(useSpan.waitForExistence(timeout: 5))
+        useSpan.tap()
+        let save = element("metric.savePeriod", in: application)
+        XCTAssertTrue(scrollToElement(save, in: application))
+        save.tap()
+        XCTAssertTrue(application.navigationBars["Save session"].waitForExistence(timeout: 5))
+        application.buttons["Cancel"].tap()
+
+        // Zooming back out ends at the whole range, drawn at its own bucket.
+        let zoomOut = element("metric.zoomOut", in: application)
+        XCTAssertTrue(scrollUpToElement(zoomOut, in: application))
+        zoomOut.tap()
+        zoomOut.tap()
+        XCTAssertTrue(waitForLabel(of: bucket, containing: "Showing 15-minute medians"), bucket.label)
+        XCTAssertFalse(zoomOut.isEnabled)
+    }
+
+    /// Improvement 34: the pair's selection steps window by window without a drag, shows
+    /// its details, and clears.
+    func testPairSelectionStepsWithoutADragAndClears() {
+        let application = launchPairwiseDemo()
+        application.buttons["Compare"].tap()
+        openHeartRate(in: application)
+        let pair = element("metric.pair", in: application)
+        XCTAssertTrue(scrollToElement(pair, in: application))
+        pair.tap()
+
+        let next = element("pairwise.next", in: application)
+        XCTAssertTrue(scrollToElement(next, in: application))
+        next.tap()
+        let clear = element("pairwise.clearSelection", in: application)
+        XCTAssertTrue(clear.waitForExistence(timeout: 5))
+        let selected = element("pairwise.selected", in: application)
+        XCTAssertTrue(scrollToElement(selected, in: application))
+
+        XCTAssertTrue(scrollUpToElement(clear, in: application))
+        clear.tap()
+        XCTAssertTrue(waitForDisappearance(of: selected))
+    }
+
+    /// Improvement 35: the Oura tab draws a timed hypnogram, a timed movement chart, a
+    /// selectable heart-rate chart, and fourteen-day trends from cached documents only.
+    func testOuraChartsDrawStagesMovementHeartRateAndTrends() {
+        let application = launch("ouraCharts")
+        application.buttons["Oura"].tap()
+
+        let heartRate = application.staticTexts["Drag across the chart to read a sample's time and heart rate."]
+        XCTAssertTrue(scrollToElement(heartRate, in: application))
+        let hypnogram = application.staticTexts["Oura's stage classification, not HeartSync's. Drag across the chart to read a stage and its times."]
+        XCTAssertTrue(scrollToElement(hypnogram, in: application))
+        let movement = application.staticTexts["Oura's activity classes, not HeartSync's. Drag across the chart to read a class and its times."]
+        XCTAssertTrue(scrollToElement(movement, in: application))
+
+        // The score cards carry their fortnight, spoken as one sentence.
+        XCTAssertTrue(scrollUpToElement(anyElement(containing: "Last 14 days", in: application), in: application, attempts: 10))
     }
 
     func testSavedSessionPeriodReachesDetailAndPair() {

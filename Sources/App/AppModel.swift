@@ -74,6 +74,9 @@ final class AppModel {
             case .ouraPartial:
                 oura.injectPartialFailureForUITesting()
                 startupState = .ready
+            case .ouraCharts:
+                oura.injectChartFixtureForUITesting()
+                startupState = .ready
             }
             return
         }
@@ -444,6 +447,7 @@ final class AppModel {
         case retention
         case removal
         case ouraPartial
+        case ouraCharts
 
         static var requested: Self? {
             let prefix = "--ui-test-"

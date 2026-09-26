@@ -172,6 +172,8 @@ struct SaveComparisonSessionView: View {
 
     @State var start: Date
     @State var end: Date
+    /// The metric a period was chosen on, when it was chosen on a metric's chart.
+    var metric: MetricKind? = nil
     @State private var title = ""
     @State private var context = ""
     @State private var saveFailed = false
@@ -232,7 +234,8 @@ struct SaveComparisonSessionView: View {
             title: title,
             context: context,
             interval: DateInterval(start: start, end: max(start, end)),
-            sourceIDs: includedSourceIDs
+            sourceIDs: includedSourceIDs,
+            metric: metric
         )
         Task {
             if await model.sessions.save(session) {

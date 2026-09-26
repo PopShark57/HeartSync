@@ -942,6 +942,122 @@ final class OuraManager {
         ]
         lastSyncSummary = "1 collection unavailable"
     }
+
+    /// Fourteen days of cached documents for the chart UI tests and for visual checks of
+    /// the Oura charts: a timed night of stages, a timed day of movement including
+    /// non-wear, daily scores and nightly values with one missing day each, and a day of
+    /// heart rate with an upload gap. In memory only: nothing is fetched or persisted.
+    func injectChartFixtureForUITesting(now: Date = .now) {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? calendar.timeZone
+        let today = calendar.startOfDay(for: now)
+        let stamp = ISO8601DateFormatter()
+        func date(daysAgo: Int) -> Date { today.addingTimeInterval(-Double(daysAgo) * 86_400) }
+        func day(_ daysAgo: Int) -> String {
+            let parts = calendar.dateComponents([.year, .month, .day], from: date(daysAgo: daysAgo))
+            return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
+        }
+        func codes(_ runs: [(Character, Int)]) -> String {
+            String(runs.flatMap { Array(repeating: $0.0, count: $0.1) })
+        }
+
+        var fixture = OuraSnapshot()
+        fixture.fetchedAt = now
+
+        // Samples every five minutes for a day, with two hours missing while the ring charged.
+        fixture.heartRates = (0..<288).compactMap { index -> OuraClient.HeartRatePoint? in
+            let minutesAgo = 10 + index * 5
+            guard !(600...720).contains(minutesAgo) else { return nil }
+            return OuraClient.HeartRatePoint(
+                bpm: Int(64 + 12 * sin(Double(index) / 18)),
+                source: minutesAgo > 900 ? "sleep" : "awake",
+                timestamp: stamp.string(from: now.addingTimeInterval(-Double(minutesAgo) * 60))
+            )
+        }
+
+        // Last night: eight hours of stages from 23:00 UTC.
+        let night = codes([
+            ("4", 3), ("2", 8), ("1", 10), ("2", 6), ("3", 5), ("2", 9), ("1", 8),
+            ("3", 7), ("4", 1), ("2", 10), ("3", 9), ("2", 8), ("3", 8), ("4", 4),
+        ])
+        fixture.sleeps = (0..<14).compactMap { daysAgo -> OuraClient.SleepDocument? in
+            guard daysAgo != 6 else { return nil }
+            let start = date(daysAgo: daysAgo).addingTimeInterval(-3_600)
+            return OuraClient.SleepDocument(
+                id: "fixture-sleep-\(daysAgo)",
+                day: day(daysAgo),
+                bedtime_start: stamp.string(from: start),
+                bedtime_end: stamp.string(from: start.addingTimeInterval(Double(night.count) * 300)),
+                average_hrv: Double(38 + (daysAgo * 3) % 12),
+                lowest_heart_rate: Double(50 + daysAgo % 6),
+                deep_sleep_duration: daysAgo == 0 ? 5_400 : nil,
+                efficiency: daysAgo == 0 ? 88 : nil,
+                light_sleep_duration: daysAgo == 0 ? 15_300 : nil,
+                rem_sleep_duration: daysAgo == 0 ? 5_700 : nil,
+                sleep_phase_5_min: daysAgo == 0 ? night : nil,
+                total_sleep_duration: daysAgo == 0 ? 26_400 : nil,
+                type: "long_sleep"
+            )
+        }
+
+        fixture.readiness = (0..<14).compactMap { daysAgo -> OuraClient.DailyReadiness? in
+            guard daysAgo != 4 else { return nil }
+            return OuraClient.DailyReadiness(
+                id: "fixture-readiness-\(daysAgo)",
+                day: day(daysAgo),
+                score: 70 + (daysAgo * 7) % 20,
+                temperature_deviation: Double((daysAgo % 5) - 2) * 0.12,
+                contributors: OuraClient.ScoreContributors()
+            )
+        }
+        fixture.sleepScores = (0..<14).map { daysAgo in
+            OuraClient.DailySleep(
+                id: "fixture-sleep-score-\(daysAgo)",
+                day: day(daysAgo),
+                score: 75 + (daysAgo * 5) % 18,
+                contributors: OuraClient.ScoreContributors()
+            )
+        }
+
+        // Today's activity day from 04:00 UTC, including an hour and a half off the finger.
+        let movement = codes([
+            ("1", 36), ("2", 24), ("3", 12), ("5", 6), ("4", 12), ("2", 36),
+            ("0", 18), ("3", 24), ("2", 48), ("4", 12), ("2", 30), ("1", 30),
+        ])
+        fixture.activities = (0..<14).map { daysAgo in
+            OuraClient.DailyActivity(
+                id: "fixture-activity-\(daysAgo)",
+                day: day(daysAgo),
+                score: 65 + (daysAgo * 3) % 25,
+                active_calories: 420,
+                average_met_minutes: 1.7,
+                class_5_min: daysAgo == 0 ? movement : nil,
+                contributors: OuraClient.ScoreContributors(),
+                equivalent_walking_distance: 7_000,
+                high_activity_time: 1_800,
+                inactivity_alerts: 1,
+                low_activity_time: 10_800,
+                medium_activity_time: 7_200,
+                non_wear_time: 5_400,
+                resting_time: 19_800,
+                sedentary_time: 36_000,
+                steps: 8_400,
+                target_calories: 500,
+                target_meters: 9_000,
+                total_calories: 2_300,
+                timestamp: daysAgo == 0 ? stamp.string(from: date(daysAgo: 0).addingTimeInterval(4 * 3_600)) : nil
+            )
+        }
+
+        snapshot = fixture
+        status = .connected(email: "demo@example.com")
+        endpointStates[.heartRate] = .available(fixture.heartRates.count)
+        endpointStates[.detailedSleep] = .available(fixture.sleeps.count)
+        endpointStates[.dailyReadiness] = .available(fixture.readiness.count)
+        endpointStates[.dailySleep] = .available(fixture.sleepScores.count)
+        endpointStates[.dailyActivity] = .available(fixture.activities.count)
+        lastSyncSummary = "Fixture data"
+    }
     #endif
 
     /// A relaunch must not upgrade a cached prefix into a complete collection, so the

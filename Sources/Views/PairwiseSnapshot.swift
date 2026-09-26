@@ -12,6 +12,10 @@ import Foundation
 /// This is built once per load key in `.task(id:)`. A drag changes only a date in `@State`,
 /// and every lookup it needs is a binary search over arrays prepared here. Statistics and
 /// the export use `analysis`, which keeps every paired window; only `plotted` is thinned.
+///
+/// Selection itself (improvement 34) snaps the timeline to the nearest drawn window within
+/// an on-screen radius, picks the difference plot's point nearest a tap in both x and y,
+/// and steps window by window for VoiceOver — all against the arrays prepared here.
 @MainActor
 struct PairwiseSnapshot {
     let kind: MetricKind
@@ -27,6 +31,9 @@ struct PairwiseSnapshot {
     /// gap in the comparison, not continuous agreement or disagreement.
     let timelineSegments: [Int]
     let timelineYDomain: ClosedRange<Double>
+    /// The timeline's pinned x domain: the analysed span, widened back to its first window
+    /// boundary. Pinning it keeps a stretch with no paired window visibly empty.
+    let timelineXDomain: ClosedRange<Date>
     let differenceXDomain: ClosedRange<Double>
     let differenceYDomain: ClosedRange<Double>
     /// Set when the history read failed. The analysis is then empty for want of data, and
@@ -39,9 +46,6 @@ struct PairwiseSnapshot {
 
     /// `plotted[i].start` as reference-date seconds, ascending (plotted is chronological).
     private let plottedStarts: [Double]
-    /// Indices into `plotted`, ordered by paired mean and then chronologically.
-    private let meanOrder: [Int]
-    private let sortedMeans: [Double]
 
     /// Swift Charts emits one mark per observation per series, and a 30-day range of a
     /// 60-second metric can pair tens of thousands of windows. Statistics, the evidence
@@ -117,12 +121,10 @@ struct PairwiseSnapshot {
             threshold: ChartSegmentation.windowThreshold(windowSize: analysis.windowSize, stride: stride)
         )
         self.plottedStarts = plotted.map { $0.start.timeIntervalSinceReferenceDate }
-        let order = plotted.indices.sorted { lhs, rhs in
-            let left = plotted[lhs].pairedMean, right = plotted[rhs].pairedMean
-            return left == right ? lhs < rhs : left < right
-        }
-        self.meanOrder = order
-        self.sortedMeans = order.map { plotted[$0].pairedMean }
+        let firstBoundary = analysis.windowSize > 0
+            ? ComparisonEngine.floorToWindow(interval.start, size: analysis.windowSize)
+            : interval.start
+        self.timelineXDomain = min(firstBoundary, interval.end)...interval.end
 
         self.timelineYDomain = Self.paddedDomain(
             plotted.flatMap { [$0.sourceA.value, $0.sourceB.value] },
@@ -134,24 +136,75 @@ struct PairwiseSnapshot {
 
     // MARK: - Selection lookups
 
-    /// The plotted window whose start is nearest `date`, found by binary search.
-    func observation(nearestStart date: Date) -> PairwiseObservation? {
-        Self.nearestIndex(in: plottedStarts, to: date.timeIntervalSinceReferenceDate).map { plotted[$0] }
+    /// The plotted window whose start is nearest `date`, found by binary search. With a
+    /// tolerance, a window farther away than that is not selected: the touch was in empty
+    /// plot area, and the caller clears the selection instead.
+    func observation(nearestStart date: Date, within tolerance: TimeInterval? = nil) -> PairwiseObservation? {
+        ChartLookup.nearestIndex(
+            in: plottedStarts,
+            to: date.timeIntervalSinceReferenceDate,
+            within: tolerance
+        ).map { plotted[$0] }
     }
 
     /// The plotted window that starts exactly at `date`, found by binary search.
     func observation(startingAt date: Date?) -> PairwiseObservation? {
-        guard let date, let index = Self.nearestIndex(
+        guard let date, let index = ChartLookup.nearestIndex(
             in: plottedStarts,
             to: date.timeIntervalSinceReferenceDate
         ), plotted[index].start == date else { return nil }
         return plotted[index]
     }
 
-    /// The plotted window whose paired mean is nearest `mean`. One-dimensional on purpose:
-    /// it keeps the difference plot's existing behaviour, only without an O(n) scan.
-    func observation(nearestPairedMean mean: Double) -> PairwiseObservation? {
-        Self.nearestIndex(in: sortedMeans, to: mean).map { plotted[meanOrder[$0]] }
+    /// The plotted window drawn nearest `location` on the difference plot, measured on
+    /// screen in both x and y, if it lies within `radius` points.
+    ///
+    /// Two-dimensional because the plot exists to show outliers, and outliers often share
+    /// a paired mean with the dense cluster: picking by paired mean alone could never
+    /// select them apart from it. `position` maps a window to its on-screen point through
+    /// the chart's own scales. It runs once per tap, not per frame, so a linear pass over
+    /// the drawn points is enough.
+    func observation(
+        nearestTo location: CGPoint,
+        within radius: Double,
+        position: (PairwiseObservation) -> CGPoint?
+    ) -> PairwiseObservation? {
+        ChartLookup.nearestIndex(to: location, in: plotted.map(position), within: radius)
+            .map { plotted[$0] }
+    }
+
+    /// The plotted window `step` places after the one starting at `start` — before it, for
+    /// a negative step. With nothing selected, stepping forward starts at the first window
+    /// and stepping back at the last. Stops at either end rather than wrapping, so someone
+    /// stepping with VoiceOver can tell where the data ends.
+    func observation(steppingFrom start: Date?, by step: Int) -> PairwiseObservation? {
+        guard !plotted.isEmpty, step != 0 else { return nil }
+        guard let current = observation(startingAt: start),
+              let index = plotted.firstIndex(where: { $0.start == current.start })
+        else { return step > 0 ? plotted.first : plotted.last }
+        return plotted[min(max(index + step, 0), plotted.count - 1)]
+    }
+
+    /// One paired window as VoiceOver reads it: when, both values, the signed difference,
+    /// and any reason to doubt it. For example "3 Sep, 14:32, A 72, B 75, A minus B −3 bpm,
+    /// outside limits".
+    func spokenSummary(_ observation: PairwiseObservation) -> String {
+        var parts = [
+            observation.start.formatted(.dateTime.month(.abbreviated).day().hour().minute()),
+            "A \(kind.format(observation.sourceA.value))",
+            "B \(kind.format(observation.sourceB.value))",
+            "A minus B \(Self.signed(observation.signedDifference, kind: kind)) \(kind.unit)",
+        ]
+        if isOutsideLimits(observation) { parts.append("outside limits") }
+        if !observation.timing.supportsConclusion { parts.append(observation.timing.title.lowercased()) }
+        if observation.sourceA.isCompacted || observation.sourceB.isCompacted { parts.append("compacted") }
+        return parts.joined(separator: ", ")
+    }
+
+    /// A signed difference as the screen writes it: always a sign, and a true minus.
+    static func signed(_ value: Double, kind: MetricKind) -> String {
+        let magnitude = kind.format(abs(value))
+        return value >= 0 ? "+\(magnitude)" : "\u{2212}\(magnitude)"
     }
 
     /// Whether a window's difference falls outside the observed limits of agreement.
@@ -172,17 +225,7 @@ struct PairwiseSnapshot {
     /// Index of the value nearest `target` in an ascending array; the earlier on a tie,
     /// matching `min(by:)` over the chronological list it replaces.
     static func nearestIndex(in sorted: [Double], to target: Double) -> Int? {
-        guard !sorted.isEmpty else { return nil }
-        var low = 0
-        var high = sorted.count - 1
-        while low < high {
-            let mid = (low + high) / 2
-            if sorted[mid] < target { low = mid + 1 } else { high = mid }
-        }
-        if low > 0, abs(sorted[low - 1] - target) <= abs(sorted[low] - target) {
-            return low - 1
-        }
-        return low
+        ChartLookup.nearestIndex(in: sorted, to: target)
     }
 
     private static func paddedDomain(_ values: [Double], kind: MetricKind) -> ClosedRange<Double> {

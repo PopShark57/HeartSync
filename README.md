@@ -60,6 +60,12 @@ Charts on the pair screen draw at most a few hundred points, always including th
 differences, and say so when they are showing a subset. Statistics and exports always use
 every paired window.
 
+Metric detail and the pair screen are interactive. Drag across a chart to read each
+device's window median, or a pair's A, B, and A − B, in a callout. On the Bland–Altman plot,
+tap a point to select it, even an outlier stacked above the dense cluster. Zoom and pan
+buttons redraw a shorter span from finer medians and name the bucket shown. **Select
+period** turns a dragged span into its own evidence, which can be saved as a session.
+
 ## Honest limitations
 
 **Blood pressure cannot be measured optically by a ring or watch.** What the app offers is
@@ -135,7 +141,10 @@ The dedicated Oura tab keeps a local, token-free cache of recent cloud records a
 - activity, readiness, sleep, stress, resilience, and contributor scores
 - heart rate, resting heart rate, RMSSD, respiratory rate, SpO₂, breathing disturbances,
   temperature deviation, VO₂ max, cardiovascular age, and pulse-wave velocity
-- sleep stages, overnight movement, activity classes, MET samples, workouts, sessions, and tags
+- a timed sleep-stage hypnogram and a timed activity-class chart, plus overnight movement,
+  MET samples, workouts, sessions, and tags
+- fourteen-day trends on the score cards and on lowest heart rate, RMSSD, and temperature
+  deviation, drawn only from the cached records
 - ring battery, charging state, model, finish, firmware, size, and setup date
 - an inspectable OAuth permission and per-collection sync status area
 
@@ -198,8 +207,10 @@ The hosted bundle includes Swift Testing coverage for GATT/PLX admission,
 Bluetooth discovery state, transactional SQLite migration and indexed queries, retention and
 compaction provenance, archive/settings recovery, HealthKit outcomes and source relationships,
 real HRV observation intervals, pairwise grades/confidence intervals, exports, estimates, OAuth,
-and Oura deletion/durability behavior. A 7-flow XCUI suite exercises deterministic recovery,
-empty/error, data-control, evidence, and pseudo-localization states in the normal CI scheme.
+Oura deletion/durability behavior, and chart selection, zoom, period, and Oura chart
+projections. A 13-flow XCUI suite exercises deterministic recovery, empty/error,
+data-control, evidence, drill-down, chart-interaction, Oura chart, and pseudo-localization
+states in the normal CI scheme.
 The separate `HeartSyncCheckerPerformance` scheme writes the full fourteen-day 1 Hz workload;
 run it on a representative physical iPhone with Instruments before release.
 

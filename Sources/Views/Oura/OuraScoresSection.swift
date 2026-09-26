@@ -12,6 +12,11 @@ struct OuraScoresSection: View {
     var sleepScore: OuraClient.DailySleep?
     var resilience: OuraClient.DailyResilience?
     var stress: OuraClient.DailyStress?
+    /// Fourteen cached days of each score, from the same collections as the values above.
+    /// Resilience and stress are categories, not scores, so they have no bars.
+    var activityTrend: OuraDailyTrend? = nil
+    var readinessTrend: OuraDailyTrend? = nil
+    var sleepTrend: OuraDailyTrend? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -28,7 +33,8 @@ struct OuraScoresSection: View {
                     progress: activity?.score.map { Double($0) / 100 },
                     detail: OuraFormat.dayLabel(activity?.day),
                     icon: "figure.walk",
-                    tint: .orange
+                    tint: .orange,
+                    trend: activityTrend
                 )
                 OuraScoreCard(
                     title: "Readiness",
@@ -36,7 +42,8 @@ struct OuraScoresSection: View {
                     progress: readiness?.score.map { Double($0) / 100 },
                     detail: OuraFormat.dayLabel(readiness?.day),
                     icon: "bolt.heart.fill",
-                    tint: .green
+                    tint: .green,
+                    trend: readinessTrend
                 )
                 OuraScoreCard(
                     title: "Sleep",
@@ -44,7 +51,8 @@ struct OuraScoresSection: View {
                     progress: sleepScore?.score.map { Double($0) / 100 },
                     detail: OuraFormat.dayLabel(sleepScore?.day),
                     icon: "moon.stars.fill",
-                    tint: .indigo
+                    tint: .indigo,
+                    trend: sleepTrend
                 )
                 OuraScoreCard(
                     title: "Resilience",

@@ -13,6 +13,10 @@ struct OuraBiomarkersSection: View {
     var oxygen: OuraClient.DailySpO2?
     var cardiovascularAge: OuraClient.DailyCardiovascularAge?
     var vo2Max: OuraClient.VO2MaxDocument?
+    /// Fourteen cached nights or days of the values that have a daily history.
+    var lowestHeartRateTrend: OuraDailyTrend? = nil
+    var rmssdTrend: OuraDailyTrend? = nil
+    var temperatureDeviationTrend: OuraDailyTrend? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -48,7 +52,8 @@ struct OuraBiomarkersSection: View {
                 unit: "bpm",
                 detail: "Nightly low",
                 icon: "heart.circle.fill",
-                tint: .red
+                tint: .red,
+                trend: lowestHeartRateTrend
             ),
             OuraBiomarkerItem(
                 id: "hrv",
@@ -57,7 +62,8 @@ struct OuraBiomarkersSection: View {
                 unit: "ms",
                 detail: "Nightly average",
                 icon: "waveform.path.ecg",
-                tint: .purple
+                tint: .purple,
+                trend: rmssdTrend
             ),
             OuraBiomarkerItem(
                 id: "respiration",
@@ -93,7 +99,11 @@ struct OuraBiomarkersSection: View {
                 unit: "°C",
                 detail: "From your Oura baseline",
                 icon: "thermometer.medium",
-                tint: .orange
+                tint: .orange,
+                // Bars above and below the baseline, never an absolute temperature.
+                trend: temperatureDeviationTrend,
+                trendStyle: .deviation,
+                trendDigits: 1
             ),
             OuraBiomarkerItem(
                 id: "vo2-max",

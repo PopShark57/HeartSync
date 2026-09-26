@@ -202,6 +202,10 @@ struct OuraClient: Sendable {
         var target_calories: Int
         var target_meters: Int
         var total_calories: Int
+        /// Start of the activity day, a 24-hour period from 4 a.m. in the ring's zone; the
+        /// first `class_5_min` interval begins here. Optional so caches written before it
+        /// was read still decode.
+        var timestamp: String? = nil
     }
 
     struct DailyReadiness: Codable, Hashable, Sendable {

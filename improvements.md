@@ -24,14 +24,17 @@ section. One claim was dropped after checking: watchOS allows a workout app with
 session to update once per second in Always On, so the workout timer's 1-second
 `TimelineView` is not a defect.
 
-**Implementation status (2026-09-26): items 26–31 have since been implemented.** Items 26,
+**Implementation status (2026-09-26): items 26–35 have since been implemented.** Items 26,
 27, 28, 30 and 31 meet the code and test parts of their "Done when" paragraphs. Item 29
-is partial. Each item below ends with a status note that says what changed and what is
-still open. Every open point is a device, simulator, or on-screen check that this
-environment could not run. The "Observed behavior" paragraphs describe the code as
-reviewed, before those changes. Items 32–41 are unchanged. See
-[Implementation validation](#implementation-validation-items-2631) for exactly what was
-and was not executed.
+is partial. Items 32–35 meet the code and unit-test parts of theirs. Their UI tests are
+written, and CI gives them their first compile and run. Each item below ends with a status
+note that says what changed and what is still open. Every open point is a device,
+simulator, or on-screen check that this environment could not run. The "Observed
+behavior" paragraphs describe the code as reviewed, before those changes. Items 36–41 are
+unchanged. The implementation validation sections for
+[items 26–31](#implementation-validation-items-2631) and
+[items 32–35](#implementation-validation-items-3235) say exactly what was and was not
+executed.
 
 ### Priorities and suggested sequence
 
@@ -43,10 +46,10 @@ and was not executed.
 | 29 | P1 | Bound and coalesce the live screens' reloads during ingest | Performance risk; measure on device | M | Partial. Bounded, throttled and budgeted, but not measured on a device. One 30-day load still blocks the main actor (item 21) |
 | 30 | P1 | Break every chart line and band across data gaps; no overshooting curves | Observed honesty gap | S | Done. On-screen check still to do |
 | 31 | P1 | Fix colour collisions for colour-blind readers and between meanings | Measured | M | Done. Validator runs as a unit test; on-device visual check still to do |
-| 32 | P2 | Make the metric-detail chart scrubbable with an inline callout | Design proposal | M | Open |
-| 33 | P2 | Add pan, zoom, and period selection to history charts | Design proposal (+ observed axis gap) | M–L | Open |
-| 34 | P2 | Rebuild pairwise-chart selection on the native selection API | Design proposal (+ observed gaps) | M | Open |
-| 35 | P2 | Turn the Oura cards into real charts: heart rate, hypnogram, 14-day trends | Design proposal (+ observed legend gap) | M–L | Open |
+| 32 | P2 | Make the metric-detail chart scrubbable with an inline callout | Design proposal | M | Done in code. On-screen and VoiceOver checks still to do |
+| 33 | P2 | Add pan, zoom, and period selection to history charts | Design proposal (+ observed axis gap) | M–L | Done with buttons, not pinch or scroll (Apple chart bugs); see status |
+| 34 | P2 | Rebuild pairwise-chart selection on the native selection API | Design proposal (+ observed gaps) | M | Done in code. The list-scrolling device check is still to do |
+| 35 | P2 | Turn the Oura cards into real charts: heart rate, hypnogram, 14-day trends | Design proposal (+ observed legend gap) | M–L | Done in code. On-screen and VoiceOver checks still to do |
 | 36 | P2 | Give the Now tab sparklines, motion, and honest "live" labelling | Design proposal (+ observed wording issue) | M | Open |
 | 37 | P2 | Make dense charts work with VoiceOver, Audio Graphs, and Dynamic Type | Accessibility gap | M | Open |
 | 38 | P2 | Adapt layouts for iPad and landscape | Design proposal | M | Open |
@@ -185,6 +188,12 @@ span. UI tests cover both paths.
   - `testSavedSessionPeriodReachesDetailAndPair`: open the "Demo walk" session from the
     `--pairwise-demo` fixture. Banners replace pickers, and the pair reads "5 paired of 5"
     where the rolling range would read 8.
+
+Follow-up: the first CI run of `testMetricDetailKeepsTheChosenRangeAfterBack`, on `main`
+after the merge, failed at its two checks after Back. The list keeps the scroll offset it
+had when the pair was opened, so the picker's row was out of view when the test read it.
+The test now scrolls back up first (`scrollUpToElement`). This change landed with items
+32–35.
 
 ### 28. Stop re-running the pairwise analysis on every drag frame
 
@@ -530,6 +539,62 @@ Scrubbing shows a callout for every bucket, including the first and last, withou
 clipping. No store query runs during a scrub (depends on 28/29). VoiceOver can reach the
 same values (see 37). Estimated values stay labelled and never enter the band.
 
+**Implementation status (2026-09-26): done in code. The on-screen, haptic, and VoiceOver
+checks are still to do.**
+
+- **Selection.** The chart is now its own view, `MetricDetailChart`, so a touch-move
+  re-evaluates only the chart and not the list around it. It uses
+  `.chartXSelection(value:)`. The raw date snaps to the nearest drawn window by a binary
+  search over window starts, which `MetricChartProjection` sorts once per load. Selection
+  is `@State`, and it is not part of any load key, so a scrub never reads the store.
+- **Sticky selection with an empty-area rule.** A touch snaps to a window only when that
+  window is within 22 pt, half of Apple's 44 pt minimum hit target. The 22 pt are
+  converted to seconds from the chart's measured width. A touch farther than that from
+  every window is in empty plot area and clears the selection, instead of jumping to a
+  window hours away. Lifting the finger keeps the selection so the callout can be read.
+  **Clear selection**, a range change, a zoom, or a pan also clear it. Together, the
+  empty-area touch and **Clear selection** replace the proposed "tap outside the plot".
+- **Callout.** The selected window gets a dashed rule in the neutral selection ink and
+  larger points. Its annotation uses `overflowResolution` `.fit(to: .chart)` on both axes,
+  so it stays inside the chart at the first and last window. The callout
+  (`MetricWindowCallout`) lists:
+  - the window's span, and the words "window medians";
+  - each device's median, with its glyph and legend label;
+  - the spread against the metric's tolerances, for example "Spread 7 bpm, at or over the
+    5 bpm warning tolerance". When fewer than two measured devices reported, it says "Not
+    compared: fewer than two measured devices" instead;
+  - "Estimate: modelled, not measured" and "Compacted median: raw samples no longer
+    stored", where they apply.
+
+  The spread wording never says "agree". One window is not evidence, and the app requires
+  at least five paired windows for a conclusion. As on the band, estimates are excluded
+  from the spread.
+- **Haptics.** `.sensoryFeedback(.selection, trigger:)` fires on the snapped window's start,
+  so each new window ticks once rather than on every pixel.
+- **Legend emphasis.** Legend entries are now buttons. One emphasises a device and dims the
+  others' lines and points; no data is hidden. Entries are 44 pt tall and expose an
+  "Emphasised" value and the selected trait to VoiceOver.
+- **VoiceOver.** Each point has a label (device and time) and a value, for example "72 bpm,
+  window median", plus "estimate, not measured" or "compacted" where they apply. Lines and
+  band are hidden from VoiceOver, so each device's window is one stop. The callout is
+  hidden too, because it repeats those values.
+- **Tests.** `Tests/MetricDetailSelectionTests.swift` (12 tests) covers:
+  - every drawn window can be selected, including the first and the last;
+  - a touch in empty plot area selects nothing;
+  - the callout's order and flags;
+  - an estimate never creates or widens the spread;
+  - the tolerance wording, which never claims agreement;
+  - the callout's spread equals the band drawn at that window;
+  - the pinned domain;
+  - the screen-to-seconds conversion.
+
+Still open:
+
+- An on-screen look at the callout at the first and last window, in both appearances, at
+  large Dynamic Type sizes, and on iPad.
+- The haptic tick on a device.
+- A VoiceOver pass. The wider Audio Graph work stays with item 37.
+
 ### 33. Add pan, zoom, and period selection to history charts
 
 **Observed behavior**
@@ -576,6 +641,84 @@ and the visible bucket is stated. A brushed period can be saved and reopened wit
 identical bounds. The statistics for a brushed period match those of the same span opened
 as a saved session.
 
+**Implementation status (2026-09-26): done, with zoom and pan on buttons rather than pinch
+or chart scrolling. On-screen checks are still to do.**
+
+- **Pinned x domain.** Metric detail pins `.chartXScale(domain:)` to the resolved span. The
+  domain is widened back to the first bucket boundary so the first window is drawn inside
+  the plot. A 7D chart with one day of data now shows six empty days. The pair timeline and
+  the Oura charts pin their domains too (items 34 and 35).
+- **Why not chart scrolling.** This departs from the proposal. The chart does not use
+  `chartScrollableAxes`, `chartXVisibleDomain`, or a `MagnifyGesture`, because of two
+  Apple bugs reported in the Developer Forums:
+  - With `chartScrollableAxes`, a selection's annotation stops displaying at all
+    (FB12584128, [thread 733711](https://developer.apple.com/forums/thread/733711)).
+    Reports there run from July 2023 to June 2024, the most recent on iOS 18. The only
+    workaround posted overlays a second, non-scrolling chart to draw the annotation. The
+    `y: .fit(to: .chart)` workaround mentioned above (thread 737244) is about the
+    callout's placement, not this.
+  - Changing `chartXVisibleDomain` after the user has scrolled makes the chart jump to a
+    different stretch (FB14091989, [thread 757099](https://developer.apple.com/forums/thread/757099)).
+    Apple staff confirmed the jump in July 2024. The workaround they offered does not
+    cover animated changes.
+
+  The callout is the point of item 32, so zoom uses a pinned domain instead.
+  `ChartViewport` holds the visible span, and four buttons move it: **Zoom in**, **Zoom
+  out**, **Show earlier**, and **Show later**. Each is 44 pt and labelled, so VoiceOver and
+  UI tests can reach it.
+  - Zoom steps through the `TimeRange` spans shorter than the period: for a week, 24
+    hours, 6 hours, then 1 hour. It never goes narrower than one hour, or than four of the
+    metric's comparison windows.
+  - Zoom in centres on the selected window, or else on the newest drawn window.
+  - A pan moves half a span and stops at the period's edges. The last position ends
+    exactly at the period's end, so a rolling range's newest readings stay reachable even
+    though "now" is not on the bucket grid.
+  - A live reload leaves a viewport that still fits where the user put it.
+- **Semantic zoom.** A zoomed span is re-read from the store at its own bucket
+  (`MetricZoomSnapshot`). The bucket is the metric's comparison window, widened to the
+  preset that fits the span: the same rule the whole period uses. A week of heart rate
+  zooms in three steps to one hour drawn from 1-minute medians. A caption states the bucket
+  and span, for example "Showing 1-minute medians, 3 Sep 2026 at 10:00 – 11:00".
+  - The zoom read runs in `.task(id:)`, rejects late results, and coalesces data-only
+    reloads with `LiveReloadPolicy`.
+  - Until it arrives, the previous chart stays up, dimmed, with a progress indicator.
+  - A failed zoom read shows the retryable unavailable view, never an empty hour.
+  - Statistics, device pairs, and the per-device table still describe the whole analysed
+    period.
+- **Period selection.** **Select period** puts the chart in period mode. There, a drag
+  chooses a span, drawn as a neutral band, and **Use the span shown** takes the visible
+  span instead. The drag layer sits in `chartOverlay` rather than the proposed
+  `chartGesture`. It exists only in period mode, so the rest of the time the chart keeps the
+  built-in selection gesture. The span snaps outward to the drawn buckets and stays inside
+  the chart. Both ends are whole seconds, because the sessions archive stores ISO-8601
+  dates without fractions. The chosen period gets a **Selected period** section with:
+  - pair evidence for exactly that span (`MetricPeriodEvidence`), from the same read and
+    engine call that metric detail uses for a saved session over the same seconds;
+  - **Save as session…**, which opens the existing save sheet with the bounds and, new,
+    the metric filled in;
+  - **Clear period**.
+- **Tests.** `Tests/ChartZoomTests.swift` (13 tests) covers:
+  - the zoom steps and their floor;
+  - a week zoomed to one hour at 1-minute medians, with the bucket named;
+  - centring, zooming out, the pan edges, and the live edge;
+  - reload stability, the finer re-read, and a failed read;
+  - snapping.
+
+  Two of those tests pin the "Done when" paragraph. A brushed period has exactly the
+  statistics of the same span opened as a saved session. A brushed period saved through the
+  sessions archive reopens with identical bounds. The UI test
+  `testMetricDetailZoomNamesItsBucketAndOffersAPeriod` zooms from 15- to 5- to 1-minute
+  medians, takes the span shown, opens the save sheet, and zooms back out.
+
+Still open:
+
+- Pinch and swipe. If they are wanted, first re-test the two bugs above on the current iOS.
+  The buttons stay as the accessible path either way.
+- An on-screen look at the period band, the dimmed loading state, and the controls row at
+  large Dynamic Type sizes.
+- The zoom read with a month of 1 Hz data on a device. A one-hour zoom reads one hour,
+  but the whole-period snapshot still loads first, on the main actor (item 21).
+
 ### 34. Rebuild pairwise-chart selection on the native selection API
 
 **Observed behavior**
@@ -618,6 +761,64 @@ The list scrolls normally when a vertical swipe starts on a chart (device check)
 plotted point, including vertically stacked outliers, can be selected. VoiceOver users can
 step through windows. The selected window's key values are visible without scrolling.
 
+**Implementation status (2026-09-26): done in code. The list-scrolling device check and a
+VoiceOver pass are still to do.**
+
+- **Timeline.** Both charts are now views of their own (`PairwiseCharts.swift`). The
+  zero-distance drag overlays are gone. The timeline uses `.chartXSelection(value:)` with
+  the same sticky rule as metric detail. A touch snaps to a paired window within 22 pt,
+  a touch farther than that clears the selection, and lifting the finger keeps it. Its x
+  domain is pinned to the analysed span, so a stretch with no paired window stays visible.
+- **Bland–Altman.** A tap selects the point drawn nearest the finger in both x and y
+  (`ChartLookup.nearestIndex(to:in:within:)`). Each plotted point is placed with
+  `ChartProxy.position(forX:)` and `position(forY:)`, and the nearest one within 22 pt
+  wins. An outlier stacked above the dense cluster at the same paired mean can therefore
+  be selected on its own. A tap farther than that from every point clears the selection.
+  The recogniser is a tap in `chartOverlay`, not the proposed `chartGesture` drag. A tap
+  gives up as soon as the finger moves, so it cannot hold on to a scroll. This replaces
+  item 28's binary search over sorted paired means, which ignored the vertical axis. The
+  per-tap search is linear over at most 500 plotted points, and it runs once per tap, not
+  once per frame.
+- **Callouts.** Both charts show a compact callout at the selected window
+  (`PairwiseObservationCallout`). It fits inside the chart on both axes and shows:
+  - the time;
+  - A, B, and A − B, tinted by severity;
+  - the timing flag;
+  - "Outside the observed 95% limits", where that applies.
+
+  The full card below the charts stays for the other details.
+- **Deselect and haptics.** A touch in empty plot area on either chart clears the
+  selection, and so does **Clear selection**. `.sensoryFeedback(.selection, trigger:)`
+  ticks once per newly selected window.
+- **Stepping and VoiceOver.** **Previous window** and **Next window** buttons (44 pt,
+  labelled) step through the drawn windows and stop at either end. Both charts expose the
+  same steps as the named accessibility actions "Next paired window" and "Previous paired
+  window". Each paired window is one VoiceOver stop, with a spoken summary such as "3 Sep,
+  14:32, A 72, B 75, A minus B −3 bpm, outside limits", plus the timing and compacted
+  caveats. The old "Drag across the chart" hint is gone.
+- **Tests.** `Tests/PairwiseSnapshotTests.swift` grows from 8 to 13 tests. The item 28
+  nearest-mean test is replaced by a two-dimensional one, checked against a linear scan.
+  New tests cover:
+  - selecting a stacked outlier;
+  - a tap in empty plot area on either chart;
+  - stepping and its ends;
+  - the spoken summary;
+  - the pinned timeline domain.
+
+  The UI test `testPairSelectionStepsWithoutADragAndClears` steps with **Next**, finds the
+  selected card, and clears it.
+
+Still open:
+
+- The device check that a vertical swipe starting on either chart scrolls the list, and
+  that a sideways scrub on the timeline is not taken over by the list. One external
+  report describes the second problem with `chartXSelection` inside an iPhone scroll view
+  ([bainluck PR #8582](https://github.com/alexander-bain/bainluck/pull/8582): "a
+  press-and-drag drew a crosshair for a moment, then the page scrolled under his thumb").
+  If a device shows the same, **Previous** and **Next** still reach every window. A
+  hold-to-scrub recogniser is the fallback that report adopted.
+- A VoiceOver pass over the stepping actions and the spoken summaries.
+
 ### 35. Turn the Oura cards into real charts: heart rate, hypnogram, 14-day trends
 
 **Observed behavior**
@@ -655,6 +856,70 @@ step through windows. The selected window's key values are visible without scrol
 The stage or class at a chosen time can be read both visually and with VoiceOver. The
 legend covers every code the colour map draws. Trends use cached documents only, and add
 no new scopes or requests.
+
+**Implementation status (2026-09-26): done in code. On-screen and VoiceOver checks are
+still to do.**
+
+- **Hypnogram.** `OuraTimelineChart` draws the night in Swift Charts, with one
+  `RectangleMark` per run of identical stages. `OuraCategoryTimeline` times each run from
+  `bedtime_start` in five-minute steps.
+  - Rows run Awake, REM, Light, Deep from top to bottom, under an hour axis.
+  - `chartXSelection` shows the run under the finger, for example "REM · 02:10–02:35 ·
+    25m". The selection stays after the finger lifts, and a touch in an unclassified gap
+    clears it.
+  - Each run is its own VoiceOver element that names the stage and its times. The chart
+    as a whole reads the night's span and the total per stage.
+  - A code Oura does not define becomes a counted gap, never a guessed stage.
+  - Without stage codes or a parseable bedtime, the card keeps the untimed ribbon from
+    item 31.
+  - The caption keeps "Oura's stage classification, not HeartSync's". Stage colours
+    follow item 31's lightness ramp. The row already identifies a stage, so Awake is not
+    hatched on the chart; the fallback ribbon and its legend keep the hatch.
+- **Movement.** The same chart shows the activity day's classes, timed from
+  `DailyActivity.timestamp`. Oura's activity day is a 24-hour period that starts at
+  4 a.m. The DTO gains `timestamp` as an optional field. A cache written before this
+  change decodes unchanged and keeps the untimed ribbon, because no clock is guessed for
+  it. The legend now includes **Non-wear**. It is generated from `OuraMovementClass`, the
+  same type the colour map uses, so it covers every code the map can draw.
+- **Fourteen-day trends.** The Readiness, Sleep, and Activity score cards show bars. The
+  lowest heart rate and RMSSD biomarkers show lines, and temperature deviation shows bars
+  above and below a neutral zero rule. `OuraDailyTrend` builds each one from the cached
+  snapshot only:
+  - fourteen calendar days, ending at the newest cached day;
+  - the first document per day wins, as in the card's headline;
+  - nightly values come from each day's main sleep, the one the headline shows;
+  - a missing day is an empty slot, and lines break there;
+  - days are keyed by Oura's own day string, so a day never shifts to its neighbour in a
+    time zone west of Greenwich.
+
+  The latest day is drawn strongest. A tap shows another day's value in the card, for
+  example "Sep 3: 82" or "Sep 1: no score". Temperature deviation reads "… from baseline"
+  and is never drawn as an absolute temperature. VoiceOver hears one sentence per card,
+  for example "Last 14 days: 12 of 14 days reported, from 61 to 88, latest 82 on Sep 3".
+  No request, scope, or sync window changed.
+- **Heart rate.** `OuraHeartRateChart` is selectable. A drag snaps to the nearest drawn
+  sample within 22 pt and shows its time and bpm; a touch in an upload gap clears the
+  selection. The x domain is pinned to the 24 hours that end at the newest cached sample,
+  so a gap stays visible. Item 30's segmentation is unchanged.
+- **Fixture.** In Debug builds, `--ui-test-ouraCharts` injects fourteen days of Oura
+  documents. They include a charging gap, a missing night, and a missing readiness day.
+  The UI test `testOuraChartsDrawStagesMovementHeartRateAndTrends` scrolls through the
+  new charts' captions and the trend sentence.
+- **Tests.** `Tests/OuraChartTests.swift` (16 tests) covers:
+  - run timing and the run at a chosen moment;
+  - undefined codes, and the ribbon fallback;
+  - movement timing, and a legacy cache that decodes without a clock;
+  - legend coverage, including non-wear;
+  - the fourteen-day span, first-document-wins, and gaps and line breaks;
+  - the spoken summary;
+  - temperature as a signed deviation;
+  - main-sleep selection;
+  - the UI fixture;
+  - heart-rate selection, which selects nothing inside a gap.
+
+Still open: an on-screen look at the hypnogram, movement chart, and trends in both
+appearances and at large Dynamic Type sizes, and a VoiceOver pass that reads a stage and a
+class with their times.
 
 ### 36. Give the Now tab sparklines, motion, and honest "live" labelling
 
@@ -920,6 +1185,60 @@ The implementation ran in a Linux container without Xcode, an iOS simulator, or 
 - New interface strings reach `Resources/Localizable.xcstrings` on the next Xcode build,
   as with earlier changes. The catalog was not edited by hand.
 
+### Implementation validation (items 32–35)
+
+This implementation also ran in a Linux container without Xcode, an iOS simulator, or a
+device.
+
+**Executed**
+
+- The same scratch SwiftPM harness, outside the repository, with Swift 6.1.3 on Linux
+  (x86-64), Swift 6 language mode, and complete concurrency checking. Its closure gains
+  the new Foundation-only files: `ChartLookup`, `ChartViewport`, `MetricChartProjection`,
+  `Oura/OuraCategoryTimeline`, `Oura/OuraMovementClass`, and `Oura/OuraDailyTrend`.
+- 409 of the 463 hosted unit tests ran, including every new or changed suite:
+
+  | Suite | Tests |
+  | --- | ---: |
+  | `MetricDetailSelectionTests` | 12 |
+  | `ChartZoomTests` | 13 |
+  | `OuraChartTests` | 16 |
+  | `PairwiseSnapshotTests` | 13 |
+
+- 404 passed. The five failures belong to this container, and the same five fail on
+  `main` here:
+  - Four archive and settings tests make a file unreadable with `chmod 000` and expect
+    the read to fail. The container runs as root, which ignores file permissions.
+  - The watch complication cache test checks `isExcludedFromBackup`, which Linux
+    Foundation does not implement. It was the one failure in the items 26–31 run.
+- The 54 tests not run are the same HealthKit and CoreBluetooth suites as before. None of
+  them calls an API this change altered.
+- The Oura chart fixture behind `--ui-test-ouraCharts` compiled and ran in the harness,
+  through its unit test.
+
+**Not compiled or run here**
+
+- Not compiled: the new and changed SwiftUI views (`MetricDetailChart`,
+  `MetricDetailView`, `PairwiseCharts`, `PairwiseAnalysisView`, `ComparisonSessionsView`,
+  `OuraTimelineChart`, `OuraTrendChart`, and the Oura card and section views), the
+  `AppModel` scenario hook, and the UI tests. Their Swift Charts and SwiftUI calls were
+  checked against Apple's documentation, for example `chartXSelection(value:)`,
+  `ChartProxy.position(forX:)`, `plotFrame`, `value(atX:as:)`,
+  `AnnotationOverflowResolution`, `sensoryFeedback(_:trigger:condition:)`, and
+  `onGeometryChange(for:of:action:)`. CI's `xcodebuild test` is their first compile and
+  the first run of the three new UI tests.
+- Not done:
+  - simulator or device runs;
+  - VoiceOver, Dynamic Type, and dark-appearance passes;
+  - on-screen checks of the callouts, the period band, the hypnogram, and the trends;
+  - haptics;
+  - the list-scrolling device check in item 34.
+- Persisted data: `DailyActivity.timestamp` is optional, so earlier Oura caches decode
+  unchanged (tested). `ComparisonSession` is unchanged; the save sheet now fills its
+  existing optional `metric`. No stable ID, persisted raw value, or database schema changed.
+- New interface strings reach `Resources/Localizable.xcstrings` on the next Xcode build.
+  The catalog was not edited by hand.
+
 ### Sources
 
 - Apple, WWDC23: [Explore pie charts and interactivity in Swift Charts](https://developer.apple.com/videos/play/wwdc2023/10037/).
@@ -967,6 +1286,32 @@ Checked while implementing items 26–31:
 - Apple documentation: [`ChartSymbolShape`](https://developer.apple.com/documentation/charts/chartsymbolshape)
   (built-in shapes include `circle`, `square`, `triangle`, `diamond`, `pentagon`, and
   `cross`), and Swift with Majid, [Mastering charts in SwiftUI: mark styling](https://swiftwithmajid.com/2023/01/18/mastering-charts-in-swiftui-mark-styling/).
+
+Checked while implementing items 32–35:
+
+- Apple Developer Forums: [SwiftUI chart annotation not working when using chartScrollableAxes](https://developer.apple.com/forums/thread/733711)
+  (FB12584128; reports from July 2023 to June 2024, the most recent on iOS 18; the only
+  posted workaround draws the annotation on a second, non-scrolling chart).
+- Apple Developer Forums: [Swift Charts: Changing chartXVisibleDomain changes chartScrollPosition](https://developer.apple.com/forums/thread/757099)
+  (FB14091989; an Apple staff reply in July 2024 confirms the jump and offers a workaround
+  that does not cover animated changes).
+- alexander-bain/bainluck, [PR #8582](https://github.com/alexander-bain/bainluck/pull/8582)
+  (with `chartXSelection` inside an iPhone scroll view, "a press-and-drag drew a crosshair
+  for a moment, then the page scrolled under his thumb"; the project moved to a
+  hold-to-scrub recogniser).
+- Apple documentation: [`chartXSelection(value:)`](https://developer.apple.com/documentation/swiftui/view/chartxselection(value:)),
+  [`ChartProxy.plotFrame`](https://developer.apple.com/documentation/charts/chartproxy/plotframe),
+  [`ChartProxy.position(forX:)`](https://developer.apple.com/documentation/charts/chartproxy/position(forx:))
+  (positions are relative to the plot), [`ChartProxy.value(atX:as:)`](https://developer.apple.com/documentation/charts/chartproxy/value(atx:as:)),
+  [`AnnotationOverflowResolution`](https://developer.apple.com/documentation/charts/annotationoverflowresolution),
+  [`sensoryFeedback(_:trigger:condition:)`](https://developer.apple.com/documentation/swiftui/view/sensoryfeedback(_:trigger:condition:)),
+  and [`onGeometryChange(for:of:action:)`](https://developer.apple.com/documentation/swiftui/view/ongeometrychange(for:of:action:)).
+- Oura for Organizations: [Understanding the Different Types of Oura Days in Oura API Data](https://partnersupport.ouraring.com/hc/en-us/articles/29160913203219-Understanding-the-Different-Types-of-Oura-Days-in-Oura-API-Data)
+  (the Activity Day runs from 4 a.m. to 4 a.m. and carries the first day's date). The
+  field descriptions for `daily_activity.timestamp` ("Timestamp of the daily activity"),
+  `class_5_min`, `sleep_phase_5_min`, and `bedtime_start` were checked in the
+  [@pinta365/oura-api type documentation](https://jsr.io/@pinta365/oura-api/doc) listed
+  above.
 
 ### Appendix: palette colour-vision check
 
