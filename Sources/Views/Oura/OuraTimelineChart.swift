@@ -59,7 +59,8 @@ struct OuraTimelineChart<Category: Hashable & Sendable>: View {
                         }
                         .fixedSize()
                         .padding(6)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .foregroundStyle(.primary)
+                        .background(HeartSyncTheme.Chart.calloutBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .accessibilityHidden(true)
                     }
             }

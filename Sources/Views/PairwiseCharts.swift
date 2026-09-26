@@ -364,7 +364,8 @@ struct PairwiseObservationCallout: View {
         .monospacedDigit()
         .fixedSize()
         .padding(7)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .foregroundStyle(.primary)
+        .background(HeartSyncTheme.Chart.calloutBackground, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .strokeBorder(.secondary.opacity(0.25))

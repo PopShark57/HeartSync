@@ -50,6 +50,17 @@ final class HeartSyncCheckerUITests: XCTestCase {
         add(attachment)
     }
 
+    /// A chart can be hittable while most of it is still behind the tab bar. Bring the
+    /// whole plot into view before selecting and capturing it for visual review.
+    private func revealChart(_ identifier: String, in application: XCUIApplication) -> XCUIElement {
+        let chart = element(identifier, in: application)
+        XCTAssertTrue(scrollToElement(chart, in: application, attempts: 10))
+        if chart.frame.maxY > application.frame.maxY - 120 {
+            application.swipeUp()
+        }
+        return chart
+    }
+
     override func tearDown() {
         // A test that rotated the device must not leave the next one in landscape.
         XCUIDevice.shared.orientation = .portrait
@@ -338,8 +349,21 @@ final class HeartSyncCheckerUITests: XCTestCase {
     /// selectable heart-rate chart, and fourteen-day trends from cached documents only.
     func testOuraChartsDrawStagesMovementHeartRateAndTrends() {
         let application = launch("ouraCharts")
-        application.buttons["Oura"].tap()
+        application.buttons.matching(identifier: "Oura").firstMatch.tap()
 
+        for (identifier, title) in [
+            ("oura.heartRate", "Oura heart-rate selection"),
+            ("oura.hypnogram", "Oura sleep selection"),
+            ("oura.movement", "Oura movement selection"),
+        ] {
+            let chart = revealChart(identifier, in: application)
+            chart.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5)).press(forDuration: 1)
+            attachScreenshot(title, of: application)
+        }
+        // Reset the scroll position before the existing section-content checks.
+        application.terminate()
+        application.launch()
+        application.buttons.matching(identifier: "Oura").firstMatch.tap()
         let heartRate = application.staticTexts["Drag across the chart to read a sample's time and heart rate."]
         XCTAssertTrue(scrollToElement(heartRate, in: application))
         let hypnogram = application.staticTexts["Oura's stage classification, not HeartSync's. Drag across the chart to read a stage and its times."]
@@ -380,29 +404,68 @@ final class HeartSyncCheckerUITests: XCTestCase {
         let application = XCUIApplication()
         application.launchArguments = ["--chart-gallery"]
         application.launch()
-        XCTAssertTrue(application.buttons["Now"].waitForExistence(timeout: 10))
-        application.buttons["Now"].tap()
+        XCTAssertTrue(application.buttons.matching(identifier: "Now").firstMatch.waitForExistence(timeout: 10))
+        application.buttons.matching(identifier: "Now").firstMatch.tap()
         XCTAssertTrue(element("now.sparkline.heartRate", in: application).waitForExistence(timeout: 10))
         attachScreenshot("Now", of: application)
 
-        application.buttons["Compare"].tap()
+        application.buttons.matching(identifier: "Compare").firstMatch.tap()
         openHeartRate(in: application)
         let range = element("metric.range", in: application)
         XCTAssertTrue(range.waitForExistence(timeout: 10))
+        let chart = element("metric.chart", in: application)
+        XCTAssertTrue(chart.waitForExistence(timeout: 10))
+        chart.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.5))
+            .press(forDuration: 1, thenDragTo: chart.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5)))
+        let clear = element("metric.clearSelection", in: application)
+        XCTAssertTrue(clear.waitForExistence(timeout: 5), "A scrub keeps its selection after the finger lifts")
+        attachScreenshot("Heart rate, selected window", of: application)
+        clear.tap()
+        XCTAssertTrue(waitForDisappearance(of: clear))
+
         range.buttons["30D"].tap()
-        XCTAssertTrue(element("metric.chart", in: application).waitForExistence(timeout: 10))
-        attachScreenshot("Metric detail, 30 days", of: application)
+        XCTAssertTrue(chart.waitForExistence(timeout: 10))
+        chart.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.5)).press(forDuration: 1)
+        XCTAssertTrue(clear.waitForExistence(timeout: 5))
+        attachScreenshot("Metric detail, 30 days, selected window", of: application)
 
         let pair = element("metric.pair", in: application)
         XCTAssertTrue(scrollToElement(pair, in: application))
         pair.tap()
         XCTAssertTrue(element("pairwise.range", in: application).waitForExistence(timeout: 10))
-        attachScreenshot("Pairwise", of: application)
+        let next = element("pairwise.next", in: application)
+        XCTAssertTrue(scrollToElement(next, in: application))
+        // Starting from no selection picks the first window, exercising an edge callout.
+        next.tap()
+        XCTAssertTrue(element("pairwise.clearSelection", in: application).waitForExistence(timeout: 5))
+        XCTAssertTrue(scrollUpToElement(element("pairwise.timeline", in: application), in: application))
+        attachScreenshot("Pairwise timeline, selected window", of: application)
+        _ = revealChart("pairwise.difference", in: application)
+        attachScreenshot("Pairwise difference, selected window", of: application)
 
         XCUIDevice.shared.orientation = .landscapeLeft
         attachScreenshot("Pairwise, landscape", of: application)
-        application.buttons["Now"].tap()
+        application.buttons.matching(identifier: "Now").firstMatch.tap()
         attachScreenshot("Now, landscape", of: application)
+
+        // Sparse daily values exercise the other reported tooltip, including its
+        // estimate and insufficient-comparison labels. Restart to reset navigation.
+        XCUIDevice.shared.orientation = .portrait
+        application.terminate()
+        application.launch()
+        application.buttons.matching(identifier: "Compare").firstMatch.tap()
+        let compareRange = element("compare.range", in: application)
+        XCTAssertTrue(compareRange.waitForExistence(timeout: 10))
+        compareRange.buttons["7D"].tap()
+        let vo2 = application.buttons.matching(NSPredicate(
+            format: "label BEGINSWITH %@", "VO\u{2082} Max"
+        )).firstMatch
+        XCTAssertTrue(vo2.waitForExistence(timeout: 10))
+        vo2.tap()
+        let sparseChart = revealChart("metric.chart", in: application)
+        sparseChart.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5)).press(forDuration: 1)
+        XCTAssertTrue(element("metric.clearSelection", in: application).waitForExistence(timeout: 5))
+        attachScreenshot("VO2 max, selected daily window", of: application)
     }
 
     func testSavedSessionPeriodReachesDetailAndPair() {

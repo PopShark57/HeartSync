@@ -292,7 +292,8 @@ struct MetricWindowCallout: View {
         .fixedSize(horizontal: false, vertical: true)
         .padding(8)
         .frame(maxWidth: 230, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .foregroundStyle(.primary)
+        .background(HeartSyncTheme.Chart.calloutBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(.secondary.opacity(0.25))
