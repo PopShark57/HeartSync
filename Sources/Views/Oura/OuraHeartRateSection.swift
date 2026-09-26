@@ -156,7 +156,8 @@ struct OuraHeartRateChart: View {
                         .fixedSize()
                         .padding(.horizontal, 7)
                         .padding(.vertical, 4)
-                        .background(.regularMaterial, in: Capsule())
+                        .foregroundStyle(.primary)
+                        .background(HeartSyncTheme.Chart.calloutBackground, in: Capsule())
                         .accessibilityHidden(true)
                 }
             }

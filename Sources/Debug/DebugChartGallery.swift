@@ -101,6 +101,11 @@ enum DebugChartGallery {
             if dayIndex.isMultiple(of: 3) {
                 readings.append(reading(watchID, .vo2Max, 44 + wave, midnight.addingTimeInterval(12 * 3_600)))
             }
+            // A second measured source makes sparse VO2 history reachable from Compare.
+            // Its alternate days also exercise the single-device/insufficient-evidence callout.
+            if dayIndex % 3 == 1 {
+                readings.append(reading(ringID, .vo2Max, 43 + wave, midnight.addingTimeInterval(12 * 3_600)))
+            }
             readings.append(reading(estimateSourceID, .vo2Max, 46 + wave * 1.5, midnight.addingTimeInterval(12 * 3_600 + 60), provenance: .estimated))
         }
 

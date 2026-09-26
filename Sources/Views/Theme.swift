@@ -46,6 +46,10 @@ enum HeartSyncTheme {
         static var cautionInk: Color { .orange }
         /// Heart-rate traces from a single cloud source (Oura), which has no palette slot.
         static var heartRateInk: Color { .pink }
+        /// Opaque, adaptive surface for chart annotations. Backdrop-blurring materials
+        /// can render as dark bands inside Swift Charts' annotation renderer.
+        static var calloutBackground: Color { Color(uiColor: .secondarySystemBackground) }
+
         /// Fill opacity of the spread band behind per-device lines.
         static let bandOpacity: Double = 0.14
 
