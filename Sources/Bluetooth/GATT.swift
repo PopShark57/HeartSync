@@ -3,11 +3,12 @@ import Foundation
 
 /// Bluetooth SIG assigned numbers for the services and characteristics HeartSync speaks.
 ///
-/// Everything here is from the public GATT specification, which is what generic
+/// Almost everything here is from the public GATT specification, which is what generic
 /// heart-rate straps, most chest sensors, and standards-compliant rings and pulse
-/// oximeters actually advertise. There is deliberately no vendor-proprietary path: a
-/// device that does not speak these standard profiles is not supported, and
-/// `BluetoothManager` reports that rather than guessing at a private protocol.
+/// oximeters actually advertise. The one vendor exception is the YCBT ring service below,
+/// used only by `R11MRingSession` after its topology and identity reply match. Any other
+/// device that does not speak the standard profiles is reported as unsupported rather than
+/// probed with a guessed private protocol.
 enum GATT {
 
     // MARK: Services
@@ -31,10 +32,31 @@ enum GATT {
         healthThermometerService,
     ]
 
-    /// Services to interrogate once connected.
+    /// Yucheng YCBT vendor service found on some rings sold as R11M. See `R11MRingSession`
+    /// for why it is candidate support, and what must match before a command is written.
+    static let ycbtService = CBUUID(string: R11MRingSession.serviceUUID)
+    /// YCBT command writes and replies.
+    static let ycbtCommand = CBUUID(string: R11MRingSession.commandCharacteristicUUID)
+    /// YCBT ring-initiated measurement events.
+    static let ycbtEvents = CBUUID(string: R11MRingSession.eventCharacteristicUUID)
+
+    /// Services to interrogate once connected. A diagnostic session passes `nil` instead,
+    /// for one connection, to inventory everything the device exposes.
     static let discoverServices: [CBUUID] = scanServices + [
         batteryService,
         deviceInformationService,
+        ycbtService,
+    ]
+
+    /// Characteristics whose every packet is a measurement attempt. Counted before parsing,
+    /// so diagnostics can tell a silent sensor from one whose packets are rejected.
+    static let measurementCharacteristics: Set<CBUUID> = [
+        heartRateMeasurement,
+        plxContinuousMeasurement,
+        plxSpotCheckMeasurement,
+        temperatureMeasurement,
+        intermediateTemperature,
+        ycbtEvents,
     ]
 
     // MARK: Characteristics
@@ -99,6 +121,7 @@ enum GATT {
         case healthThermometerService:  "Thermometer"
         case batteryService:            "Battery"
         case deviceInformationService:  "Device Info"
+        case ycbtService:               "Ring protocol"
         default:                        uuid.uuidString
         }
     }

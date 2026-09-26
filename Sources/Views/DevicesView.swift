@@ -211,14 +211,19 @@ struct DevicesView: View {
         Section {
             ForEach(bluetoothSources) { source in
                 let state = model.bluetooth.connectionState(forSource: source.id)
-                SourceRow(
-                    source: source,
-                    statusText: source.isEnabled ? state.title : "Paused",
-                    statusColor: statusColor(for: state, enabled: source.isEnabled),
-                    battery: source.batteryPercent,
-                    hrvProgress: bluetoothDetailText(for: source)
-                )
-                .accessibilityIdentifier("source.\(source.id)")
+                VStack(alignment: .leading, spacing: 6) {
+                    SourceRow(
+                        source: source,
+                        statusText: source.isEnabled ? state.title : "Paused",
+                        statusColor: statusColor(for: state, enabled: source.isEnabled),
+                        battery: source.batteryPercent,
+                        hrvProgress: bluetoothDetailText(for: source)
+                    )
+                    .accessibilityIdentifier("source.\(source.id)")
+                    if source.isEnabled, let ring = model.bluetooth.ringSession(forSource: source.id) {
+                        ringControls(ring, source: source)
+                    }
+                }
                 // No full swipe: with it, one long gesture performed Remove and deleted the
                 // device's whole history, which for Bluetooth cannot be downloaded again.
                 // Remove now only proposes; the dialog states what would be deleted.
@@ -251,6 +256,20 @@ struct DevicesView: View {
                         }
                     }
                     Button("Reconnect") { model.bluetooth.reconnect(sourceID: source.id) }
+                    Button("Run Bluetooth diagnostics") {
+                        model.bluetooth.runDiagnostics(sourceID: source.id)
+                    }
+                    .disabled(!model.bluetooth.isPoweredOn || !source.isEnabled)
+                    if let report = model.bluetooth.diagnosticsReport(forSource: source.id, deviceName: source.displayName) {
+                        // Explicit export only. The report can contain raw packets from a
+                        // diagnostic session, which are health data.
+                        ShareLink(
+                            item: report,
+                            preview: SharePreview("Bluetooth diagnostics for \(source.displayName)")
+                        ) {
+                            Label("Export diagnostics\u{2026}", systemImage: "doc.text.magnifyingglass")
+                        }
+                    }
                     Button("Rename") { renamingSource = source }
                     Button("Remove\u{2026}", role: .destructive) { proposeRemoval(source) }
                 }
@@ -274,7 +293,32 @@ struct DevicesView: View {
         } header: {
             Text("Bluetooth sensors")
         } footer: {
-            Text("Works with any device using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles \u{2014} most chest straps, many rings, and standards-compliant pulse oximeters.")
+            Text("Works with devices using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles, such as most chest straps and standards-compliant pulse oximeters. Some rings only measure on request through a vendor protocol. HeartSync has candidate support for one such protocol (YCBT) and offers Measure heart rate once the ring has identified itself. Use Run Bluetooth diagnostics from a device's menu to see what it sends.")
+        }
+    }
+
+    /// On-demand measurement for a ring whose vendor protocol was identified. The ring does
+    /// not measure continuously, so nothing starts without this explicit action.
+    @ViewBuilder
+    private func ringControls(_ ring: R11MRingSession, source: DataSource) -> some View {
+        if ring.isMeasuring {
+            Button {
+                model.bluetooth.cancelRingMeasurement(sourceID: source.id)
+            } label: {
+                Label("Cancel measurement", systemImage: "stop.circle")
+                    .font(.caption.weight(.medium))
+            }
+            .buttonStyle(.borderless)
+            .accessibilityHint("Asks the ring to stop measuring. Nothing from this measurement is saved.")
+        } else if ring.canStartMeasurement {
+            Button {
+                model.bluetooth.measureHeartRate(sourceID: source.id)
+            } label: {
+                Label("Measure heart rate", systemImage: "heart.text.square")
+                    .font(.caption.weight(.medium))
+            }
+            .buttonStyle(.borderless)
+            .accessibilityHint("Asks the ring for one heart-rate measurement. Keep the ring on your finger and still for about a minute.")
         }
     }
 
