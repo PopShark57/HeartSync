@@ -41,6 +41,32 @@ version, app commit, sensor models and firmware, date, and tester beside the rel
 - [ ] Background and lock the app during collection, walk out of range and return, then
   terminate and relaunch through CoreBluetooth restoration. Confirm no duplicate or invented
   readings.
+- [ ] Standard heart rate without R-R intervals says "Ready for 1 metric", not three, and
+  never shows HRV. With the sensor off the body, the stall message names the rejection
+  ("sensor reports no contact"); with the sensor silent, it says no packets arrived.
+- [ ] Reconnect on a connected device disconnects, reconnects once, and rediscovers. Pause
+  during Reconnect does not reconnect. A foreground refresh leaves a streaming device alone.
+- [ ] Run Bluetooth diagnostics and export the report. Confirm it lists every service and
+  characteristic, per-characteristic packet counts, rejections, and raw packets only from
+  the 60-second diagnostic session.
+
+### Vendor ring (YCBT candidate, RingFix.md)
+
+Keep every other ring app disconnected so the result belongs to HeartSync's own session.
+Record the ring's model, firmware, and the diagnostic report with each result.
+
+- [ ] The ring row reaches "Connected; waiting for ring measurement." and offers Measure
+  heart rate. A ring without the YCBT service, or one that never answers the identity
+  query, keeps the standard path and never offers the button.
+- [ ] Measure heart rate on the finger: the row shows provisional values, then "Last measured
+  N BPM at T". Exactly one reading appears in history under the ring's Bluetooth source,
+  timed at the last live value, and it matches the ring's own app within its tolerance.
+- [ ] Off the finger: the ring's no-contact result is shown and nothing is stored. No warm-up
+  or zero value is stored. Cancel stops the ring. Repeat a measurement after completion,
+  after Cancel, and after Reconnect.
+- [ ] Standard `2A37` notifications from the same ring are not stored while the vendor
+  session owns heart rate (diagnostics count them as superseded).
+- [ ] A chest strap and a standard pulse oximeter still work unchanged.
 
 ## Apple Health
 
@@ -111,6 +137,19 @@ version, app commit, sensor models and firmware, date, and tester beside the rel
   around zero and labelled "from baseline".
 
 ## Interface and accessibility
+
+- [ ] Now: each card's sparkline breaks at gaps and stops at the last completed window. The
+  Sources header is absent when no source is connected; Apple Health and Oura chips say
+  "Synced …" or "Waiting", never "Live". The heart glyph pulses only while a Bluetooth
+  source streams, and neither it nor the numbers animate with Reduce Motion on.
+- [ ] Changing the range on Compare or metric detail immediately shows "Updating for the
+  new selection…" and dims the old results until the new ones land.
+- [ ] VoiceOver at the largest accessibility size: metric detail, pair, and Oura heart-rate
+  points read with source, time, value, and caveats; the Audio Graph names each device.
+  No chart's plot area collapses.
+- [ ] iPad in both orientations and iPhone in landscape: the sidebar lists five
+  destinations, Now shows several card columns, Compare shows metrics beside detail, and no
+  metric chip is clipped on Devices. Compare the CI screenshots with the device.
 
 - [ ] Run the complete UI suite, including the doubled-string pseudo-localization launch.
 - [ ] Manually inspect all five tabs with VoiceOver, Accessibility Extra Extra Extra Large,

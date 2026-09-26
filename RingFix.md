@@ -6,6 +6,33 @@
 **Scope:** The ring itself, through direct BLE. No SmartHealth or Apple Health data source, bridge, or fallback.  
 **Change made by this review:** This document only. All implementation changes below are proposals.
 
+## Implementation status (2026-09-26)
+
+Steps 1–4 below are implemented. The protocol path is **still unverified on hardware**:
+nothing here connected to a ring, so the completion criterion in section 8 is not yet met.
+
+| Step | Where | State |
+| --- | --- | --- |
+| 1. Diagnostics | `Sources/Bluetooth/BluetoothDiagnostics.swift`, Devices › device menu › Run Bluetooth diagnostics / Export diagnostics | Done. Full `discoverServices(nil)` only in a diagnostic session. Packets counted before parsing, per characteristic. Named rejections. Commands tracked as sent, written, and failed, apart from the ring's acceptance. Forwarded is distinct from saved. Raw packets only for 60 seconds of a diagnostic session, at most 200, export only. |
+| 2. Ring adapter | `Sources/Bluetooth/YCBTFrameCodec.swift`, `Sources/Bluetooth/R11MRingSession.swift` | Done as a candidate. Chosen from topology, not name. Waits for both channel subscriptions, then sends one read-only identity query (`02 00`, `"GC"`). Measurement is offered only after a CRC-valid identity reply, and starts only on Measure heart rate (`03 2F`, `01 00`). Fragmented frames reassemble within 512 bytes; bad length or CRC produces nothing. Live `06 01` values are provisional; the `04 0E` completion event emits the last one through `emit` → `AppModel.ingest` → `HealthStore`. No contact (`02`), rejection, and timeout (90 s, then stop) store nothing. SpO₂ is recognized but not requested or stored. Standard `2A37` from an identified ring is not ingested. |
+| 3. Readiness | `BluetoothDiscoveryState`, `PeripheralConnectionState.resolving`, `StreamCadence` | Done. Heart rate counts as one metric; HRV appears only from real R–R intervals. Vendor channels make a link ready without adding metrics. Observed metrics survive late callbacks. The watchdog follows cadence (30 s to 10 min) and says whether it saw silence, rejected packets, or a stopped stream. A ring's spot reading ages normally; no watchdog runs for it. |
+| 4. Reconnect | `BluetoothManager.reconnect`, `beginFreshSession` | Done. A connected link is cancelled, and one new connection starts from its disconnect callback, bypassing the backoff (10 s fallback if the callback never comes). Pause, forget, and radio-off cancel it. Delayed work checks a per-link session number. A foreground refresh no longer rediscovers a live link. |
+
+Where the framing came from: the frame layout (`group | command | length LE | payload | CRC
+LE`, CRC-16/CCITT-FALSE, total length including header and CRC) and the `04 0E` completion
+event are from independent public write-ups of R11M-reporting and YCBT rings
+([vitals-smart-ring-app PROTOCOL.md](https://github.com/narey83/vitals-smart-ring-app/blob/main/PROTOCOL.md),
+[PulseLoopAndroid issue 59](https://github.com/foureight84/PulseLoopAndroid/issues/59)). The
+same write-up reports that this firmware's `2A37` contact bit says "not detected" while
+readings are genuine. That may explain the observed silence, because HeartSync correctly
+discards off-body frames. The contact check was not weakened. The vendor completion result
+is used for that ring instead.
+
+Tests: `Tests/RingSessionTests.swift` (codec vectors, reassembly, topology selection,
+subscription gating, warm-up, completion, no contact, rejection, timeouts, cancel and
+repeat, readiness, late callbacks, stall diagnosis, capture bounds, cadence). Hardware
+acceptance steps are in `RELEASE_CHECKLIST.md` under "Vendor ring".
+
 ## 1. Diagnosis
 
 HeartSync can connect to the R11M and subscribe to a recognized measurement characteristic, but that does not establish that the ring is actively measuring or delivering usable measurements.

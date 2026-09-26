@@ -320,6 +320,7 @@ final class BluetoothManager: NSObject {
         guard let uuid = UUID(uuidString: sourceID), let peripheral = peripherals[uuid] else { return }
         cancelFreshReconnect(for: uuid)
         cancelPendingReconnect(for: uuid)
+        fullDiscoveryRequested.remove(uuid)
         // Stop a running ring measurement while the link can still carry the command.
         stopRingMeasurement(on: peripheral)
         central.cancelPeripheralConnection(peripheral)

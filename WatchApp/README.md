@@ -67,6 +67,10 @@ in the Smart Stack.
   neither phone delivery nor complication refresh has a guaranteed interval. A disconnected
   watch can retain old data until a new context arrives. Missing/unreadable data prompts the
   user to open HeartSync. Measurement views use `privacySensitive()` for system redaction.
+- The circular complication is an `accessoryCircular` gauge over the metric's nominal
+  display range. The value sits in the centre; the ring's opening shows **Older** or
+  **Median** when either applies, otherwise the metric's short name. An older reading shows
+  an empty ring and a dash rather than a full-strength arc.
 - Demo launch data stays in the watch app and never overwrites the complication cache.
   Gallery previews use synthetic samples only in WidgetKit preview/placeholder requests.
 
@@ -91,6 +95,16 @@ in the Smart Stack.
 - Workouts support Other, Walking, Running, and Cycling, with indoor/outdoor selection where
   relevant. Live heart rate comes from the watch's workout builder. Heart-rate read access
   is not inferred from permission-sheet completion; an empty reading state remains possible.
+- **Always On.** With luminance reduced, the workout and dashboard keep the heart rate,
+  its value, and elapsed time prominent, dim labels and secondary lines, and hide the trend.
+  **Decision:** live heart rate is `privacySensitive()`, the same as the complications. The
+  watch's own privacy settings decide whether it is redacted on a lowered wrist; HeartSync
+  does not hide it unconditionally, because Apple's workout guidance is to keep the key
+  metric readable. Elapsed time is never marked sensitive.
+- A small trend shows the last five minutes of the workout's heart rate from the samples
+  the builder already delivered. It is kept in memory only, breaks at gaps (a pause or a
+  silent sensor), is cleared at Start and Discard, and adds no persistence. No heart-rate
+  zones are shown.
 - Pausing stops elapsed workout time through HealthKit's own elapsed-time calculation. Values
   older than 15 seconds are labelled as awaiting a new reading. End opens review; Save stores
   the workout in HealthKit; Discard requires confirmation. Save failures keep the builder for
@@ -155,7 +169,11 @@ Before release, use a signed paired iPhone/watch to check:
 5. HealthKit sync to iPhone, reimport without duplicate UUIDs, and comparison against an enabled
    BLE source. Confirm no watch import is written back by the phone.
 6. Both complications in each family and in the Smart Stack; choose different metrics, verify
-   tinting, long source names, VoiceOver, large text, and privacy/Always On redaction. Tap each
+   tinting, long source names, VoiceOver, large text, and privacy/Always On redaction. The
+   circular gauge must render in tinted and full-colour faces with its Older and Median
+   labels. During a workout, lower the wrist and confirm the reduced presentation: heart rate
+   and elapsed time prominent, secondary text dimmed, trend hidden, and heart rate redacted
+   only when the watch's privacy setting asks for it. Tap each
    measurement and the workout shortcut, including while a workout is active.
 7. Change phone data with the watch app closed, then check eventual complication reloads.
    Verify first-use empty state, no selected metric, old measurement after a fresh sync, aging

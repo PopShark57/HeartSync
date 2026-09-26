@@ -47,7 +47,7 @@ HeartSyncApp
 | `Sources/App` | App entry point, root tabs, lifecycle, service construction, ingestion, timers, and derived-metric orchestration. |
 | `Sources/Model` | Canonical metric, reading, source, provenance, user-profile, discrepancy, and evidence value types. |
 | `Sources/Store` | Observable store boundary, transactional indexed SQLite database, small atomic JSON archives, settings, Keychain wrapper, and stable-ID generation. |
-| `Sources/Bluetooth` | CoreBluetooth lifecycle, SIG GATT constants, safe binary reader, and typed measurement parsers. |
+| `Sources/Bluetooth` | CoreBluetooth lifecycle, SIG GATT constants, safe binary reader, typed measurement parsers, per-connection diagnostics, and the topology-gated YCBT ring session and frame codec. |
 | `Sources/Watch` | iPhone snapshot projection and coalesced WatchConnectivity publication. |
 | `Shared` | Versioned display payload, WatchConnectivity session, and workout presentation values compiled into both apps. |
 | `WatchApp` | Native watchOS SwiftUI dashboard, HealthKit workout manager, resources, and entitlements. |
@@ -56,7 +56,7 @@ HeartSyncApp
 | `Sources/Oura` | OAuth, Keychain-backed credentials, API transport/DTOs, endpoint status, token-free cache, sync orchestration, and scalar mapping. |
 | `Sources/Analysis` | Comparison/windowing/statistics, HRV, estimators, and pairwise export. These are mostly pure or value-oriented. |
 | `Sources/Views` | SwiftUI screens and reusable components, Charts usage, plus the narrow UIKit share-sheet bridge. |
-| `Sources/Debug` | Deterministic pairwise demo fixtures guarded by `#if DEBUG`. |
+| `Sources/Debug` | Deterministic fixtures guarded by `#if DEBUG`: the pairwise demo, UI-test scenarios, the thirty-day `--chart-gallery`, and the Xcode previews for every chart and Oura section. |
 | `Tests` | Swift Testing suites for parsers, analysis, OAuth/API behavior, stable IDs, and export. |
 | `UITests` | Deterministic UI recovery, data-control, comparison, Oura failure, and pseudo-localization flows. |
 | `PerformanceTests` | Separate physical-device 14-day, 1 Hz indexed-store release workload. |
@@ -88,7 +88,7 @@ There are no:
 - iOS widget extensions, notification extensions, or reusable framework targets;
 - `Package.swift`, `Package.resolved`, SwiftPM package dependencies, CocoaPods, or Carthage dependencies.
 
-The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, CryptoKit, WatchConnectivity, WatchKit, WidgetKit, AppIntents, and SQLite3. Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
+The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, CryptoKit, Accessibility (Audio Graph descriptors), WatchConnectivity, WatchKit, WidgetKit, AppIntents, and SQLite3. Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
 
 ## Shared Versus Platform-Specific Code
 
@@ -151,7 +151,7 @@ Oura endpoint requests currently run sequentially. Do not casually convert them 
 
 `BluetoothManager` owns scanning, restoration, connection/reconnection, discovery, notification handling, source metadata, and ingestion. Strong references to peripherals are mandatory; removing them can silently break connections.
 
-Supported measurement paths are Bluetooth SIG standards, not arbitrary vendor protocols:
+Supported measurement paths are Bluetooth SIG standards, plus one topology-gated vendor candidate described below:
 
 - Heart Rate Service `180D` and Heart Rate Measurement `2A37`.
 - Pulse Oximeter Service `1822` and PLX continuous/spot-check measurements.
@@ -167,7 +167,23 @@ Reuse `GATT`, `BinaryReader`, `HeartRateMeasurement`, `PulseOximeterMeasurement`
 - IEEE-11073 reserved/special float values are not valid measurements.
 - Fahrenheit temperatures are normalized to Celsius.
 
-HRV is derived per peripheral with `HRVAccumulator`/`HRVCalculator`, artifact rejection, a five-minute window, at least 20 clean beats, and rate-limited emission. Preserve those semantics and their tests.
+HRV is derived per peripheral with `HRVAccumulator`/`HRVCalculator`, artifact rejection, a five-minute window, at least 20 clean beats, and rate-limited emission. Preserve those semantics and their tests. A Heart Rate Measurement subscription counts as heart rate only in readiness; HRV appears only from real R–R intervals.
+
+Readiness and diagnostics (`RingFix.md`):
+
+- `BluetoothDiscoveryState` tracks measurement candidates and vendor control channels separately. A control channel can make a link ready but never adds a metric.
+- `PeripheralConnectionState.resolving` keeps observed streaming state when a late discovery callback arrives.
+- The no-data watchdog follows `StreamCadence` (30 s to 10 min) and explains itself from `BluetoothDiagnostics`: silence, rejected packets (with the reason), or a stopped stream.
+- `BluetoothDiagnostics` counts packets per characteristic before any parser or admission guard and names every rejection. Record new rejection paths there. Raw packets are captured only during an explicit 60-second diagnostic session (`runDiagnostics`, which runs `discoverServices(nil)` once), bounded to 200, and leave the app only through the user's export. Never log them.
+- Reconnect is a fresh session: a connected link is cancelled and one connection starts from its disconnect callback, bypassing the backoff. A per-link `connectionSessions` counter invalidates delayed work. `connect` does not rediscover a link that already has discovery state, so a foreground refresh leaves a healthy session alone.
+
+Vendor ring candidate (`R11MRingSession`, `YCBTFrameCodec`):
+
+- It is selected only from GATT topology: the YCBT service with a writable, subscribable command characteristic and a subscribable event characteristic. Never select it from the advertised name.
+- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query. A measurement starts only after a CRC-valid identity reply, and only from the user's Measure heart rate action.
+- Live values are provisional. Only the ring's completion event emits a reading (the last live value, through `emit`). Zero, no-contact, rejection, and timeout store nothing. SpO₂ is recognized but not requested or stored.
+- While the session owns heart rate, the same ring's `2A37` frames are counted as superseded, not ingested.
+- The framing is from public reverse-engineering and is unverified on hardware. Do not add commands (history, clock, settings, keepalive) without captured evidence and tests. Do not describe the path as verified.
 
 The restoration identifier is `com.heartsync.central`. `UIBackgroundModes = bluetooth-central` enables CoreBluetooth background/restoration behavior; it is not a generic background-execution entitlement.
 
@@ -218,6 +234,8 @@ snapshot from the paired iPhone and always labels measurement time separately fr
   timeline reload requests happen before completing WatchConnectivity background tasks.
 - Measurement complications support seven non-estimated metrics in circular, rectangular,
   inline, and corner families, using the newest displayed source with stable tie-breaking.
+  The circular family is an `accessoryCircular` gauge over `MetricKind.displayRange`; its
+  opening shows Older or Median when either applies.
   Preserve derived/median labels, explicit empty/old states, and measurement-time freshness.
   Schedule a future stale entry; WidgetKit reload timing remains system-controlled. Mark
   measurement views privacy-sensitive. `heartsync-watch` links open metric details or workout
@@ -227,6 +245,11 @@ snapshot from the paired iPhone and always labels measurement time separately fr
   for retry, and reconnects a recovered session through `WKApplicationDelegate`.
 - Use HealthKit's builder elapsed time, which excludes pauses. Use the sample timestamp to
   mark heart rate older than 15 seconds; receipt time does not make an old sample live.
+- Always On: the workout and dashboard read `isLuminanceReduced`, keep heart rate and elapsed
+  time prominent, dim secondary content, and hide the trend. Live heart-rate values are
+  `privacySensitive()`, as the complications are. `WorkoutHeartRateTrend` holds the last
+  five minutes of builder samples in memory only and resets at Start and Discard. Do not
+  persist it or add zones without estimate labelling.
 - Read permission is never inferred from authorization-sheet completion. A workout may
   contain no accessible heart-rate samples. Discarding the workout does not promise deletion
   of samples Apple Watch independently collected.
@@ -340,7 +363,12 @@ Preserve measurement semantics:
 The application is SwiftUI-first and targets iOS 18:
 
 - Use Observation environment state, the iOS 18 `Tab` API, `NavigationStack`, `List`/`Form`, sheets, toolbars, `refreshable`, and Swift Charts consistently with nearby screens.
-- Prefer existing semantic components in `Sources/Views/Components.swift` and the existing Oura card helpers before introducing another visual vocabulary.
+- Prefer existing semantic components in `Sources/Views/Components.swift` (including `FlowLayout` for wrapping chips) and the existing Oura card helpers before introducing another visual vocabulary. Content cards share one surface, `HeartSyncCardBackground`.
+- Chart heights, inks, band opacity, and `axisFormat(span:)` come from `HeartSyncTheme.Chart`. Size every history chart with `heartSyncChartHeight(_:)`, which grows with Dynamic Type and the available width, never a fixed `.frame(height:)`.
+- A chart whose automatic Audio Graph would name series by source ID gets an `AXChartDescriptorRepresentable` (`ChartAudioGraph.swift`) that names devices.
+- A screen that loads a snapshot per key shows "Updating for the new selection…" and dims and disables the old results while the question has changed, as Compare and metric detail do.
+- Now: only a streaming Bluetooth source can be labelled Live (`SourceChipStatus`). Sparklines draw completed-window medians only and are cached until the window closes. Motion honours Reduce Motion.
+- Layout adapts to size class: `.sidebarAdaptable` tabs, an adaptive grid on Now, and a split view on Compare in regular widths.
 - Use SF Symbols, semantic system colors, monospaced digits for measurements, and existing source colors.
 - Keep empty, loading, unavailable, insufficient-evidence, and estimated states explicit. Do not hide uncertainty to make a screen look complete.
 - Add accessibility labels/hints for icon-only controls and compound measurement rows, following existing views.
@@ -474,7 +502,9 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/HRVFilterTests.swift`: 20 tests covering artefact filtering, body-location versus technology metadata, accumulator thresholds, and rate limiting.
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
 - `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
-- `UITests/HeartSyncCheckerUITests.swift`: 13 deterministic flows:
+- `UITests/HeartSyncCheckerUITests.swift`: 15 deterministic flows, which keep screenshots
+  (`XCTAttachment`, `.keepAlways`) of key screens; CI also runs the screenshot flow on an
+  iPad simulator:
   - recovery and settings;
   - device actions, including removal that asks first and deletes only that device;
   - retention and evidence;
@@ -482,6 +512,8 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   - metric-detail zoom, the stated bucket, and a chart period's Save as session sheet;
   - pair selection stepped with Next and cleared, without a drag;
   - Oura partial failure;
+  - Now without connected sources (no Sources header, trend label, 44 pt target);
+  - the `--chart-gallery` screenshot tour, in portrait and landscape;
   - the Oura hypnogram, movement, heart-rate, and fourteen-day trend charts
     (`--ui-test-ouraCharts`);
   - pseudo-localization.
@@ -526,6 +558,15 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   bounded Now read, which shows the same values and verdicts as the two-day read.
 - `Tests/ChartGapTests.swift`: 12 tests covering shared gap segmentation for the band,
   the pairwise timeline, and Oura heart rate, including isolated points and thinning.
+- `Tests/RingSessionTests.swift`: 25 tests covering the YCBT codec (CRC check value,
+  framing, reassembly, bad CRC and length), topology selection, subscription gating,
+  identification, warm-up and completion, no contact, rejection, timeouts, cancel and repeat,
+  heart-rate-only readiness, control channels, late callbacks, stall diagnosis, raw-capture
+  bounds, command stages, and stream cadence.
+- `Tests/DashboardTrendTests.swift`: 8 tests covering Now sparklines (window medians, gaps,
+  single points, spans, spoken summary, per-window caching), chip status, and the
+  `--chart-gallery` fixture.
+- `Tests/Watch/WorkoutTrendTests.swift`: 4 tests covering the workout trend buffer.
 - `Tests/ColourVisionTests.swift`: 11 tests. They pin the Machado/CAM02-UCS validator to
   published values and enforce ΔE ≥ 15 under protan, deutan, and tritan simulation:
   between source slots, against the reference-line ink, and between sleep stages. They
@@ -552,7 +593,10 @@ and copy or symlink the real source files into it — `Sources/Store`, `Sources/
 `SourceRemovalConsequence`, `WindowLabel`, `ChartLookup`, `ChartViewport`,
 `MetricChartProjection`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
 `Oura/OuraMovementClass`, `Oura/OuraDailyTrend`), `Shared`, plus
-`Sources/Bluetooth/GATT.swift` for `BodySensorLocation`. The Oura timeline and trend
+`Sources/Bluetooth/GATT.swift` for `BodySensorLocation` (which needs a `CBUUID` shim, and
+`R11MRingSession`), the Foundation-only Bluetooth files (`BluetoothDiagnostics`,
+`BluetoothDiscoveryState`, `YCBTFrameCodec`, `R11MRingSession`, `Measurements`,
+`BinaryReader`, `BluetoothIngestionPolicy`), and `Sources/Debug`'s `DebugChartGallery`. The Oura timeline and trend
 projections also need the Foundation-only DTOs in `Sources/Oura/OuraClient.swift`. That closure builds for macOS and runs the store, analysis,
 export, presentation-projection and watch-lifecycle suites. It cannot compile the SwiftUI
 screens (they import UIKit), the Oura stack (AuthenticationServices), or `WatchApp`. Never
@@ -607,6 +651,8 @@ Use additional validation by area:
 
 `--pairwise-demo` is a Debug-only launch argument that installs deterministic in-memory fixtures and skips normal archive loading and all transports. It is the preferred safe UI fixture mode, but it does not validate persistence, Bluetooth, HealthKit, or Oura.
 
+`--chart-gallery` is a Debug-only launch argument that installs thirty days of in-memory readings from `DebugChartGallery`: four sources (two named alike), gaps, estimates, and compacted windows. It starts no transport and saves nothing. The chart previews and the screenshot UI test use it.
+
 `--ui-test-ouraCharts` is the Debug-only UI-test scenario for the Oura charts. It installs fourteen days of in-memory Oura documents, with a charging gap, a missing night, and a missing readiness day, and fetches and persists nothing. Like the other `--ui-test-*` scenarios, it does not validate the Oura API or OAuth.
 
 ## Fragile and Tightly Coupled Areas
@@ -647,7 +693,7 @@ When a comment and implementation disagree, document the discrepancy and test ac
 - Do not duplicate `MetricKind`, store, parser, comparison, estimator, OAuth, or export logic in a view or a new parallel service.
 - Do not change the CoreBluetooth queue while retaining `MainActor.assumeIsolated` delegate handling.
 - Do not weaken validity checks or parser units to accommodate one device without representative frames and regression tests.
-- Do not claim proprietary/vendor BLE support. The current implementation supports standards-compliant GATT profiles only.
+- Do not claim proprietary/vendor BLE support beyond the topology-gated YCBT candidate, and do not describe that candidate as verified until a device run in `RELEASE_CHECKLIST.md` records it. Never select a vendor path from a device name, and never write to a characteristic before its session's gating says so.
 - Keep watch workout sample import on HealthKit. Do not duplicate live samples into the iPhone store over WatchConnectivity or treat the wrist display snapshot as new measurements.
 - Do not claim App Groups, CloudKit, Keychain sharing, widgets, notifications, or background tasks that are not configured.
 - Do not use a simulator build as proof that BLE, HealthKit, background delivery, signing, OAuth presentation, or TCC/privacy behavior works.

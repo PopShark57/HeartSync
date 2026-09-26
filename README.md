@@ -9,7 +9,7 @@ Three transports, because these devices genuinely do not speak one protocol:
 
 | Source | Transport | Why |
 |---|---|---|
-| Chest straps, generic rings, pulse oximeters | **Bluetooth LE** | They implement the standard GATT profiles, so they can be read directly and live. |
+| Chest straps, standards-compliant rings, pulse oximeters | **Bluetooth LE** | Devices that implement the standard GATT profiles can be read directly and live. Many inexpensive rings do not; see below. |
 | Apple Watch | **HealthKit** | Apple Watch readings reach iPhone through HealthKit. The native companion also records live heart-rate workouts on the watch; it is not a BLE peripheral. |
 | Oura Ring | **Oura Cloud API v2** | The ring's Bluetooth protocol is proprietary and undocumented. The Cloud API is the supported route. |
 
@@ -19,6 +19,19 @@ Bluetooth support covers the SIG-standard services:
 - **Pulse Oximeter (0x1822)** — SpO₂ and pulse rate, continuous and spot-check
 - **Health Thermometer (0x1809)** — body temperature
 - **Battery (0x180F)** and **Device Information (0x180A)**
+
+Many inexpensive rings measure only when asked, through a vendor protocol, and a standard
+Heart Rate subscription alone never produces a value. HeartSync has **candidate** support for
+one such protocol, Yucheng YCBT (found on some rings sold as R11M). It is chosen from the
+ring's GATT topology, never its name. HeartSync sends nothing but a read-only identity query
+until the ring answers it correctly, and then starts a heart-rate measurement only when you
+tap **Measure heart rate**. Only the value the ring reports when it finishes is saved. This
+path has not been verified on hardware; no specific model or firmware is claimed as
+supported. SpO₂ from the vendor protocol is not requested or stored.
+
+**Run Bluetooth diagnostics** in a device's menu on the Devices tab inventories every
+service and characteristic, counts packets before parsing, and names why any were rejected.
+Its report leaves the phone only through **Export diagnostics**.
 
 Metrics tracked: heart rate, resting heart rate, HRV (RMSSD and SDNN), SpO₂, respiratory
 rate, body temperature, VO₂ max, and blood pressure.

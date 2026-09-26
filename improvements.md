@@ -30,11 +30,14 @@ is partial. Items 32–35 meet the code and unit-test parts of theirs. Their UI 
 written, and CI gives them their first compile and run. Each item below ends with a status
 note that says what changed and what is still open. Every open point is a device,
 simulator, or on-screen check that this environment could not run. The "Observed
-behavior" paragraphs describe the code as reviewed, before those changes. Items 36–41 are
-unchanged. The implementation validation sections for
-[items 26–31](#implementation-validation-items-2631) and
-[items 32–35](#implementation-validation-items-3235) say exactly what was and was not
-executed.
+behavior" paragraphs describe the code as reviewed, before those changes. Items 36–41 have
+since been implemented too, together with the direct-ring fix in `RingFix.md`. They meet the
+code and unit-test parts of their "Done when" paragraphs; their UI tests and screenshots
+run first in CI, and the device checks remain. The implementation validation sections for
+[items 26–31](#implementation-validation-items-2631),
+[items 32–35](#implementation-validation-items-3235), and
+[items 36–41 and RingFix](#implementation-validation-items-3641-and-ringfix) say exactly what
+was and was not executed.
 
 ### Priorities and suggested sequence
 
@@ -50,12 +53,12 @@ executed.
 | 33 | P2 | Add pan, zoom, and period selection to history charts | Design proposal (+ observed axis gap) | M–L | Done with buttons, not pinch or scroll (Apple chart bugs); see status |
 | 34 | P2 | Rebuild pairwise-chart selection on the native selection API | Design proposal (+ observed gaps) | M | Done in code. The list-scrolling device check is still to do |
 | 35 | P2 | Turn the Oura cards into real charts: heart rate, hypnogram, 14-day trends | Design proposal (+ observed legend gap) | M–L | Done in code. On-screen and VoiceOver checks still to do |
-| 36 | P2 | Give the Now tab sparklines, motion, and honest "live" labelling | Design proposal (+ observed wording issue) | M | Open |
-| 37 | P2 | Make dense charts work with VoiceOver, Audio Graphs, and Dynamic Type | Accessibility gap | M | Open |
-| 38 | P2 | Adapt layouts for iPad and landscape | Design proposal | M | Open |
-| 39 | P2 | Consolidate visual tokens, chart styling, and loading feedback | Polish and maintainability | S–M | Open. Reference-line tokens landed with item 31 |
-| 40 | P2 | Adopt Always On guidance and gauges on the watch | Design proposal | S–M | Open |
-| 41 | P2 | Add previews, chart fixtures, and screenshot artefacts for UI work | Developer experience | M | Open |
+| 36 | P2 | Give the Now tab sparklines, motion, and honest "live" labelling | Design proposal (+ observed wording issue) | M | Done in code. UI test written; on-screen and Reduce Motion checks still to do |
+| 37 | P2 | Make dense charts work with VoiceOver, Audio Graphs, and Dynamic Type | Accessibility gap | M | Done in code. The AX5 VoiceOver and Audio Graph pass is still to do |
+| 38 | P2 | Adapt layouts for iPad and landscape | Design proposal | M | Done in code. iPad screenshots come from CI; a device look is still to do |
+| 39 | P2 | Consolidate visual tokens, chart styling, and loading feedback | Polish and maintainability | S–M | Done |
+| 40 | P2 | Adopt Always On guidance and gauges on the watch | Design proposal | S–M | Done in code. The physical-watch Always On and face checks are still to do |
+| 41 | P2 | Add previews, chart fixtures, and screenshot artefacts for UI work | Developer experience | M | Done. Previews not yet opened in Xcode; vectorized plots evaluated, not adopted |
 
 **P1** here means fix first: data loss, wrong analysis period, misleading drawing, or work
 that interactive charts would make worse. **P2** is the interactive and visual roadmap
@@ -956,6 +959,30 @@ A card shows a trend that never implies unmeasured continuity. Apple Health and 
 chips never claim to be live. Motion is disabled under Reduce Motion, apart from the
 system's own symbol handling. A UI test covers the no-connected-sources state.
 
+**Implementation status (2026-09-26): done in code. On-screen and Reduce Motion checks are
+still to do.**
+
+- **Sparklines.** `Sparkline` (in `DashboardSnapshot.swift`) draws one line per source on
+  the card: the median of each completed comparison window, over the last hour for fast
+  metrics and fourteen days for daily ones. Lines break at a missing window
+  (`ChartSegmentation`), a lone window is a dot, interpolation is monotone, and the x domain
+  is pinned. With fewer than two windows there is no sparkline. It stops at the start of
+  the current window, so `DashboardSnapshot` keeps it in `sparklineCache` and re-reads only
+  when a window closes. The 1 Hz reload does not re-read an hour of rows each second.
+  VoiceOver hears one sentence per source: first and last value, range, and gaps.
+- **Motion.** The headline uses `.numericText(value:)` and `.snappy`, both off under Reduce
+  Motion. The heart-rate glyph pulses (`symbolEffect(.pulse)`) only while a Bluetooth
+  source on that card is streaming.
+- **Sources header.** Renamed **Sources** and hidden when empty. `SourceChipStatus` gives
+  each chip Live, Synced *n* ago, or Waiting. Only a transport with `isLive` (Bluetooth)
+  that is streaming can be Live. Apple Health and Oura show their managers' last sync time.
+- **Target.** The History and agreement pill is at least 44 pt tall, with a capsule hit
+  shape and the label "History and agreement for *metric*".
+- **Tests.** `Tests/DashboardTrendTests.swift`: window medians, gaps and dots, the
+  single-point rule, spans, the spoken summary, caching until the window closes, and chip
+  status. `testNowWithoutConnectedSourcesHidesTheSourcesHeader` checks the empty header,
+  the trend's label, and the pill's height.
+
 ### 37. Make dense charts work with VoiceOver, Audio Graphs, and Dynamic Type
 
 **Observed behavior**
@@ -987,6 +1014,22 @@ A VoiceOver pass at the largest accessibility text size can read each device's v
 metric detail, pairwise, and Oura charts. The Audio Graph is available and names the
 series. No chart's plot area collapses at AX5.
 
+**Implementation status (2026-09-26): done in code. The VoiceOver and Audio Graph pass at
+AX5 is still to do.**
+
+- Metric-detail points already carried source, time, value, and Estimate or Compacted
+  (item 32), with lines and band hidden. The chart now also has a `chartYAxisLabel` with
+  the unit, and `MetricAudioGraph` (`ChartAudioGraph.swift`) replaces the automatic Audio
+  Graph. The automatic one names series by the stable source ID; this one names each
+  device by its label and marks estimated and compacted points.
+- Oura heart rate: each sample is spoken with its time and bpm. The area and duplicate dots
+  are hidden. It has a `bpm` y-axis label and its own Audio Graph descriptor.
+- Every history chart's height comes from `heartSyncChartHeight(_:)`. The base height grows
+  with Dynamic Type (up to 2.2×), by 1.4× in a regular width, and by 1.2× in a compact
+  height (landscape iPhone).
+- The pair charts kept their existing summaries, named step actions, and axis labels from
+  item 34.
+
 ### 38. Adapt layouts for iPad and landscape
 
 **Observed behavior**
@@ -1015,6 +1058,18 @@ orientation, but no view reads a size class. Specifically:
 
 UI screenshots (see 41) of iPad in both orientations and iPhone in landscape show no
 clipped chips, charts use the extra space, and the sidebar lists the five destinations.
+
+**Implementation status (2026-09-26): done in code. The iPad screenshots come from the next
+CI run; a device look is still to do.**
+
+- `RootView` uses `.tabViewStyle(.sidebarAdaptable)`.
+- Now lays its cards out in a `LazyVGrid` of adaptive 320 pt columns.
+- In a regular width, Compare is a `NavigationSplitView`: the metric list selects into a
+  detail column. A compact width pushes, as before.
+- Metric chips on Devices use a new wrapping `FlowLayout` (`Components.swift`).
+- Chart heights grow in landscape and on iPad (item 37).
+- `testChartGalleryScreenshots` captures Now, metric detail, and the pair screen, then the
+  pair screen and Now in landscape. CI runs it on an iPhone and on an iPad simulator.
 
 ### 39. Consolidate visual tokens, chart styling, and loading feedback
 
@@ -1052,6 +1107,20 @@ clipped chips, charts use the extra space, and the sidebar lists the five destin
 Chart colours and dash patterns come from one place. A range change shows immediate
 feedback, and results never silently describe the previous range.
 
+**Implementation status (2026-09-26): done.**
+
+- `HeartSyncTheme.Chart` now also holds the caution ink, the heart-rate ink, the band
+  opacity, every chart height, the shared `axisFormat(span:)` (moved out of
+  `MetricDetailChart`), and a spoken `axisDescription`. The chart files use these instead of
+  `.orange` and `.pink` literals. Semantic colours stay owned by the model types.
+- One card surface: `ouraCard()` now draws `HeartSyncCardBackground`, the Now card surface,
+  at the compact radius.
+- Loading feedback: Compare's unused `isLoading` is gone. When the question changes (range,
+  session, sources, threshold, estimates) but the snapshot still answers the old one,
+  Compare and metric detail show "Updating for the new selection…" and dim the old results
+  and make them inert and hidden from VoiceOver. New data alone still shows the existing lag
+  note.
+
 ### 40. Adopt Always On guidance and gauges on the watch
 
 **Observed behavior**
@@ -1081,6 +1150,24 @@ feedback, and results never silently describe the previous range.
 On a physical watch, Always On shows the chosen reduced presentation during a workout. The
 circular complication renders as a gauge in tinted and full-colour faces, with the current
 freshness labels.
+
+**Implementation status (2026-09-26): done in code. The physical-watch checks are still to
+do.**
+
+- The workout and dashboard screens read `isLuminanceReduced`: labels lose their tint,
+  secondary lines dim, and the trend hides. Heart rate and elapsed time stay prominent.
+- **Decision:** live heart rate on the workout and dashboard is `privacySensitive()`, like
+  the complications. The watch's own privacy settings decide redaction; elapsed time is not
+  sensitive. Recorded in `WatchApp/README.md`.
+- `WorkoutHeartRateTrend` (in `Shared/WorkoutPresentation.swift`) keeps the last five
+  minutes of builder samples in memory. It drops repeats and out-of-order samples, is
+  bounded to 600 samples, breaks after 30 seconds without a sample, and resets at Start and
+  Discard. No zones are drawn, so no age-predicted maximum is involved.
+- The circular complication is an `accessoryCircular` `Gauge` over the metric's display
+  range. It shows Older or Median in the ring's opening, and a dash with an empty ring when
+  the reading is older.
+- Tests: `Tests/Watch/WorkoutTrendTests.swift` (4). Previews: the circular gauge (current,
+  older, compacted) and watch metric detail.
 
 ### 41. Add previews, chart fixtures, and screenshot artefacts for UI work
 
@@ -1113,6 +1200,28 @@ freshness labels.
 
 Chart and Oura views render in Xcode previews from fixtures. The CI artefact contains
 screenshots of Now, metric detail, pairwise, Oura, and an iPad layout.
+
+**Implementation status (2026-09-26): done. The previews have not been opened in Xcode yet.**
+
+- `--chart-gallery` (`DebugChartGallery`, Debug only, in memory) installs thirty days:
+  - four measuring sources, two of them named "Polar H10";
+  - gaps of hours and days;
+  - estimated VO₂ max beside measured values;
+  - compacted heart-rate windows older than fourteen days;
+  - the last two hours at one-minute resolution.
+  Values are smooth functions of time, so runs are repeatable. It starts no transport.
+- `Sources/Debug/ChartPreviews.swift` has previews for metric detail (30 days, and with
+  estimates), the pair timeline, Bland–Altman, and every Oura section. Each draws light,
+  dark, and AX3 variants. The Oura previews use `OuraManager.chartFixtureSnapshot`, the same
+  documents as the `--ui-test-ouraCharts` test.
+- UI tests keep screenshots (`XCTAttachment`, `.keepAlways`) of Now, metric detail, the pair
+  screen, Oura, and landscape. CI adds an iPad run of the screenshot test. Both results are
+  in the uploaded `.xcresult`.
+- Vectorized plots (`LinePlot`, `PointPlot`) were evaluated and not adopted. Raising the
+  thinning caps needs a device measurement first. The marks that would move also carry
+  per-mark accessibility labels and selection styling.
+- Tests: `ChartGalleryFixtureTests` checks the gallery's promises and that Now draws a
+  trend and a comparison from it.
 
 ### UI strengths to preserve
 
@@ -1238,6 +1347,56 @@ device.
   existing optional `metric`. No stable ID, persisted raw value, or database schema changed.
 - New interface strings reach `Resources/Localizable.xcstrings` on the next Xcode build.
   The catalog was not edited by hand.
+
+### Implementation validation (items 36–41 and RingFix)
+
+This implementation also ran in a Linux container without Xcode, an iOS simulator, a
+watch, or a ring.
+
+**Executed**
+
+- The scratch SwiftPM harness, outside the repository, with Swift 6.1.3 on Linux (x86-64),
+  Swift 6 language mode, and complete concurrency checking. Its closure gains the new
+  Foundation-only files: `BluetoothDiagnostics`, `R11MRingSession`, `YCBTFrameCodec`, and
+  `DebugChartGallery`. It also compiles the Oura manager and OAuth files through small
+  shims, and `BluetoothManager.swift` through a CoreBluetooth shim, as a type check only.
+- 446 of the hosted unit tests ran, including every new suite:
+
+  | Suite | Tests |
+  | --- | ---: |
+  | `YCBTFrameCodecTests` | 7 |
+  | `R11MRingSessionTests` | 10 |
+  | `BluetoothReadinessDiagnosticsTests` | 8 |
+  | `DashboardTrendTests` | 7 |
+  | `ChartGalleryFixtureTests` | 1 |
+  | `WorkoutTrendTests` | 4 |
+
+- 441 passed. The five failures are the same container-only ones as before: four
+  `chmod 000` checks, which root ignores, and `isExcludedFromBackup`, which Linux Foundation
+  does not implement.
+- Not run: `HealthKitConversionTests`, `HealthKitSessionTests`, and `ImprovementTests`. They
+  need HealthKit, and none of them calls an API this change altered. The Bluetooth
+  discovery tests in `ImprovementTests` use `PeripheralConnectionState`, which moved files
+  unchanged.
+
+**Not compiled or run here**
+
+- Not compiled: the SwiftUI and watch views, `AppModel`, `ChartAudioGraph`, the previews,
+  and the UI tests. They were checked by reading. The API shapes used were checked against
+  Apple's documentation and WWDC sessions: `AXChartDescriptor`, `accessoryCircular` label
+  placement, and `isLuminanceReduced`. CI's `xcodebuild test` is their first compile and the
+  first run of the new UI tests and the iPad screenshot run.
+- Not done:
+  - any ring, simulator, device, or watch run;
+  - VoiceOver, Audio Graph, Dynamic Type, Reduce Motion, and appearance passes;
+  - an Xcode preview render;
+  - the vendor-ring acceptance list in `RELEASE_CHECKLIST.md`.
+- Persisted data: unchanged. No stable ID, persisted raw value, schema, or `Codable` field
+  changed. `PeripheralConnectionState` moved from `BluetoothManager.swift` to
+  `BluetoothDiscoveryState.swift` unchanged, apart from its titles for zero metrics.
+- Capabilities: none added. The only new framework import is Accessibility, for the Audio
+  Graph descriptors. `Charts` is now also imported by the watch app.
+- New interface strings reach `Resources/Localizable.xcstrings` on the next Xcode build.
 
 ### Sources
 
