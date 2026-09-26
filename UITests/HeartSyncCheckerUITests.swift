@@ -50,12 +50,6 @@ final class HeartSyncCheckerUITests: XCTestCase {
         add(attachment)
     }
 
-    override func tearDown() {
-        // A test that rotated the device must not leave the next one in landscape.
-        XCUIDevice.shared.orientation = .portrait
-        super.tearDown()
-    }
-
     private func waitForDisappearance(of candidate: XCUIElement, timeout: TimeInterval = 5) -> Bool {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == false"),
@@ -399,6 +393,10 @@ final class HeartSyncCheckerUITests: XCTestCase {
         XCTAssertTrue(element("pairwise.range", in: application).waitForExistence(timeout: 10))
         attachScreenshot("Pairwise", of: application)
 
+        // Runs even if an assertion below fails, so the next test never starts in landscape.
+        addTeardownBlock { @MainActor in
+            XCUIDevice.shared.orientation = .portrait
+        }
         XCUIDevice.shared.orientation = .landscapeLeft
         attachScreenshot("Pairwise, landscape", of: application)
         application.buttons["Now"].tap()
