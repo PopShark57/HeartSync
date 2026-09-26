@@ -17,6 +17,11 @@ version, app commit, sensor models and firmware, date, and tester beside the rel
   workload to ordinary PR CI. Measure launch, one-day and 30-day queries, scrolling,
   compaction, and background ingestion; attach Instruments evidence and record peak memory
   and main-thread stalls.
+- [ ] In the same run, record `liveScreensDuringIngest`: Now's p95 reload time, the
+  steady-state main-thread share with a 30-day detail open during 1 Hz ingest, and the time
+  of one 30-day detail load. Confirm or tune the initial 50 ms and 25% budgets in
+  `HealthStorePerformanceTests`. A single load that blocks the main actor for seconds is
+  improvement 21's open work, not a pass.
 - [ ] Lock after first unlock and confirm SQLite database and WAL writes continue. Reboot
   without unlocking and confirm startup blocks without overwriting history, then recovers on
   Retry after unlock.
@@ -75,6 +80,11 @@ version, app commit, sensor models and firmware, date, and tester beside the rel
   stays blank or unknown and confidence intervals appear only with sufficient pairs.
 - [ ] Compare Oura Cloud with its Health writer relationship and confirm agreement is labelled
   non-independent instead of corroboration.
+- [ ] Swipe fully across a Bluetooth row and an Apple Health row and confirm nothing is
+  deleted. Remove must show the reading count and first date. Export first must share only
+  that source's rows and leave no temporary file behind. Cancel must change nothing, and
+  confirming must delete exactly that source's readings. Disconnect Oura must state the
+  14-day resync.
 
 ## Interface and accessibility
 
@@ -86,3 +96,10 @@ version, app commit, sensor models and firmware, date, and tester beside the rel
   and recovery states remain explicit and actionable at every size.
 - [ ] Confirm icon-only controls have names and hints, compound measurement rows read
   coherently, focus order is logical, and no verdict depends on color alone.
+- [ ] In light and dark appearance, check the charts:
+  - source colours, shapes, and the A/B line-end labels;
+  - neutral reference lines with their dash patterns;
+  - the hatched Awake sleep stage;
+  - no line, band, or area bridges a data gap, and no curve overshoots its samples;
+  - a saved session's banner, not the range picker, on metric detail and on the pair
+    screen.
