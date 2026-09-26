@@ -1,10 +1,12 @@
 import SwiftUI
 
-/// The most recent detailed sleep document: totals, efficiency, and the five-minute stage
-/// ribbon Oura publishes.
+/// The most recent detailed sleep document: totals, efficiency, and a hypnogram of the
+/// five-minute stages Oura publishes.
 ///
-/// The ribbon renders Oura's own stage classification. HeartSync does not stage sleep itself
-/// and must not present these bands as an independent measurement.
+/// The hypnogram renders Oura's own stage classification on a clock, from `bedtime_start`
+/// in five-minute steps, with Awake on top and Deep at the bottom. HeartSync does not stage
+/// sleep itself and must not present these bands as an independent measurement. A document
+/// without a bedtime keeps the untimed ribbon, because its stages cannot be placed in time.
 struct OuraSleepSection: View {
     var sleep: OuraClient.SleepDocument?
 
@@ -38,7 +40,22 @@ struct OuraSleepSection: View {
                         }
                     }
 
-                    if let phases = sleep.sleep_phase_5_min, !phases.isEmpty {
+                    if let hypnogram = OuraCategoryTimeline<OuraSleepStage>(sleep: sleep) {
+                        OuraTimelineChart(
+                            timeline: hypnogram,
+                            rows: OuraSleepStage.allCases.sorted { $0.depth < $1.depth },
+                            title: { $0.title },
+                            color: { $0.fill.color },
+                            hourStride: 2,
+                            summary: hypnogramSummary(hypnogram)
+                        )
+                        .frame(height: 132)
+                        .accessibilityIdentifier("oura.hypnogram")
+
+                        Text("Oura's stage classification, not HeartSync's. Drag across the chart to read a stage and its times.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else if let phases = sleep.sleep_phase_5_min, !phases.isEmpty {
                         OuraCategoricalRibbon(
                             values: Array(phases),
                             colors: Self.stageColors,
@@ -70,6 +87,20 @@ struct OuraSleepSection: View {
             }
             .ouraCard()
         }
+    }
+
+    /// The night as VoiceOver reads the chart as a whole; each run is its own element too.
+    private func hypnogramSummary(_ hypnogram: OuraCategoryTimeline<OuraSleepStage>) -> String {
+        let start = hypnogram.start.formatted(date: .omitted, time: .shortened)
+        let end = hypnogram.end.formatted(date: .omitted, time: .shortened)
+        let totals = OuraSleepStage.allCases
+            .sorted { $0.depth > $1.depth }
+            .compactMap { stage -> String? in
+                let seconds = hypnogram.duration(of: stage)
+                guard seconds > 0, let text = OuraFormat.durationText(Int(seconds)) else { return nil }
+                return "\(stage.title) \(text)"
+            }
+        return "Sleep stages as Oura classified them, from \(start) to \(end): \(totals.joined(separator: ", "))"
     }
 
     /// Keyed by Oura's `sleep_phase_5_min` codes: a lightness ramp that follows depth, so

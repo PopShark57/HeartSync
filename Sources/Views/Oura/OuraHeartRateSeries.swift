@@ -53,9 +53,33 @@ struct OuraHeartRateSeries {
     /// that happens once per plotted sample.
     let floor: Double
 
+    /// The drawn window, from 24 hours before the newest cached sample to that sample.
+    /// Pinning the axis to it keeps a stretch the ring did not upload visibly empty.
+    let domain: ClosedRange<Date>?
+
+    /// `points[i].date` as reference-date seconds, ascending, for selection lookups.
+    private let pointTimes: [Double]
+
     /// True when the chart is showing a subset. The section says so on screen: silently
     /// drawing part of the window would misstate how much data is behind the line.
     var isThinned: Bool { points.count < sampleCount }
+
+    /// The drawn sample nearest `date`, found by binary search. With a tolerance, a sample
+    /// farther away than that is not selected: the touch was in a gap, and the chart clears
+    /// its selection rather than jumping to a sample hours away.
+    func point(nearest date: Date, within tolerance: TimeInterval? = nil) -> Point? {
+        ChartLookup.nearestIndex(
+            in: pointTimes,
+            to: date.timeIntervalSinceReferenceDate,
+            within: tolerance
+        ).map { points[$0] }
+    }
+
+    /// The drawn sample with this identity, if it is still drawn.
+    func point(id: String?) -> Point? {
+        guard let id else { return nil }
+        return points.first { $0.id == id }
+    }
 
     /// The window drawn, measured back from the newest cached sample rather than from now —
     /// this is Oura's processed cloud series, and the ring may not have uploaded for hours.
@@ -86,8 +110,10 @@ struct OuraHeartRateSeries {
         if let newest {
             let cutoff = newest.addingTimeInterval(-Self.window)
             recent = dated.filter { $0.date >= cutoff }.sorted { $0.date < $1.date }
+            self.domain = cutoff...newest
         } else {
             recent = []
+            self.domain = nil
         }
 
         let values = recent.map(\.bpm)
@@ -108,6 +134,7 @@ struct OuraHeartRateSeries {
             plotted[index].isIsolated = isolated.contains(index)
         }
         self.points = plotted
+        self.pointTimes = plotted.map { $0.date.timeIntervalSinceReferenceDate }
         self.sampleCount = recent.count
         self.lowest = low.map { Int($0) }
         self.highest = high.map { Int($0) }

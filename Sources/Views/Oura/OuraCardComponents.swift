@@ -9,6 +9,8 @@ import SwiftUI
 ///
 /// Nothing here interprets a measurement. Values arrive already formatted by `OuraFormat`,
 /// and no component may add agreement, trend, or reference-standard language of its own.
+/// A card's fourteen-day chart draws Oura's cached daily values as they are; it never
+/// calls a direction "improving" or "declining", and a missing day stays a gap.
 
 // MARK: - Card chrome
 
@@ -85,9 +87,14 @@ struct OuraScoreCard: View {
     var detail: String
     var icon: String
     var tint: Color
+    /// Fourteen cached days of this score, drawn as bars under the value.
+    var trend: OuraDailyTrend? = nil
+
+    /// A day a tap on the trend revealed. Its value replaces the detail line.
+    @State private var selectedDayKey: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label(title, systemImage: icon)
                     .font(.subheadline.weight(.semibold))
@@ -110,7 +117,11 @@ struct OuraScoreCard: View {
                 .font(.system(.title2, design: .rounded, weight: .bold))
                 .minimumScaleFactor(0.65)
                 .lineLimit(1)
-            Text(detail)
+            if let trend, trend.isDrawable {
+                OuraTrendChart(trend: trend, style: .bars, tint: tint, selectedKey: $selectedDayKey)
+                    .frame(height: 30)
+            }
+            Text(detailText)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
@@ -121,12 +132,24 @@ struct OuraScoreCard: View {
         .accessibilityLabel(accessibilityDescription)
     }
 
+    /// The day a tap revealed, or the card's own detail.
+    private var detailText: String {
+        guard let trend, let day = trend.day(forKey: selectedDayKey) else { return detail }
+        let label = OuraClient.dayLabel(for: day.date)
+        return day.value.map { "\(label): \(OuraFormat.number($0, digits: 0))" } ?? "\(label): no score"
+    }
+
     /// Combining the children reads the card as "Activity 82 3 Mar", and the `—` placeholder
     /// as a bare dash. Naming the missing state keeps an absent score audibly absent instead
     /// of sounding like something the ring reported.
     private var accessibilityDescription: String {
         let spokenValue = value == "—" ? "No score yet" : value
-        return "\(title), \(spokenValue). \(detail)"
+        var description = "\(title), \(spokenValue). \(detail)"
+        if let trend, trend.isDrawable {
+            description += ". Last \(trend.days.count) days: "
+                + trend.spokenSummary { OuraFormat.number($0, digits: 0) }
+        }
+        return description
     }
 }
 
@@ -138,10 +161,26 @@ struct OuraBiomarkerItem: Identifiable {
     var detail: String
     var icon: String
     var tint: Color
+    /// Fourteen cached days of this value, where Oura keeps a daily history of it.
+    var trend: OuraDailyTrend? = nil
+    var trendStyle: OuraTrendChart.Style = .line
+    /// Decimal places for a day's value revealed from the trend.
+    var trendDigits: Int = 0
+
+    /// A trend value as the card writes it: signed for a deviation, with the unit.
+    func trendValueText(_ value: Double) -> String {
+        let number = trendStyle == .deviation
+            ? OuraFormat.signed(value, digits: trendDigits)
+            : OuraFormat.number(value, digits: trendDigits)
+        return "\(number) \(unit)"
+    }
 }
 
 struct OuraBiomarkerCard: View {
     var item: OuraBiomarkerItem
+
+    /// A day a tap on the trend revealed. Its value replaces the detail line.
+    @State private var selectedDayKey: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -160,7 +199,11 @@ struct OuraBiomarkerCard: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            Text(item.detail)
+            if let trend = item.trend, trend.isDrawable {
+                OuraTrendChart(trend: trend, style: item.trendStyle, tint: item.tint, selectedKey: $selectedDayKey)
+                    .frame(height: 30)
+            }
+            Text(detailText)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
@@ -171,12 +214,26 @@ struct OuraBiomarkerCard: View {
         .accessibilityLabel(accessibilityDescription)
     }
 
+    /// The day a tap revealed, or the card's own detail. A deviation stays a deviation:
+    /// the revealed value keeps its sign and says what it is measured from.
+    private var detailText: String {
+        guard let trend = item.trend, let day = trend.day(forKey: selectedDayKey) else { return item.detail }
+        let label = OuraClient.dayLabel(for: day.date)
+        guard let value = day.value else { return "\(label): no value" }
+        let text = "\(label): \(item.trendValueText(value))"
+        return item.trendStyle == .deviation ? "\(text) from baseline" : text
+    }
+
     /// The value and its unit are separate `Text` views, so the combined element would read
     /// "— bpm" for a metric Oura has not reported. The label keeps value and unit together
     /// and says outright when there is no value, without implying a measurement.
     private var accessibilityDescription: String {
         let spokenValue = item.value == "—" ? "No recent value" : "\(item.value) \(item.unit)"
-        return "\(item.title), \(spokenValue). \(item.detail)"
+        var description = "\(item.title), \(spokenValue). \(item.detail)"
+        if let trend = item.trend, trend.isDrawable {
+            description += ". Last \(trend.days.count) days: " + trend.spokenSummary { item.trendValueText($0) }
+        }
+        return description
     }
 }
 

@@ -23,6 +23,8 @@ struct ChartPoint: Identifiable {
     /// six-hour hole and imply measurement that never happened. Colour and symbol still
     /// key on `sourceID`, so a broken line stays visibly one device.
     var seriesKey: String = ""
+    /// A fixed compacted median, so VoiceOver can say so for the point it lands on.
+    var isCompacted: Bool = false
 }
 
 /// Distinguishable mark shapes, assigned per source alongside colour.
@@ -161,11 +163,14 @@ struct MetricDetailSnapshot {
     /// screen compares this with the current generation to say when it is behind.
     let generation: Int
     let resolvedAt: Date
+    /// The whole period's chart: points, band, domains, and the per-window summaries the
+    /// selection callout reads. A zoomed chart is a separate projection of the same kind.
+    let chart: MetricChartProjection
     /// Chart bucket actually used, which is the metric's comparison window widened to the
     /// zoom level so a month does not try to render 43,000 points.
-    let bucketSize: TimeInterval
-    let points: [ChartPoint]
-    let bandPoints: [BandPoint]
+    var bucketSize: TimeInterval { chart.bucketSize }
+    var points: [ChartPoint] { chart.points }
+    var bandPoints: [BandPoint] { chart.bandPoints }
     let sourcesInRange: [DataSource]
     /// Chart series in canonical order. `styleDomain` is the source-ID domain every scale
     /// on the chart shares, so colour and symbol assignment cannot drift apart.
@@ -173,7 +178,7 @@ struct MetricDetailSnapshot {
     var styleDomain: [String] { series.map(\.sourceID) }
     var styleRange: [Color] { series.map(\.color) }
     var symbolRange: [BasicChartSymbolShape] { series.map(\.symbol.chartSymbol) }
-    let yDomain: ClosedRange<Double>
+    var yDomain: ClosedRange<Double> { chart.yDomain }
     let perSourceStats: [SourceStats]
     let pairwiseAnalyses: [PairwiseAnalysis]
     /// Whether the range holds any modelled value at all, so the estimate switch is only
@@ -225,7 +230,6 @@ struct MetricDetailSnapshot {
         self.hasEstimatedReadings = readings.contains { $0.provenance == .estimated }
 
         let bucketSize = max(kind.comparisonWindow, period.chartBucket)
-        self.bucketSize = bucketSize
         let windows = ComparisonEngine.windows(
             from: readings,
             kind: kind,
@@ -239,51 +243,22 @@ struct MetricDetailSnapshot {
             .sorted { $0.displayName < $1.displayName }
         self.sourcesInRange = sources
         self.series = Self.makeSeries(for: sources)
-        var names: [String: String] = [:]
-        for entry in self.series { names[entry.sourceID] = entry.label }
-
-        let chartPoints = windows.flatMap { window in
-            window.values.map { value in
-                ChartPoint(
-                    id: "\(value.sourceID)-\(window.start.timeIntervalSince1970)",
-                    date: window.start,
-                    value: value.value,
-                    sourceID: value.sourceID,
-                    sourceName: names[value.sourceID] ?? store.displayName(forSource: value.sourceID),
-                    isEstimate: value.provenance == .estimated
-                )
+        // A reading whose device record is gone still draws, under the store's fallback
+        // name; every other label is the legend's own.
+        var fallbackLabels: [String: String] = [:]
+        for window in windows {
+            for value in window.values where store.source(id: value.sourceID) == nil {
+                fallbackLabels[value.sourceID] = store.displayName(forSource: value.sourceID)
             }
         }
-        self.points = Self.segmented(chartPoints, bucketSize: bucketSize)
-
-        // The band is a disagreement verdict drawn on a chart, so it is built from measured
-        // and derived values only. Showing estimates must never widen it or change its
-        // colour: the switch above is presentation, and an estimate is not a device.
-        let compared = windows.compactMap { window -> BandPoint? in
-            let comparable = window.values.filter { $0.provenance != .estimated }
-            guard comparable.count >= 2,
-                  let low = comparable.min(by: { $0.value < $1.value }),
-                  let high = comparable.max(by: { $0.value < $1.value })
-            else { return nil }
-            return BandPoint(
-                id: window.id,
-                date: window.start,
-                low: low.value,
-                high: high.value,
-                severity: kind.agreement.severity(forDelta: high.value - low.value)
-            )
-        }
-        self.bandPoints = Self.bandRuns(compared, bucketSize: bucketSize)
-
-        // Pads the observed range slightly so lines are not flush against the plot edges,
-        // and never collapses to zero height when every reading is identical.
-        let plotted = self.points.map(\.value)
-        if let low = plotted.min(), let high = plotted.max() {
-            let padding = max((high - low) * 0.15, kind.agreement.warn)
-            self.yDomain = (low - padding)...(high + padding)
-        } else {
-            self.yDomain = kind.displayRange
-        }
+        self.chart = MetricChartProjection(
+            windows: windows,
+            kind: kind,
+            interval: interval,
+            bucketSize: bucketSize,
+            series: self.series,
+            labels: fallbackLabels
+        )
 
         // Built from the same `windows` pass the chart draws, so the table and the chart
         // describe identical buckets. The estimate switch is presentation, and `windows`
@@ -343,93 +318,15 @@ struct MetricDetailSnapshot {
         )
     }
 
-    /// Assigns each point a line-segment key, starting a new segment wherever a source
-    /// skipped more than one bucket.
-    ///
-    /// A curve drawn across a gap asserts that the device was measuring throughout it. It
-    /// was not, and the chart must not say so. An isolated observation gets its own
-    /// segment and remains visible as a point, because `PointMark` is drawn regardless.
-    ///
-    /// The threshold is 1.5 buckets: one bucket of spacing is normal for a source
-    /// reporting every window, so only a genuinely missed window breaks the line.
+    /// Line-segment keys that break at gaps; see `MetricChartProjection.segmented`.
     static func segmented(_ points: [ChartPoint], bucketSize: TimeInterval) -> [ChartPoint] {
-        guard bucketSize > 0 else { return points }
-        let threshold = ChartSegmentation.windowThreshold(windowSize: bucketSize)
-        var result: [ChartPoint] = []
-        result.reserveCapacity(points.count)
-
-        for (sourceID, group) in Dictionary(grouping: points, by: \.sourceID) {
-            let ordered = group.sorted { $0.date < $1.date }
-            let segments = ChartSegmentation.segments(for: ordered.map(\.date), threshold: threshold)
-            for (point, segment) in zip(ordered, segments) {
-                var keyed = point
-                keyed.seriesKey = ChartSegmentation.key(series: sourceID, segment: segment)
-                result.append(keyed)
-            }
-        }
-        return result.sorted { $0.date < $1.date }
+        MetricChartProjection.segmented(points, bucketSize: bucketSize)
     }
 
-    /// Splits the disagreement band into areas that are honest about two things.
-    ///
-    /// **Gaps.** A window where fewer than two devices reported has no band. One area drawn
-    /// across it shaded "disagreement" over time when nothing was compared, so the band
-    /// breaks at a missing window exactly as the lines do.
-    ///
-    /// **Severity.** Swift Charts draws a whole area series in the style of its first mark,
-    /// so one area per stretch painted every window in the first window's colour: a major
-    /// disagreement after an agreeing start was shaded as agreement. Each run of equal
-    /// severity is its own series instead. Where the severity changes the two runs meet at
-    /// the midpoint between the windows, so each window keeps its own colour for its half
-    /// of the interval and the band stays continuous.
-    ///
-    /// A compared window with no compared neighbour is kept and flagged `isIsolated`.
+    /// Band areas that break at gaps and severity changes; see
+    /// `MetricChartProjection.bandRuns`.
     static func bandRuns(_ band: [BandPoint], bucketSize: TimeInterval) -> [BandPoint] {
-        let ordered = band.sorted { $0.date < $1.date }
-        let gaps = ChartSegmentation.segments(
-            for: ordered.map(\.date),
-            threshold: ChartSegmentation.windowThreshold(windowSize: bucketSize)
-        )
-        var result: [BandPoint] = []
-        result.reserveCapacity(ordered.count)
-        var run = -1
-
-        func emit(_ point: BandPoint, id: String) {
-            var keyed = point
-            keyed.id = id
-            keyed.seriesKey = ChartSegmentation.key(series: "band", segment: run)
-            result.append(keyed)
-        }
-
-        for index in ordered.indices {
-            let point = ordered[index]
-            guard index > 0, gaps[index] == gaps[index - 1] else {
-                run += 1
-                emit(point, id: point.id)
-                continue
-            }
-            let previous = ordered[index - 1]
-            if point.severity != previous.severity {
-                let middle = BandPoint(
-                    id: "",
-                    date: Date(timeIntervalSince1970: (previous.date.timeIntervalSince1970 + point.date.timeIntervalSince1970) / 2),
-                    low: (previous.low + point.low) / 2,
-                    high: (previous.high + point.high) / 2,
-                    severity: previous.severity
-                )
-                emit(middle, id: "\(previous.id)\u{001F}end")
-                run += 1
-                var opening = middle
-                opening.severity = point.severity
-                emit(opening, id: "\(point.id)\u{001F}start")
-            }
-            emit(point, id: point.id)
-        }
-
-        var counts: [String: Int] = [:]
-        for point in result { counts[point.seriesKey, default: 0] += 1 }
-        for index in result.indices { result[index].isIsolated = counts[result[index].seriesKey] == 1 }
-        return result
+        MetricChartProjection.bandRuns(band, bucketSize: bucketSize)
     }
 
     /// Builds the chart series for the sources visible in this range.
