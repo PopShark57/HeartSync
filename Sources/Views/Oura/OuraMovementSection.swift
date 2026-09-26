@@ -50,7 +50,7 @@ struct OuraMovementSection: View {
                             hourStride: 4,
                             summary: movementSummary(movement)
                         )
-                        .frame(height: 150)
+                        .heartSyncChartHeight(HeartSyncTheme.Chart.ouraMovementHeight)
                         .accessibilityIdentifier("oura.movement")
 
                         Text("Oura's activity classes, not HeartSync's. Drag across the chart to read a class and its times.")

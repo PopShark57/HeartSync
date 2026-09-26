@@ -40,6 +40,72 @@ enum HeartSyncTheme {
         static var majorTolerance: StrokeStyle { StrokeStyle(lineWidth: 1, dash: [1.5, 3]) }
         /// The dashed rule marking a selected window.
         static var selection: StrokeStyle { StrokeStyle(lineWidth: 1, dash: [3, 3]) }
+
+        /// Caveats drawn on a chart: estimates, sparse timing, noisy spread. Orange is the
+        /// app's "look closer" colour, never a device.
+        static var cautionInk: Color { .orange }
+        /// Heart-rate traces from a single cloud source (Oura), which has no palette slot.
+        static var heartRateInk: Color { .pink }
+        /// Fill opacity of the spread band behind per-device lines.
+        static let bandOpacity: Double = 0.14
+
+        // Plot heights at the default text size. `heartSyncChartHeight(_:)` scales them with
+        // Dynamic Type and the available width, so the plot never collapses under large
+        // axis labels and uses the room an iPad or a landscape iPhone offers.
+        static let sparklineHeight: CGFloat = 36
+        static let historyHeight: CGFloat = 240
+        static let pairTimelineHeight: CGFloat = 250
+        static let blandAltmanHeight: CGFloat = 280
+        static let ouraHeartRateHeight: CGFloat = 210
+        static let ouraMovementHeight: CGFloat = 150
+        static let ouraHypnogramHeight: CGFloat = 132
+
+        /// X-axis labels for a time span: minutes within a day, hours for a day, dates
+        /// beyond. Shared so every history chart labels the same span the same way.
+        static func axisFormat(span: TimeInterval) -> Date.FormatStyle {
+            switch TimeRange.fitting(duration: span) {
+            case .hour, .sixHours: .dateTime.hour().minute()
+            case .day:             .dateTime.hour()
+            case .week, .month:    .dateTime.month(.abbreviated).day()
+            }
+        }
+
+        /// A spoken time for an Audio Graph axis: always to the minute, with the date once
+        /// the span is longer than a day.
+        static func axisDescription(_ date: Date, span: TimeInterval) -> String {
+            span <= 86_400
+                ? date.formatted(date: .omitted, time: .shortened)
+                : date.formatted(.dateTime.month(.abbreviated).day().hour().minute())
+        }
+    }
+}
+
+/// Sizes a chart's plot from a base height: larger with Dynamic Type (the axis labels grow
+/// too, so a fixed height leaves a sliver of plot at accessibility sizes), larger again in
+/// a regular width (iPad) or a landscape iPhone.
+private struct ChartHeightModifier: ViewModifier {
+    var base: CGFloat
+    /// 100 at the default text size; tracks the body text style.
+    @ScaledMetric(relativeTo: .body) private var textScale: CGFloat = 100
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    func body(content: Content) -> some View {
+        content.frame(height: height)
+    }
+
+    private var height: CGFloat {
+        // Capped so AX5 labels still leave room for the rest of the screen.
+        var value = base * min(max(textScale / 100, 1), 2.2)
+        if horizontalSizeClass == .regular { value *= 1.4 }
+        if verticalSizeClass == .compact { value *= 1.2 }
+        return value.rounded()
+    }
+}
+
+extension View {
+    func heartSyncChartHeight(_ base: CGFloat) -> some View {
+        modifier(ChartHeightModifier(base: base))
     }
 }
 

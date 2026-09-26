@@ -15,13 +15,16 @@ import SwiftUI
 // MARK: - Card chrome
 
 extension View {
-    /// The single card treatment every Oura section shares.
+    /// The card treatment every Oura section shares: the app's one content-card surface
+    /// (`HeartSyncCardBackground`, as on Now), with the compact radius and padding that the
+    /// Oura grids need.
     func ouraCard() -> some View {
         padding(14)
-            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 16))
-            .overlay {
-                RoundedRectangle(cornerRadius: 16)
-                    .strokeBorder(.secondary.opacity(0.08))
+            .background {
+                HeartSyncCardBackground(
+                    tint: HeartSyncTheme.accentSecondary,
+                    cornerRadius: HeartSyncTheme.compactCornerRadius
+                )
             }
     }
 }

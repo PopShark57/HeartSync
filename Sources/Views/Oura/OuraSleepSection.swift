@@ -49,7 +49,7 @@ struct OuraSleepSection: View {
                             hourStride: 2,
                             summary: hypnogramSummary(hypnogram)
                         )
-                        .frame(height: 132)
+                        .heartSyncChartHeight(HeartSyncTheme.Chart.ouraHypnogramHeight)
                         .accessibilityIdentifier("oura.hypnogram")
 
                         Text("Oura's stage classification, not HeartSync's. Drag across the chart to read a stage and its times.")

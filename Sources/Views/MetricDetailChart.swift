@@ -130,12 +130,15 @@ struct MetricDetailChart: View {
         .chartXAxis {
             AxisMarks(preset: .aligned) { _ in
                 AxisGridLine()
-                AxisValueLabel(format: MetricDetailChart.axisFormat(span: chart.interval.duration))
+                AxisValueLabel(format: HeartSyncTheme.Chart.axisFormat(span: chart.interval.duration))
             }
         }
         .chartYAxis {
             AxisMarks(position: .leading)
         }
+        .chartYAxisLabel(kind.unit)
+        // Names each device in the Audio Graph; the automatic one would name source IDs.
+        .accessibilityChartDescriptor(MetricAudioGraph(kind: kind, chart: chart, series: series))
         // Swift Charts recognises the gesture itself, rather than an overlay claiming every
         // touch; how it shares a vertical swipe with the list is a device check. In period
         // mode the binding ignores it and the overlay below takes the drag instead.
@@ -237,16 +240,6 @@ struct MetricDetailChart: View {
         return parts.joined(separator: ", ")
     }
 
-    // MARK: - Formatting
-
-    /// Axis labels for the span drawn: times for hours, dates for days and weeks.
-    static func axisFormat(span: TimeInterval) -> Date.FormatStyle {
-        switch TimeRange.fitting(duration: span) {
-        case .hour, .sixHours: .dateTime.hour().minute()
-        case .day:             .dateTime.hour()
-        case .week, .month:    .dateTime.month(.abbreviated).day()
-        }
-    }
 }
 
 /// The inline callout for one selected window: its span, each device's window median with
@@ -279,7 +272,7 @@ struct MetricWindowCallout: View {
                 }
                 if value.isEstimate {
                     Text("Estimate: modelled, not measured")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(HeartSyncTheme.Chart.cautionInk)
                 }
             }
 

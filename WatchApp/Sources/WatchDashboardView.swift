@@ -63,25 +63,33 @@ struct WatchDashboardView: View {
 
 private struct WatchMetricRow: View {
     let metric: WatchMetric
+    /// Always On: the value stays; tints and secondary lines dim.
+    @Environment(\.isLuminanceReduced) private var isLuminanceReduced
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { timeline in
             VStack(alignment: .leading, spacing: 4) {
                 Label(metric.kind.title, systemImage: metric.kind.systemImage)
                     .font(.caption)
-                    .foregroundStyle(metric.kind.tint)
+                    .foregroundStyle(isLuminanceReduced ? AnyShapeStyle(.secondary) : AnyShapeStyle(metric.kind.tint))
                 if let reading = metric.readings.first {
                     Text(metric.kind.formatWithUnit(reading.value))
                         .font(.title3.bold()).monospacedDigit()
                         .minimumScaleFactor(0.7).lineLimit(1)
-                    Text(reading.sourceName).font(.caption2).lineLimit(2)
-                    HStack {
-                        Text(reading.provenance.title)
-                        if reading.isStale(kind: metric.kind, now: timeline.date) {
-                            Text("Older reading").foregroundStyle(.orange)
+                        // As on the complications: hidden when the wearer's privacy
+                        // settings redact sensitive data.
+                        .privacySensitive()
+                    Group {
+                        Text(reading.sourceName).lineLimit(2)
+                        HStack {
+                            Text(reading.provenance.title)
+                            if reading.isStale(kind: metric.kind, now: timeline.date) {
+                                Text("Older reading").foregroundStyle(.orange)
+                            }
                         }
                     }
                     .font(.caption2)
+                    .opacity(isLuminanceReduced ? 0.6 : 1)
                 }
             }
             .accessibilityElement(children: .combine)
@@ -141,3 +149,12 @@ struct WatchMetricDetailView: View {
         .navigationTitle(metric.kind.shortTitle)
     }
 }
+
+#if DEBUG
+#Preview("Metric detail") {
+    let snapshot = WatchPreviewFixtures.snapshot()
+    NavigationStack {
+        WatchMetricDetailView(metric: snapshot.metrics[0], generatedAt: snapshot.generatedAt)
+    }
+}
+#endif

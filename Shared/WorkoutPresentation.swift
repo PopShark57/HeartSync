@@ -24,3 +24,57 @@ struct WorkoutHeartRate: Equatable, Sendable {
         now.timeIntervalSince(timestamp) <= 15
     }
 }
+
+/// The last five minutes of a workout's heart rate, for the small trend on the watch.
+///
+/// Memory only and bounded: it holds samples the workout builder already delivered, never
+/// writes them anywhere, and forgets them when a workout starts or is discarded. Health
+/// remains the only store of workout samples. A pause or a silent sensor leaves a gap,
+/// and the trend breaks there rather than drawing through it.
+struct WorkoutHeartRateTrend: Equatable, Sendable {
+    static let window: TimeInterval = 5 * 60
+    /// Samples further apart than this are drawn as separate runs.
+    static let gapThreshold: TimeInterval = 30
+    static let maximumSamples = 600
+
+    struct Point: Equatable, Sendable, Identifiable {
+        var date: Date
+        var bpm: Double
+        /// Run number; it advances at every gap longer than `gapThreshold`.
+        var segment: Int
+
+        var id: Date { date }
+    }
+
+    private(set) var samples: [WorkoutHeartRate] = []
+
+    /// Adds a sample unless it repeats or precedes the newest one. The builder reports its
+    /// most recent quantity on every statistics update, so repeats are normal.
+    mutating func append(_ sample: WorkoutHeartRate) {
+        if let last = samples.last, sample.timestamp <= last.timestamp { return }
+        samples.append(sample)
+        let cutoff = sample.timestamp.addingTimeInterval(-Self.window)
+        samples.removeAll { $0.timestamp < cutoff }
+        if samples.count > Self.maximumSamples {
+            samples.removeFirst(samples.count - Self.maximumSamples)
+        }
+    }
+
+    mutating func reset() {
+        samples.removeAll()
+    }
+
+    /// Samples within the window ending at `now`, with their gap segments.
+    func points(at now: Date) -> [Point] {
+        let cutoff = now.addingTimeInterval(-Self.window)
+        var segment = 0
+        var previous: Date?
+        return samples.filter { $0.timestamp >= cutoff && $0.timestamp <= now }.map { sample in
+            if let previous, sample.timestamp.timeIntervalSince(previous) > Self.gapThreshold {
+                segment += 1
+            }
+            previous = sample.timestamp
+            return Point(date: sample.timestamp, bpm: sample.value, segment: segment)
+        }
+    }
+}

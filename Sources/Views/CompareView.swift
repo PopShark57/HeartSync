@@ -9,13 +9,15 @@ struct CompareView: View {
     /// re-reads only; nothing here resets or reimports stored data.
     @State private var retryToken = 0
     @State private var snapshot: ComparisonSnapshot?
-    @State private var isLoading = false
     /// Non-nil when the user has opened a saved session: the analysed span is then fixed
     /// rather than sliding with the clock.
     @State private var activeSession: ComparisonSession?
     @State private var showingSessions = false
     @State private var savingSession = false
     @State private var revisitNotice: String?
+    /// The metric shown in the detail column of the regular-width split view.
+    @State private var selectedMetric: MetricKind?
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     /// The span actually analysed. A saved session pins it; otherwise it rolls.
     private var period: ComparisonPeriod {
@@ -47,6 +49,14 @@ struct CompareView: View {
         }
     }
 
+    /// True while the shown snapshot answers a different question (range, session, sources,
+    /// threshold) than the one now asked. New data alone is not a different question; the
+    /// lag note covers that.
+    private var isShowingPreviousSelection: Bool {
+        guard snapshot != nil, let lastLoadedKey else { return false }
+        return !loadKey.sameSelection(as: lastLoadedKey)
+    }
+
     private var loadKey: LoadKey {
         LoadKey(
             generation: model.store.changeToken,
@@ -60,98 +70,144 @@ struct CompareView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            // The range control lives outside the result content on purpose. When a narrow
-            // range holds nothing comparable, the empty state tells the user to widen the
-            // range \u{2014} so the control that widens it has to still be on screen.
-            List {
-                Section {
-                    if let session = activeSession {
-                        sessionBanner(session)
+        // A regular width (iPad, or a large iPhone in landscape) shows metrics beside the
+        // selected metric's detail. A compact width pushes, as before.
+        if horizontalSizeClass == .regular {
+            NavigationSplitView {
+                compareList(selection: $selectedMetric)
+            } detail: {
+                NavigationStack {
+                    if let selectedMetric {
+                        MetricDetailView(kind: selectedMetric, initialRange: range, session: activeSession)
+                            // A different metric, range, or session is a new detail screen,
+                            // not an update of the old one's interaction state.
+                            .id(DetailIdentity(kind: selectedMetric, range: range, sessionID: activeSession?.id))
                     } else {
-                        Picker("Range", selection: $range) {
-                            ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                        .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
-                        .accessibilityIdentifier("compare.range")
-                    }
-                    if let snapshot, snapshot.generation != model.store.changeToken {
-                        SnapshotLagNote(resolvedAt: snapshot.resolvedAt)
+                        ContentUnavailableView(
+                            "Choose a metric",
+                            systemImage: "chart.xyaxis.line",
+                            description: Text("Its history, device agreement, and pairs appear here.")
+                        )
                     }
                 }
+            }
+        } else {
+            NavigationStack {
+                compareList(selection: nil)
+            }
+        }
+    }
 
-                if let snapshot {
-                    content(snapshot)
+    private struct DetailIdentity: Hashable {
+        var kind: MetricKind
+        var range: TimeRange
+        var sessionID: UUID?
+    }
+
+    private func compareList(selection: Binding<MetricKind?>?) -> some View {
+        // The range control lives outside the result content on purpose. When a narrow
+        // range holds nothing comparable, the empty state tells the user to widen the
+        // range \u{2014} so the control that widens it has to still be on screen.
+        List(selection: selection) {
+            Section {
+                if let session = activeSession {
+                    sessionBanner(session)
                 } else {
-                    Section {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text("Loading comparison\u{2026}")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-                        .accessibilityIdentifier("compare.loading")
+                    Picker("Range", selection: $range) {
+                        ForEach(TimeRange.allCases) { Text($0.rawValue).tag($0) }
                     }
+                    .pickerStyle(.segmented)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                    .accessibilityIdentifier("compare.range")
+                }
+                if isShowingPreviousSelection {
+                    // The results below answer the previous question until the new
+                    // snapshot lands; say so instead of letting them pass as current.
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Updating for the new selection\u{2026}")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("compare.updating")
+                } else if let snapshot, snapshot.generation != model.store.changeToken {
+                    SnapshotLagNote(resolvedAt: snapshot.resolvedAt)
                 }
             }
-            .navigationTitle("Compare")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
-                ToolbarItem(placement: .topBarLeading) {
-                    Menu {
-                        Button("Saved sessions\u{2026}", systemImage: "bookmark") { showingSessions = true }
-                        Button("Save this period\u{2026}", systemImage: "bookmark.square") { savingSession = true }
-                        if activeSession != nil {
-                            Button("Back to rolling range", systemImage: "clock.arrow.circlepath") {
-                                activeSession = nil
-                                revisitNotice = nil
-                            }
-                        }
-                    } label: {
-                        Label("Sessions", systemImage: "bookmark")
+
+            if let snapshot {
+                content(snapshot)
+                    // Dimmed and inert while stale, so a tap cannot open the old range.
+                    .opacity(isShowingPreviousSelection ? 0.45 : 1)
+                    .disabled(isShowingPreviousSelection)
+                    .accessibilityHidden(isShowingPreviousSelection)
+            } else {
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Loading comparison\u{2026}")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
                     }
-                    .accessibilityIdentifier("compare.sessions")
+                    .accessibilityIdentifier("compare.loading")
                 }
             }
-            .sheet(isPresented: $showingSessions) {
-                ComparisonSessionsView { session in openSession(session) }
+        }
+        .navigationTitle("Compare")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
+            ToolbarItem(placement: .topBarLeading) {
+                Menu {
+                    Button("Saved sessions\u{2026}", systemImage: "bookmark") { showingSessions = true }
+                    Button("Save this period\u{2026}", systemImage: "bookmark.square") { savingSession = true }
+                    if activeSession != nil {
+                        Button("Back to rolling range", systemImage: "clock.arrow.circlepath") {
+                            activeSession = nil
+                            revisitNotice = nil
+                        }
+                    }
+                } label: {
+                    Label("Sessions", systemImage: "bookmark")
+                }
+                .accessibilityIdentifier("compare.sessions")
             }
-            .sheet(isPresented: $savingSession) {
-                SaveComparisonSessionView(
-                    start: period.interval.start,
-                    end: period.interval.end
-                )
-            }
-            // `.task(id:)` cancels the in-flight load whenever the key changes, so a slow
-            // month-range load cannot land after the user has switched back to an hour.
-            .task(id: loadKey) {
-                let key = loadKey
-                isLoading = true
-                defer { isLoading = false }
-                // One frame of slack for a changed question, so dragging across the range
-                // picker starts a single load. New data alone waits out the live-reload
-                // interval instead: a Bluetooth strap bumps the key once a second, and a
-                // month-range comparison must not be re-read that often.
-                let wait = LiveReloadPolicy.delay(
-                    dataOnly: lastLoadedKey.map { key.sameSelection(as: $0) } ?? false,
-                    elapsed: lastLoadedAt.map { Date.now.timeIntervalSince($0) },
-                    minimumInterval: LiveReloadPolicy.minimumInterval(for: period)
-                )
-                try? await Task.sleep(for: .seconds(wait))
-                guard !Task.isCancelled else { return }
-                let resolved = ComparisonSnapshot(
-                    store: model.store,
-                    period: period,
-                    alertThreshold: model.settings.snapshot.discrepancyThreshold,
-                    hiddenSourceIDs: model.settings.snapshot.comparisonHidden
-                )
-                // Rejects a late result: the selection may have moved on while this ran.
-                guard !Task.isCancelled, key == loadKey else { return }
-                snapshot = resolved
-                lastLoadedKey = key
-                lastLoadedAt = .now
-            }
+        }
+        .sheet(isPresented: $showingSessions) {
+            ComparisonSessionsView { session in openSession(session) }
+        }
+        .sheet(isPresented: $savingSession) {
+            SaveComparisonSessionView(
+                start: period.interval.start,
+                end: period.interval.end
+            )
+        }
+        // `.task(id:)` cancels the in-flight load whenever the key changes, so a slow
+        // month-range load cannot land after the user has switched back to an hour.
+        .task(id: loadKey) {
+            let key = loadKey
+            // One frame of slack for a changed question, so dragging across the range
+            // picker starts a single load. New data alone waits out the live-reload
+            // interval instead: a Bluetooth strap bumps the key once a second, and a
+            // month-range comparison must not be re-read that often.
+            let wait = LiveReloadPolicy.delay(
+                dataOnly: lastLoadedKey.map { key.sameSelection(as: $0) } ?? false,
+                elapsed: lastLoadedAt.map { Date.now.timeIntervalSince($0) },
+                minimumInterval: LiveReloadPolicy.minimumInterval(for: period)
+            )
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled else { return }
+            let resolved = ComparisonSnapshot(
+                store: model.store,
+                period: period,
+                alertThreshold: model.settings.snapshot.discrepancyThreshold,
+                hiddenSourceIDs: model.settings.snapshot.comparisonHidden
+            )
+            // Rejects a late result: the selection may have moved on while this ran.
+            guard !Task.isCancelled, key == loadKey else { return }
+            snapshot = resolved
+            lastLoadedKey = key
+            lastLoadedAt = .now
         }
     }
 
@@ -171,16 +227,22 @@ struct CompareView: View {
                 } else {
                     Section("Metrics measured by more than one device") {
                         ForEach(snapshot.metrics) { kind in
-                            NavigationLink {
-                                // The session, not only the picker value: with a session
-                                // open, detail must analyse the session's exact seconds.
-                                MetricDetailView(kind: kind, initialRange: range, session: activeSession)
-                            } label: {
-                                ComparisonSummaryRow(
-                                    kind: kind,
-                                    analyses: snapshot.analyses(for: kind),
-                                    sourceIDs: snapshot.sourceIDs(for: kind)
-                                )
+                            let row = ComparisonSummaryRow(
+                                kind: kind,
+                                analyses: snapshot.analyses(for: kind),
+                                sourceIDs: snapshot.sourceIDs(for: kind)
+                            )
+                            if horizontalSizeClass == .regular {
+                                // Selects into the split view's detail column.
+                                NavigationLink(value: kind) { row }
+                            } else {
+                                NavigationLink {
+                                    // The session, not only the picker value: with a session
+                                    // open, detail must analyse the session's exact seconds.
+                                    MetricDetailView(kind: kind, initialRange: range, session: activeSession)
+                                } label: {
+                                    row
+                                }
                             }
                         }
                     }

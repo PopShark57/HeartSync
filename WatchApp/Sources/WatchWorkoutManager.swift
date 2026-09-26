@@ -30,6 +30,8 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
     /// session and builder, and asks the lifecycle what is allowed to happen to them.
     private(set) var lifecycle = WorkoutLifecycle()
     private(set) var heartRate: WorkoutHeartRate?
+    /// The last five minutes of heart rate for the workout screen's trend. In memory only.
+    private(set) var heartRateTrend = WorkoutHeartRateTrend()
     private(set) var averageHeartRate: Double?
     private(set) var activityTitle = "Workout"
 
@@ -51,6 +53,7 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
         guard let operation = lifecycle.beginStart(), session == nil else { return }
         self.token = operation
         heartRate = nil
+        heartRateTrend.reset()
         averageHeartRate = nil
         guard HKHealthStore.isHealthDataAvailable() else {
             failStart(operation, "Health data is unavailable on this watch.")
@@ -133,6 +136,7 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
         guard lifecycle.beginDiscard() else { return }
         detachHealthKitObjects(discard: true)
         heartRate = nil
+        heartRateTrend.reset()
         averageHeartRate = nil
     }
 
@@ -222,7 +226,10 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
     }
 
     private func apply(_ sample: StatisticsSnapshot) {
-        if let latest = sample.latest { heartRate = latest }
+        if let latest = sample.latest {
+            heartRate = latest
+            heartRateTrend.append(latest)
+        }
         averageHeartRate = sample.average
     }
 

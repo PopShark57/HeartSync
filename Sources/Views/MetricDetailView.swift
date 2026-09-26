@@ -224,7 +224,16 @@ struct MetricDetailView: View {
                     .accessibilityIdentifier("metric.range")
                 }
 
-                if let resolvedAt = lagResolvedAt(snapshot) {
+                if isShowingPreviousSelection {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Updating for the new selection\u{2026}")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("metric.updating")
+                } else if let resolvedAt = lagResolvedAt(snapshot) {
                     SnapshotLagNote(resolvedAt: resolvedAt)
                 }
 
@@ -238,100 +247,113 @@ struct MetricDetailView: View {
                 }
             }
 
-            Section {
-                if let failure = snapshot.queryFailure {
-                    // A failed read is not an empty range. Saying "no data" here would be a
-                    // claim about the user's history that this screen cannot support.
-                    HistoryUnavailableView(error: failure) { retryToken &+= 1 }
-                        .accessibilityIdentifier("metric.unavailable")
-                } else if snapshot.points.isEmpty {
-                    Text("No \(kind.title.lowercased()) data in this range.")
-                        .foregroundStyle(.secondary)
-                        .font(.subheadline)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 30)
-                } else {
-                    chartRow(snapshot, chart: chart)
-                    chartControls(snapshot, chart: chart)
-                    legend(snapshot)
+            // Everything below answers the previous question until the new snapshot lands:
+            // dimmed and inert, so the old range is never read or opened as the new one.
+            Group {
+                Section {
+                    if let failure = snapshot.queryFailure {
+                        // A failed read is not an empty range. Saying "no data" here would be a
+                        // claim about the user's history that this screen cannot support.
+                        HistoryUnavailableView(error: failure) { retryToken &+= 1 }
+                            .accessibilityIdentifier("metric.unavailable")
+                    } else if snapshot.points.isEmpty {
+                        Text("No \(kind.title.lowercased()) data in this range.")
+                            .foregroundStyle(.secondary)
+                            .font(.subheadline)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 30)
+                    } else {
+                        chartRow(snapshot, chart: chart)
+                        chartControls(snapshot, chart: chart)
+                        legend(snapshot)
+                    }
+                } header: {
+                    Text(kind.title)
+                } footer: {
+                    if !snapshot.points.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Drag across the chart to read each device's window median. The selection stays when you lift your finger; touch empty chart area, or Clear selection, to remove it. Tap a device below the chart to emphasise it; nothing is hidden.")
+                            if !chart.bandPoints.isEmpty {
+                                Text("The shaded band spans the highest and lowest device reading in each \(WindowLabel.length(chart.bucketSize)) window, coloured by that window's agreement. A wide band means your devices disagree at that moment. Lines and band break where a device, or a second device to compare with, did not report.")
+                            }
+                        }
+                    }
                 }
-            } header: {
-                Text(kind.title)
-            } footer: {
-                if !snapshot.points.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Drag across the chart to read each device's window median. The selection stays when you lift your finger; touch empty chart area, or Clear selection, to remove it. Tap a device below the chart to emphasise it; nothing is hidden.")
-                        if !chart.bandPoints.isEmpty {
-                            Text("The shaded band spans the highest and lowest device reading in each \(WindowLabel.length(chart.bucketSize)) window, coloured by that window's agreement. A wide band means your devices disagree at that moment. Lines and band break where a device, or a second device to compare with, did not report.")
+
+                if let selectedPeriod {
+                    periodSection(selectedPeriod)
+                }
+
+                if !snapshot.perSourceStats.isEmpty {
+                    Section {
+                        ForEach(snapshot.perSourceStats) { entry in
+                            PerSourceStatsRow(kind: kind, entry: entry)
+                        }
+                    } header: {
+                        Text("Per device, \(periodPhrase(snapshot.period))")
+                    } footer: {
+                        Text("These summarise one median per device per \(WindowLabel.length(snapshot.bucketSize)) window \u{2014} the same windows the chart draws. They are not raw sample statistics: readings older than the compaction age are stored as one median per window, so the original minimum, maximum and mean no longer exist. Where the original sample count was recorded it is shown separately; where it was not, it is shown as unknown.")
+                    }
+                }
+
+                if !snapshot.pairwiseAnalyses.isEmpty {
+                    Section {
+                        ForEach(snapshot.pairwiseAnalyses) { analysis in
+                            NavigationLink {
+                                // Carries the session too, so a pair opened from a saved
+                                // session analyses — and exports — the session's own span.
+                                PairwiseAnalysisView(
+                                    kind: kind,
+                                    sourceAID: analysis.sourceA,
+                                    sourceBID: analysis.sourceB,
+                                    initialRange: range,
+                                    session: session
+                                )
+                            } label: {
+                                PairwiseAnalysisRow(analysis: analysis)
+                            }
+                            .accessibilityIdentifier("metric.pair")
+                        }
+                    } header: {
+                        Text("Device pairs")
+                    } footer: {
+                        Text("Every eligible pair is listed, including pairs with no overlap or too few paired windows. Open a pair for its timeline, difference plot, evidence, and export.")
+                    }
+                }
+
+                if isHRV {
+                    Section {
+                        Text("HRV is the metric where devices disagree most. Vendors use different window lengths, different artefact-rejection rules, and different sensors \u{2014} an ECG chest strap and an optical ring are not measuring the same signal. Treat each device's HRV as its own scale and watch its trend, rather than expecting two devices to match.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        ForEach(snapshot.hrvQuality) { entry in
+                            HRVQualityRow(entry: entry)
+                        }
+                    } header: {
+                        if !snapshot.hrvQuality.isEmpty {
+                            Text("How good is this HRV?")
+                        }
+                    } footer: {
+                        if !snapshot.hrvQuality.isEmpty {
+                            Text("Beat quality is reported by HeartSync's own HRV calculation from the R\u{2013}R intervals a Bluetooth device sent, and describes that device's latest window only. It is a caveat on the numbers above, not a comparison between devices.")
                         }
                     }
                 }
             }
-
-            if let selectedPeriod {
-                periodSection(selectedPeriod)
-            }
-
-            if !snapshot.perSourceStats.isEmpty {
-                Section {
-                    ForEach(snapshot.perSourceStats) { entry in
-                        PerSourceStatsRow(kind: kind, entry: entry)
-                    }
-                } header: {
-                    Text("Per device, \(periodPhrase(snapshot.period))")
-                } footer: {
-                    Text("These summarise one median per device per \(WindowLabel.length(snapshot.bucketSize)) window \u{2014} the same windows the chart draws. They are not raw sample statistics: readings older than the compaction age are stored as one median per window, so the original minimum, maximum and mean no longer exist. Where the original sample count was recorded it is shown separately; where it was not, it is shown as unknown.")
-                }
-            }
-
-            if !snapshot.pairwiseAnalyses.isEmpty {
-                Section {
-                    ForEach(snapshot.pairwiseAnalyses) { analysis in
-                        NavigationLink {
-                            // Carries the session too, so a pair opened from a saved
-                            // session analyses — and exports — the session's own span.
-                            PairwiseAnalysisView(
-                                kind: kind,
-                                sourceAID: analysis.sourceA,
-                                sourceBID: analysis.sourceB,
-                                initialRange: range,
-                                session: session
-                            )
-                        } label: {
-                            PairwiseAnalysisRow(analysis: analysis)
-                        }
-                        .accessibilityIdentifier("metric.pair")
-                    }
-                } header: {
-                    Text("Device pairs")
-                } footer: {
-                    Text("Every eligible pair is listed, including pairs with no overlap or too few paired windows. Open a pair for its timeline, difference plot, evidence, and export.")
-                }
-            }
-
-            if isHRV {
-                Section {
-                    Text("HRV is the metric where devices disagree most. Vendors use different window lengths, different artefact-rejection rules, and different sensors \u{2014} an ECG chest strap and an optical ring are not measuring the same signal. Treat each device's HRV as its own scale and watch its trend, rather than expecting two devices to match.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    ForEach(snapshot.hrvQuality) { entry in
-                        HRVQualityRow(entry: entry)
-                    }
-                } header: {
-                    if !snapshot.hrvQuality.isEmpty {
-                        Text("How good is this HRV?")
-                    }
-                } footer: {
-                    if !snapshot.hrvQuality.isEmpty {
-                        Text("Beat quality is reported by HeartSync's own HRV calculation from the R\u{2013}R intervals a Bluetooth device sent, and describes that device's latest window only. It is a caveat on the numbers above, not a comparison between devices.")
-                    }
-                }
-            }
+            .opacity(isShowingPreviousSelection ? 0.45 : 1)
+            .disabled(isShowingPreviousSelection)
+            .accessibilityHidden(isShowingPreviousSelection)
         }
     }
 
     private var isHRV: Bool { kind == .hrvRMSSD || kind == .hrvSDNN }
+
+    /// True while the shown snapshot answers another range, period, or estimate choice.
+    private var isShowingPreviousSelection: Bool {
+        guard snapshot != nil, let lastLoadedKey else { return false }
+        return !loadKey.sameSelection(as: lastLoadedKey)
+    }
 
     // MARK: - Chart
 
@@ -373,7 +395,7 @@ struct MetricDetailView: View {
                     isSelectingPeriod = false
                 }
             )
-            .frame(height: 240)
+            .heartSyncChartHeight(HeartSyncTheme.Chart.historyHeight)
             .opacity(isZoomLoading ? 0.45 : 1)
             .overlay {
                 if isZoomLoading {
