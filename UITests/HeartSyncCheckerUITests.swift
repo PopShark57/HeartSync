@@ -61,11 +61,13 @@ final class HeartSyncCheckerUITests: XCTestCase {
         return chart
     }
 
-    override func tearDown() async throws {
+    override func tearDownWithError() throws {
         // A test that rotated the device must not leave the next one in landscape. The device
-        // object is main-actor isolated, and the synchronous tearDown is not.
-        await MainActor.run { XCUIDevice.shared.orientation = .portrait }
-        try await super.tearDown()
+        // object is main-actor isolated; XCTest runs UI-test teardown on the main thread. The
+        // async override this replaces sent `self` across isolation to `super.tearDown()`,
+        // which Swift 6.1 (Xcode 16) rejects.
+        MainActor.assumeIsolated { XCUIDevice.shared.orientation = .portrait }
+        try super.tearDownWithError()
     }
 
     private func waitForDisappearance(of candidate: XCUIElement, timeout: TimeInterval = 5) -> Bool {
@@ -460,7 +462,15 @@ final class HeartSyncCheckerUITests: XCTestCase {
 
         XCUIDevice.shared.orientation = .landscapeLeft
         attachScreenshot("Pairwise, landscape", of: application)
-        application.buttons.matching(identifier: "Now").firstMatch.tap()
+        let nowTab = application.buttons.matching(identifier: "Now").firstMatch
+        if !nowTab.waitForExistence(timeout: 5) {
+            // On iPad in landscape the pushed pair screen can hide the top tab bar. The app
+            // opens on Now, so relaunch rather than hunt for the tab.
+            application.terminate()
+            application.launch()
+        }
+        if nowTab.exists { nowTab.tap() }
+        XCTAssertTrue(element("now.sparkline.heartRate", in: application).waitForExistence(timeout: 10))
         attachScreenshot("Now, landscape", of: application)
 
         // Sparse daily values exercise the other reported tooltip, including its

@@ -320,6 +320,13 @@ final class HealthDatabase {
             self.writer = writer
         }
 
+        /// Closes the idle readers before the writer is released. A throwaway database's
+        /// writer deletes its files as it goes, and iOS invalidates the descriptors of any
+        /// connection still open on them ("vnode unlinked while in use").
+        deinit {
+            idle.removeAll()
+        }
+
         func read<T>(_ body: (HealthDatabase) throws -> T) throws -> T {
             let (connection, failing) = try checkOut()
             connection.failQueries = failing

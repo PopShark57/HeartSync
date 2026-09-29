@@ -275,7 +275,9 @@ struct MetricChartProjection {
                 result.append(keyed)
             }
         }
-        return result.sorted { $0.date < $1.date }
+        // Source order breaks ties, so equal dates never come out in dictionary order and
+        // two loads of the same data draw the same marks in the same order.
+        return result.sorted { $0.date == $1.date ? $0.sourceID < $1.sourceID : $0.date < $1.date }
     }
 
     /// Splits the disagreement band into areas that are honest about two things.
