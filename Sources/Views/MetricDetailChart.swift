@@ -72,6 +72,22 @@ struct MetricDetailChart: View {
                 }
             }
 
+            // An average over a night or a day, across the interval it describes. Never a
+            // point at its midpoint: it was not measured then, and it is never compared.
+            ForEach(chart.intervalSpans) { span in
+                let emphasis = emphasisedSourceID == nil || emphasisedSourceID == span.sourceID ? 1.0 : 0.2
+                RuleMark(
+                    xStart: .value("Average start", span.start),
+                    xEnd: .value("Average end", span.end),
+                    y: .value(kind.title, span.value)
+                )
+                .foregroundStyle(by: .value("Source", span.sourceID))
+                .lineStyle(StrokeStyle(lineWidth: 5, lineCap: .butt, dash: span.isEstimate ? [4, 3] : []))
+                .opacity(0.55 * emphasis)
+                .accessibilityLabel(spokenLabel(span))
+                .accessibilityValue(spokenValue(span))
+            }
+
             // Every mark keys on `sourceID`, never on the display name. Two devices called
             // "Polar H10" are two series; renaming one is a label change, not a data move.
             ForEach(chart.points) { point in
@@ -230,6 +246,17 @@ struct MetricDetailChart: View {
 
     private func spokenLabel(_ point: ChartPoint) -> String {
         "\(point.sourceName), \(point.date.formatted(.dateTime.month(.abbreviated).day().hour().minute()))"
+    }
+
+    private func spokenLabel(_ span: IntervalSpan) -> String {
+        let format = Date.FormatStyle.dateTime.month(.abbreviated).day().hour().minute()
+        return "\(span.label), average from \(span.start.formatted(format)) to \(span.end.formatted(format))"
+    }
+
+    private func spokenValue(_ span: IntervalSpan) -> String {
+        var parts = [kind.formatWithUnit(span.value), "interval average, not compared with other devices"]
+        if span.isEstimate { parts.append("estimate, not measured") }
+        return parts.joined(separator: ", ")
     }
 
     /// The window median with its unit, and any reason it is not a plain measurement.

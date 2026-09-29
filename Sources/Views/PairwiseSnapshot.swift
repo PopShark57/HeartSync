@@ -16,7 +16,9 @@ import Foundation
 /// Selection itself (improvement 34) snaps the timeline to the nearest drawn window within
 /// an on-screen radius, picks the difference plot's point nearest a tap in both x and y,
 /// and steps window by window for VoiceOver — all against the arrays prepared here.
-@MainActor
+///
+/// The `history:` initialiser reads and analyses off the main actor; the screen publishes
+/// only the finished snapshot.
 struct PairwiseSnapshot {
     let kind: MetricKind
     let period: ComparisonPeriod
@@ -56,8 +58,19 @@ struct PairwiseSnapshot {
     /// outliers a Bland–Altman plot exists to show.
     static let maximumPlottedExtremes = 60
 
+    @MainActor
     init(
         store: HealthStore,
+        kind: MetricKind,
+        sourceA: String,
+        sourceB: String,
+        period: ComparisonPeriod
+    ) {
+        self.init(history: store.history, kind: kind, sourceA: sourceA, sourceB: sourceB, period: period)
+    }
+
+    init(
+        history store: HealthHistory,
         kind: MetricKind,
         sourceA: String,
         sourceB: String,

@@ -151,7 +151,10 @@ struct HRVQualityEntry: Identifiable {
 /// Every projection this screen draws comes from the same read and the same windowing, so
 /// the chart, the band, the legend, the per-device table and the pair list cannot describe
 /// slightly different spans of time, and drawing the screen costs one pass rather than ten.
-@MainActor
+///
+/// Built from a `HealthHistory` rather than the store, so the screen builds it off the main
+/// actor and only publishes the result there. The `store:` initialisers are conveniences
+/// for tests and previews that build it in place.
 struct MetricDetailSnapshot {
     /// The period requested: a rolling preset, or a saved session's fixed span.
     let period: ComparisonPeriod
@@ -194,6 +197,7 @@ struct MetricDetailSnapshot {
     /// same moment: half of the 300-second HRV comparison window.
     private static let crossCheckTolerance: TimeInterval = 150
 
+    @MainActor
     init(
         store: HealthStore,
         kind: MetricKind,
@@ -202,7 +206,7 @@ struct MetricDetailSnapshot {
         hrvQuality: [UUID: HRVQuality]
     ) {
         self.init(
-            store: store,
+            history: store.history,
             kind: kind,
             period: .rolling(range),
             includeEstimates: includeEstimates,
@@ -210,8 +214,25 @@ struct MetricDetailSnapshot {
         )
     }
 
+    @MainActor
     init(
         store: HealthStore,
+        kind: MetricKind,
+        period: ComparisonPeriod,
+        includeEstimates: Bool,
+        hrvQuality: [UUID: HRVQuality]
+    ) {
+        self.init(
+            history: store.history,
+            kind: kind,
+            period: period,
+            includeEstimates: includeEstimates,
+            hrvQuality: hrvQuality
+        )
+    }
+
+    init(
+        history store: HealthHistory,
         kind: MetricKind,
         period: ComparisonPeriod,
         includeEstimates: Bool,
@@ -238,7 +259,13 @@ struct MetricDetailSnapshot {
             includeEstimated: includeEstimates
         )
 
-        let sources = Set(windows.flatMap { $0.values.map(\.sourceID) })
+        // Averages over a night or a day are drawn as spans and never windowed.
+        let intervalAverages = readings.filter { reading in
+            reading.isIntervalAverage
+                && interval.contains(reading.midpoint)
+                && (includeEstimates || reading.provenance != .estimated)
+        }
+        let sources = Set(windows.flatMap { $0.values.map(\.sourceID) } + intervalAverages.map(\.sourceID))
             .compactMap { store.source(id: $0) }
             .sorted { $0.displayName < $1.displayName }
         self.sourcesInRange = sources
@@ -251,13 +278,17 @@ struct MetricDetailSnapshot {
                 fallbackLabels[value.sourceID] = store.displayName(forSource: value.sourceID)
             }
         }
+        for reading in intervalAverages where store.source(id: reading.sourceID) == nil {
+            fallbackLabels[reading.sourceID] = store.displayName(forSource: reading.sourceID)
+        }
         self.chart = MetricChartProjection(
             windows: windows,
             kind: kind,
             interval: interval,
             bucketSize: bucketSize,
             series: self.series,
-            labels: fallbackLabels
+            labels: fallbackLabels,
+            intervalAverages: intervalAverages
         )
 
         // Built from the same `windows` pass the chart draws, so the table and the chart
@@ -407,7 +438,7 @@ struct MetricDetailSnapshot {
     /// caveat always describes data the user can see. The heart rates come from one bounded
     /// read spanning the candidate windows rather than a query per device.
     private static func qualityEntries(
-        store: HealthStore,
+        store: HealthHistory,
         sources: [DataSource],
         quality: [UUID: HRVQuality],
         range: DateInterval

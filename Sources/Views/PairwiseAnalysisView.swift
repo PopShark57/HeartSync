@@ -109,13 +109,11 @@ struct PairwiseAnalysisView: View {
             )
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }
-            let resolved = PairwiseSnapshot(
-                store: model.store,
-                kind: kind,
-                sourceA: sourceAID,
-                sourceB: sourceBID,
-                period: period
-            )
+            let history = model.store.history
+            let kind = kind, sourceA = sourceAID, sourceB = sourceBID, period = period
+            let resolved = await HealthHistory.offMain {
+                PairwiseSnapshot(history: history, kind: kind, sourceA: sourceA, sourceB: sourceB, period: period)
+            }
             guard !Task.isCancelled, key == loadKey else { return }
             snapshot = resolved
             lastLoadedKey = key
@@ -448,6 +446,13 @@ struct PairwiseAnalysisView: View {
                 if let interval = stats.meanBiasConfidenceInterval {
                     LabeledContent("Bias confidence interval") {
                         Text("\(signed(interval.lowerBound)) to \(signed(interval.upperBound)) \(kind.unit)")
+                    }
+                    if let effective = stats.effectiveSampleSize {
+                        // Adjacent windows of one activity are not independent; the interval
+                        // is based on this many, not on the window count.
+                        LabeledContent("Independent windows (effective)") {
+                            Text(effective.formatted(.number.precision(.fractionLength(0))))
+                        }
                     }
                 }
             }
@@ -908,6 +913,8 @@ struct PairwiseAnalysisView: View {
             return "Not applicable to an interval summary"
         case .unknown:
             return "Unknown — compacted window"
+        case .intervalAverage:
+            return "Not applicable — one value is an average over a longer interval"
         case .simultaneous, .separated:
             guard let separation = observation.timingSeparation else { return "Unknown" }
             return WindowLabel.elapsed(separation)

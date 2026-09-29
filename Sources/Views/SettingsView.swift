@@ -582,6 +582,10 @@ private struct BPCalibrationView: View {
 
     @State private var systolic = 120.0
     @State private var diastolic = 80.0
+    /// The live inputs the calibration anchors to, read off the main actor whenever the
+    /// store changes rather than in `body`.
+    @State private var currentHR: Double?
+    @State private var currentRMSSD: Double?
 
     var body: some View {
         NavigationStack {
@@ -636,6 +640,18 @@ private struct BPCalibrationView: View {
             }
             .navigationTitle("Calibrate")
             .navigationBarTitleDisplayMode(.inline)
+            .task(id: model.store.changeToken) {
+                let history = model.store.history
+                let inputs = await HealthHistory.offMain {
+                    (
+                        DerivedEstimates.currentHeartRate(history: history, now: .now),
+                        DerivedEstimates.currentRMSSD(history: history, now: .now)
+                    )
+                }
+                guard !Task.isCancelled else { return }
+                currentHR = inputs.0
+                currentRMSSD = inputs.1
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -648,22 +664,6 @@ private struct BPCalibrationView: View {
         }
     }
 
-    private var currentHR: Double? {
-        let readings = model.store.readings(
-            kind: .heartRate,
-            in: DateInterval(start: .now.addingTimeInterval(-600), end: .now)
-        )
-        return ComparisonEngine.windows(from: readings, kind: .heartRate).last?.consensus
-    }
-
-    private var currentRMSSD: Double? {
-        let readings = model.store.readings(
-            kind: .hrvRMSSD,
-            in: DateInterval(start: .now.addingTimeInterval(-3600), end: .now)
-        )
-        return ComparisonEngine.windows(from: readings, kind: .hrvRMSSD).last?.consensus
-    }
-
     private func save() {
         guard let hr = currentHR else { return }
         model.settings.snapshot.profile.bpCalibration = UserProfile.BPCalibration(
@@ -674,7 +674,7 @@ private struct BPCalibrationView: View {
             takenAt: .now
         )
         model.ensureEstimateSourceExists()
-        model.recomputeDerivedMetrics()
+        Task { await model.recomputeDerivedMetrics() }
         dismiss()
     }
 }

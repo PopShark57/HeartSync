@@ -63,13 +63,28 @@ extension ChartWindowSummary.Spread {
     }
 }
 
+/// One average over longer than the metric's comparison window, drawn across its whole
+/// interval rather than as a point at its midpoint (improvement 46).
+///
+/// Oura's night heart rate is the mean of eight hours. As a point at 03:00 it looked like a
+/// reading taken at 03:00, and it was paired as one. These are never windowed or compared,
+/// so they are also never part of the band or the selection callout.
+struct IntervalSpan: Identifiable, Sendable {
+    var id: UUID
+    var sourceID: String
+    var label: String
+    var start: Date
+    var end: Date
+    var value: Double
+    var isEstimate: Bool
+}
+
 /// The drawing half of metric detail: one span of one metric at one bucket size.
 ///
 /// The screen draws either the whole analysed period, from its snapshot's own windowing
 /// pass, or a zoomed-in part of it re-read at a finer bucket. Both go through this one
 /// projection, so the line segmentation, the band, the domains, and the selection lookups
 /// cannot differ between the two.
-@MainActor
 struct MetricChartProjection {
     /// The span this projection was read for.
     let interval: DateInterval
@@ -83,6 +98,8 @@ struct MetricChartProjection {
     let xDomain: ClosedRange<Date>
     /// Every drawn window, in time order, as the selection callout describes it.
     let windows: [ChartWindowSummary]
+    /// Interval averages in this span, clipped to it, drawn as horizontal bars.
+    let intervalSpans: [IntervalSpan]
     /// `windows[i].start` as reference-date seconds, ascending.
     private let windowStarts: [Double]
 
@@ -90,13 +107,16 @@ struct MetricChartProjection {
     ///   - comparisonWindows: `ComparisonEngine.windows` over `interval` at `bucketSize`.
     ///   - series: the legend's series, which fix each device's label and order.
     ///   - labels: display names for devices without a series entry.
+    ///   - intervalAverages: readings for which `Reading.isIntervalAverage` holds, which
+    ///     `windows` left out. Drawn as spans; never windowed.
     init(
         windows comparisonWindows: [ComparisonWindow],
         kind: MetricKind,
         interval: DateInterval,
         bucketSize: TimeInterval,
         series: [SourceSeries],
-        labels: [String: String] = [:]
+        labels: [String: String] = [:],
+        intervalAverages: [Reading] = []
     ) {
         self.interval = interval
         self.bucketSize = bucketSize
@@ -174,20 +194,36 @@ struct MetricChartProjection {
         }
         self.bandPoints = Self.bandRuns(compared, bucketSize: bucketSize)
 
+        let firstBoundary = bucketSize > 0
+            ? ComparisonEngine.floorToWindow(interval.start, size: bucketSize)
+            : interval.start
+        self.xDomain = min(firstBoundary, interval.end)...interval.end
+
+        let domain = self.xDomain
+        self.intervalSpans = intervalAverages
+            .filter { $0.kind == kind && $0.isIntervalAverage && $0.end > domain.lowerBound && $0.start < domain.upperBound }
+            .sorted { $0.start < $1.start }
+            .map { reading in
+                IntervalSpan(
+                    id: reading.id,
+                    sourceID: reading.sourceID,
+                    label: names[reading.sourceID] ?? reading.sourceID,
+                    start: max(reading.start, domain.lowerBound),
+                    end: min(reading.end, domain.upperBound),
+                    value: reading.value,
+                    isEstimate: reading.provenance == .estimated
+                )
+            }
+
         // Pads the observed range slightly so lines are not flush against the plot edges,
         // and never collapses to zero height when every reading is identical.
-        let plotted = self.points.map(\.value)
+        let plotted = self.points.map(\.value) + self.intervalSpans.map(\.value)
         if let low = plotted.min(), let high = plotted.max() {
             let padding = max((high - low) * 0.15, kind.agreement.warn)
             self.yDomain = (low - padding)...(high + padding)
         } else {
             self.yDomain = kind.displayRange
         }
-
-        let firstBoundary = bucketSize > 0
-            ? ComparisonEngine.floorToWindow(interval.start, size: bucketSize)
-            : interval.start
-        self.xDomain = min(firstBoundary, interval.end)...interval.end
     }
 
     // MARK: - Selection
@@ -310,7 +346,8 @@ struct MetricChartProjection {
 ///
 /// Only the chart zooms. The per-device table and the pair list keep describing the whole
 /// analysed period, because they are labelled with that period.
-@MainActor
+///
+/// Built from a `HealthHistory`, so the screen builds it off the main actor.
 struct MetricZoomSnapshot {
     let viewport: ChartViewport
     let chart: MetricChartProjection
@@ -322,6 +359,7 @@ struct MetricZoomSnapshot {
     /// - Parameter series: the whole period's legend series, so a zoomed chart keeps every
     ///   device's label, colour, and shape. A device that first reported after the period
     ///   loaded is left out until the period reloads, rather than drawn without a legend entry.
+    @MainActor
     init(
         store: HealthStore,
         kind: MetricKind,
@@ -329,15 +367,26 @@ struct MetricZoomSnapshot {
         includeEstimates: Bool,
         series: [SourceSeries]
     ) {
+        self.init(history: store.history, kind: kind, viewport: viewport, includeEstimates: includeEstimates, series: series)
+    }
+
+    init(
+        history: HealthHistory,
+        kind: MetricKind,
+        viewport: ChartViewport,
+        includeEstimates: Bool,
+        series: [SourceSeries]
+    ) {
         self.viewport = viewport
-        self.generation = store.changeToken
+        self.generation = history.changeToken
         self.resolvedAt = .now
-        let outcome = store.readingsOutcome(kind: kind, in: viewport.visible)
+        let outcome = history.readingsOutcome(kind: kind, in: viewport.visible)
         self.queryFailure = outcome.error
         let known = Set(series.map(\.sourceID))
         let bucket = viewport.bucket(for: kind)
+        let readings = outcome.valueOrEmpty.filter { known.contains($0.sourceID) }
         let windows = ComparisonEngine.windows(
-            from: outcome.valueOrEmpty.filter { known.contains($0.sourceID) },
+            from: readings,
             kind: kind,
             windowSize: bucket,
             range: viewport.visible,
@@ -348,7 +397,8 @@ struct MetricZoomSnapshot {
             kind: kind,
             interval: viewport.visible,
             bucketSize: bucket,
-            series: series
+            series: series,
+            intervalAverages: readings.filter { $0.isIntervalAverage && (includeEstimates || $0.provenance != .estimated) }
         )
     }
 }
@@ -358,15 +408,19 @@ struct MetricZoomSnapshot {
 /// Computed exactly as metric detail computes it for a saved session over the same
 /// seconds — the same read, the same engine call, the same range — so saving the period
 /// and reopening it shows these statistics, not different ones.
-@MainActor
 struct MetricPeriodEvidence {
     let interval: DateInterval
     let analyses: [PairwiseAnalysis]
     let queryFailure: HealthStoreQueryError?
 
+    @MainActor
     init(store: HealthStore, kind: MetricKind, interval: DateInterval) {
+        self.init(history: store.history, kind: kind, interval: interval)
+    }
+
+    init(history: HealthHistory, kind: MetricKind, interval: DateInterval) {
         self.interval = interval
-        let outcome = store.readingsOutcome(kind: kind, in: interval)
+        let outcome = history.readingsOutcome(kind: kind, in: interval)
         self.queryFailure = outcome.error
         self.analyses = ComparisonEngine.allPairwiseAnalyses(
             from: outcome.valueOrEmpty,

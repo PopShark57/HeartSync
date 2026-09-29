@@ -100,36 +100,19 @@ final class BluetoothManager: NSObject {
     /// Strong references are mandatory: CoreBluetooth does not retain peripherals, and a
     /// released `CBPeripheral` silently stops delivering notifications.
     private var peripherals: [UUID: CBPeripheral] = [:]
-    private var hrvAccumulators: [UUID: HRVAccumulator] = [:]
     /// Receipt-time admission keeps a chatty peripheral from turning every callback into a
     /// stored row. It is deliberately per source and metric so one device cannot starve another
     /// and a pulse-oximeter's SpO2 stream does not suppress its pulse stream.
-    private var readingAdmission = BluetoothReadingAdmission()
-    private var pendingModelInfo: [UUID: DeviceInformation] = [:]
-    private var discoveryStates: [UUID: BluetoothDiscoveryState] = [:]
-    private var serviceDiscoveryIDs: [ObjectIdentifier: String] = [:]
-    private var characteristicSubscriptionIDs: [ObjectIdentifier: String] = [:]
-    private var streamStallTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var readingAdmission = BluetoothReadingAdmission()
+    /// One value per peripheral for the current connection session, and one for the
+    /// device's lifetime (`PeripheralState.swift`). Ending a session replaces a link;
+    /// Forget removes both. Not observed: views read the published dictionaries above.
+    @ObservationIgnored private var links: [UUID: PeripheralLink<CBCharacteristic>] = [:]
+    @ObservationIgnored private var records: [UUID: PeripheralRecord] = [:]
+    /// Numbers every session of every peripheral, so a number is never reused, not even
+    /// after Forget and re-adding the same device.
+    @ObservationIgnored private var sessionCounter = 0
     private var scanTimeoutTask: Task<Void, Never>?
-
-    /// Increments on every app-side connection (and every restored or rediscovered link).
-    /// Delayed work captures the value and does nothing if a newer session has begun.
-    private var connectionSessions: [UUID: Int] = [:]
-    /// Peripherals whose explicit Reconnect is waiting for the old link's disconnect callback.
-    private var pendingFreshReconnects: Set<UUID> = []
-    private var freshReconnectFallbacks: [UUID: Task<Void, Never>] = [:]
-    /// Peripherals whose next discovery inventories every service (a diagnostic session).
-    private var fullDiscoveryRequested: Set<UUID> = []
-    /// Metrics accepted on the current connection. Late discovery callbacks cannot erase it.
-    private var observedMetrics: [UUID: Set<MetricKind>] = [:]
-    private var streamCadences: [UUID: StreamCadence] = [:]
-    /// Diagnostic key for each discovered characteristic.
-    private var characteristicKeys: [ObjectIdentifier: String] = [:]
-    private var ringCharacteristics: [UUID: [R11MRingSession.Channel: CBCharacteristic]] = [:]
-    private var ringAssemblers: [UUID: [R11MRingSession.Channel: YCBTFrameAssembler]] = [:]
-    private var ringTimeoutTasks: [UUID: Task<Void, Never>] = [:]
-    /// Purposes of vendor writes awaiting `didWriteValueFor`, oldest first.
-    private var pendingRingWrites: [UUID: [R11MRingSession.Purpose]] = [:]
 
     /// Scan results as they arrive, before publication.
     ///
@@ -149,10 +132,6 @@ final class BluetoothManager: NSObject {
     /// still leaves ample room for a user choosing among nearby health devices.
     static let maximumDiscoveredPerScan = 256
 
-    /// Reconnection attempts since the last successful connection, per peripheral.
-    private var reconnectAttempts: [UUID: Int] = [:]
-    private var reconnectTasks: [UUID: Task<Void, Never>] = [:]
-
     /// Reconnection backoff. A ring that connects and drops repeatedly would otherwise
     /// spin a tight connect loop forever; these bound it and give the user a state to
     /// retry from instead of an invisible failure.
@@ -165,37 +144,28 @@ final class BluetoothManager: NSObject {
     /// One transaction for a batch, used by a ring history import. Falls back to
     /// `onReading` per value when not configured.
     private var onReadings: (@MainActor ([Reading]) -> Void)?
-
-    /// Device Information Service strings, accumulated as the individual characteristics
-    /// arrive. They are read separately and in no guaranteed order, so the display string
-    /// is rebuilt from whatever is known each time one lands.
-    private struct DeviceInformation {
-        var manufacturer: String?
-        var model: String?
-        var firmware: String?
-
-        /// "Polar H10 (firmware 3.1.1)" \u{2014} the identity first, the revision parenthesised
-        /// after it, and any missing part simply omitted.
-        var displayString: String {
-            let identity = [manufacturer, model]
-                .compactMap { $0 }
-                .joined(separator: " ")
-            guard let firmware, !firmware.isEmpty else { return identity }
-            guard !identity.isEmpty else { return "Firmware \(firmware)" }
-            return "\(identity) (firmware \(firmware))"
-        }
-    }
+    /// Called when a link ends, so values waiting to be committed are not held back.
+    private var onLinkEnded: (@MainActor () -> Void)?
 
     // MARK: Setup
 
+    /// Wires the manager to the store and creates the central manager.
+    ///
+    /// Called at process launch (`AppDelegate`), before the store has loaded, because a
+    /// system relaunch to deliver a restored peripheral's notifications needs the central
+    /// re-created with its restoration identifier straight away: a view's `.task` may never
+    /// run in the background. Values that arrive before the store loads are held in the
+    /// store's bounded pre-load buffer and committed when it loads.
     func configure(
         store: HealthStore,
         onReading: @escaping @MainActor (Reading) -> Void,
-        onReadings: (@MainActor ([Reading]) -> Void)? = nil
+        onReadings: (@MainActor ([Reading]) -> Void)? = nil,
+        onLinkEnded: (@MainActor () -> Void)? = nil
     ) {
         self.store = store
         self.onReading = onReading
         self.onReadings = onReadings
+        self.onLinkEnded = onLinkEnded
         guard central == nil else { return }
         central = CBCentralManager(
             delegate: self,
@@ -317,7 +287,7 @@ final class BluetoothManager: NSObject {
             // discovery is under way or finished is left alone: rediscovering would reset a
             // ring measurement and overwrite observed streaming state. Only a connected link
             // HeartSync has never interrogated (for example after restoration) is discovered.
-            if discoveryStates[peripheral.identifier] == nil {
+            if links[peripheral.identifier] == nil {
                 discoverServices(on: peripheral)
             }
             return
@@ -334,14 +304,15 @@ final class BluetoothManager: NSObject {
 
     func disconnect(sourceID: String) {
         guard let uuid = UUID(uuidString: sourceID), let peripheral = peripherals[uuid] else { return }
-        cancelFreshReconnect(for: uuid)
-        cancelPendingReconnect(for: uuid)
-        fullDiscoveryRequested.remove(uuid)
+        records[uuid]?.cancelFreshReconnect()
+        records[uuid]?.cancelPendingReconnect()
+        records[uuid]?.fullDiscoveryRequested = false
         // Stop a running ring measurement while the link can still carry the command.
         stopRingMeasurement(on: peripheral)
         central.cancelPeripheralConnection(peripheral)
         endConnectionSession(for: uuid)
         connectionStates[uuid] = .disconnected
+        onLinkEnded?()
     }
 
     /// User-initiated reconnection: a fresh app connection session, not a rediscovery on
@@ -355,8 +326,8 @@ final class BluetoothManager: NSObject {
     /// schedule a duplicate connection.
     func reconnect(sourceID: String) {
         guard let uuid = UUID(uuidString: sourceID) else { return }
-        cancelPendingReconnect(for: uuid)
-        reconnectAttempts[uuid] = nil
+        records[uuid]?.cancelPendingReconnect()
+        records[uuid]?.reconnectAttempts = 0
         guard let peripheral = peripherals[uuid] ?? central.retrievePeripherals(withIdentifiers: [uuid]).first else { return }
         peripherals[uuid] = peripheral
         beginFreshSession(peripheral)
@@ -367,7 +338,7 @@ final class BluetoothManager: NSObject {
     /// result is read with `diagnosticsReport(forSource:deviceName:)`.
     func runDiagnostics(sourceID: String) {
         guard isPoweredOn, let uuid = UUID(uuidString: sourceID) else { return }
-        fullDiscoveryRequested.insert(uuid)
+        records[uuid, default: PeripheralRecord()].fullDiscoveryRequested = true
         reconnect(sourceID: sourceID)
     }
 
@@ -384,26 +355,27 @@ final class BluetoothManager: NSObject {
 
     private func beginFreshSession(_ peripheral: CBPeripheral) {
         let id = peripheral.identifier
-        cancelFreshReconnect(for: id)
+        records[id]?.cancelFreshReconnect()
         switch peripheral.state {
         case .connected, .disconnecting:
             stopRingMeasurement(on: peripheral)
             endConnectionSession(for: id)
-            pendingFreshReconnects.insert(id)
+            records[id, default: PeripheralRecord()].awaitingFreshReconnect = true
             connectionStates[id] = .connecting
             if peripheral.state == .connected {
                 central.cancelPeripheralConnection(peripheral)
             }
             // The disconnect callback normally arrives within a second. If it never does,
-            // reconnect anyway rather than leaving the row in "Connecting" forever.
-            let session = connectionSessions[id]
-            freshReconnectFallbacks[id] = Task { [weak self] in
+            // reconnect anyway rather than leaving the row in "Connecting" forever. The link
+            // has just ended, so the captured session is nil until a new one begins.
+            let session = links[id]?.session
+            records[id]?.freshReconnectFallback = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled, let self,
-                      self.connectionSessions[id] == session,
-                      self.pendingFreshReconnects.remove(id) != nil
+                      self.links[id]?.session == session,
+                      self.records[id]?.awaitingFreshReconnect == true
                 else { return }
-                self.freshReconnectFallbacks[id] = nil
+                self.records[id]?.cancelFreshReconnect()
                 guard self.isPoweredOn, let peripheral = self.peripherals[id] else { return }
                 self.connect(peripheral)
             }
@@ -414,62 +386,44 @@ final class BluetoothManager: NSObject {
         }
     }
 
-    private func cancelFreshReconnect(for id: UUID) {
-        pendingFreshReconnects.remove(id)
-        freshReconnectFallbacks[id]?.cancel()
-        freshReconnectFallbacks[id] = nil
+    /// Discards everything that belongs to one app connection session of one peripheral,
+    /// by removing its one link value. Persistent facts (source, history, diagnostics of the
+    /// ended session, the device record) are kept.
+    private func endConnectionSession(for id: UUID) {
+        links.removeValue(forKey: id)?.cancelScheduledWork()
+        // The beats behind the progress count went with the link's accumulator.
+        if hrvProgress[id] != nil { hrvProgress[id] = nil }
+        if ringSessions[id] != nil { ringSessions[id] = nil }
     }
 
-    /// Discards everything that belongs to one app connection session of one peripheral.
-    /// Persistent facts (source, history, diagnostics of the ended session) are kept.
-    private func endConnectionSession(for id: UUID) {
-        discoveryStates[id] = nil
-        streamStallTasks[id]?.cancel()
-        streamStallTasks[id] = nil
-        observedMetrics[id] = nil
-        streamCadences[id] = nil
-        ringSessions[id] = nil
-        ringCharacteristics[id] = nil
-        ringAssemblers[id] = nil
-        ringTimeoutTasks[id]?.cancel()
-        ringTimeoutTasks[id] = nil
-        pendingRingWrites[id] = nil
+    /// A link that is gone: disconnected, or the radio turned off. Ends the session and
+    /// clears what described the live link, then lets the owner commit anything waiting.
+    private func endLink(for id: UUID) {
+        endConnectionSession(for: id)
+        readingAdmission.reset(sourceID: id.uuidString)
+        if hrvQuality[id] != nil { hrvQuality[id] = nil }
+        if pulseOximeterQuality[id] != nil { pulseOximeterQuality[id] = nil }
+        onLinkEnded?()
     }
 
     func forget(sourceID: String) {
         guard let uuid = UUID(uuidString: sourceID) else { return }
-        cancelFreshReconnect(for: uuid)
-        fullDiscoveryRequested.remove(uuid)
         if let peripheral = peripherals[uuid] {
             stopRingMeasurement(on: peripheral)
             central.cancelPeripheralConnection(peripheral)
         }
-        endConnectionSession(for: uuid)
-        diagnostics[uuid] = nil
-        diagnosticsIDs.remove(uuid)
-        cancelPendingReconnect(for: uuid)
         // Everything keyed by this peripheral goes, or a device re-added later inherits
         // the stale HRV window, quality caveat, or half-collected model string of the one
-        // the user just removed.
+        // the user just removed. Two values and the published dictionaries, not a list of
+        // fields that each teardown path has to remember.
+        endLink(for: uuid)
+        records.removeValue(forKey: uuid)?.cancelScheduledWork()
+        diagnostics[uuid] = nil
+        diagnosticsIDs.remove(uuid)
         peripherals[uuid] = nil
         connectionStates[uuid] = nil
-        hrvAccumulators[uuid] = nil
-        readingAdmission.reset(sourceID: uuid.uuidString)
-        hrvProgress[uuid] = nil
-        hrvQuality[uuid] = nil
-        pulseOximeterQuality[uuid] = nil
-        pendingModelInfo[uuid] = nil
-        discoveryStates[uuid] = nil
-        streamStallTasks[uuid]?.cancel()
-        streamStallTasks[uuid] = nil
-        reconnectAttempts[uuid] = nil
         // `discoveredByID` is deliberately left alone: a forgotten device should still be
         // offered by an in-flight scan so the user can add it back.
-    }
-
-    private func cancelPendingReconnect(for id: UUID) {
-        reconnectTasks[id]?.cancel()
-        reconnectTasks[id] = nil
     }
 
     /// Schedules a reconnection attempt after an exponentially growing delay.
@@ -482,9 +436,9 @@ final class BluetoothManager: NSObject {
         gaveUpReason: String = "Lost connection. Use Reconnect to try again."
     ) {
         let id = peripheral.identifier
-        cancelPendingReconnect(for: id)
+        records[id]?.cancelPendingReconnect()
 
-        let attempt = (reconnectAttempts[id] ?? 0) + 1
+        let attempt = (records[id]?.reconnectAttempts ?? 0) + 1
         guard attempt <= Self.maximumReconnectAttempts else {
             // Names the recovery the devices list actually offers ("Reconnect" in the row's
             // menu) rather than leaving a dead end.
@@ -494,17 +448,17 @@ final class BluetoothManager: NSObject {
             )
             return
         }
-        reconnectAttempts[id] = attempt
+        records[id, default: PeripheralRecord()].reconnectAttempts = attempt
 
         let delay = min(
             Self.firstReconnectDelay * pow(2, Double(attempt - 1)),
             Self.maximumReconnectDelay
         )
-        reconnectTasks[id] = Task { [weak self] in
+        records[id]?.reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
             guard let self else { return }
-            self.reconnectTasks[id] = nil
+            self.records[id]?.reconnectTask = nil
             // The radio can go away while we wait. Retrying then would burn an attempt on
             // a call that cannot succeed; `centralManagerDidUpdateState` reconnects every
             // enabled source when power comes back, so nothing is lost by stopping here.
@@ -524,11 +478,13 @@ final class BluetoothManager: NSObject {
         let id = peripheral.identifier
         connectionStates[id] = .linkConnected
         endConnectionSession(for: id)
-        connectionSessions[id, default: 0] += 1
-        let fullDiscovery = fullDiscoveryRequested.remove(id) != nil
+        sessionCounter += 1
+        links[id] = PeripheralLink(session: sessionCounter)
+        let fullDiscovery = records[id]?.fullDiscoveryRequested == true
+        records[id]?.fullDiscoveryRequested = false
         diagnostics[id] = BluetoothDiagnostics(
             startedAt: .now,
-            connectionSession: connectionSessions[id] ?? 0,
+            connectionSession: sessionCounter,
             fullDiscovery: fullDiscovery
         )
         diagnosticsIDs.insert(id)
@@ -586,16 +542,16 @@ final class BluetoothManager: NSObject {
     }
 
     private func note(metric: MetricKind, for peripheralID: UUID, at date: Date = .now) {
-        observedMetrics[peripheralID, default: []].insert(metric)
-        streamCadences[peripheralID, default: StreamCadence()].record(date)
+        links[peripheralID]?.observedMetrics.insert(metric)
+        links[peripheralID]?.cadence.record(date)
         // An on-demand ring reading is a completed spot measurement. It keeps its own
         // timestamp and ages normally; it is not a continuous stream that "stalls".
         if let ring = ringSessions[peripheralID], ring.suppressesStandardHeartRate {
             applyDiscoveryResolution(for: peripheralID)
             return
         }
-        streamStallTasks[peripheralID]?.cancel()
-        streamStallTasks[peripheralID] = nil
+        links[peripheralID]?.stallTask?.cancel()
+        links[peripheralID]?.stallTask = nil
         let state = (connectionStates[peripheralID] ?? .disconnected).receiving(metric)
         setConnectionState(state, for: peripheralID)
         if case .streaming = state {
@@ -604,7 +560,7 @@ final class BluetoothManager: NSObject {
     }
 
     private func applyDiscoveryResolution(for peripheralID: UUID) {
-        guard let discovery = discoveryStates[peripheralID] else { return }
+        guard let link = links[peripheralID], let discovery = link.discovery else { return }
         let ring = ringSessions[peripheralID]
         diagnostics[peripheralID]?.ringPhase = ring?.statusText
         let onDemand = ring?.suppressesStandardHeartRate == true
@@ -612,7 +568,7 @@ final class BluetoothManager: NSObject {
             discovery.resolution,
             current: connectionStates[peripheralID] ?? .disconnected,
             // A ring's spot reading is shown by the ring status, not as a stream.
-            observed: onDemand ? [] : observedMetrics[peripheralID] ?? [],
+            observed: onDemand ? [] : link.observedMetrics,
             onDemandStatus: onDemand ? ring?.statusText : nil,
             adapterWarning: onDemand ? nil : ring?.statusText
         )
@@ -627,13 +583,14 @@ final class BluetoothManager: NSObject {
     /// packets, or a stream that stopped. It changes only the displayed state; a later valid
     /// value recovers the stream.
     private func scheduleStreamStallCheck(for peripheralID: UUID) {
-        streamStallTasks[peripheralID]?.cancel()
-        let threshold = streamCadences[peripheralID]?.stallThreshold ?? StreamCadence.initialAcquisitionBudget
-        let session = connectionSessions[peripheralID]
-        streamStallTasks[peripheralID] = Task { [weak self] in
+        guard let link = links[peripheralID] else { return }
+        link.stallTask?.cancel()
+        let threshold = link.cadence.stallThreshold
+        let session = link.session
+        links[peripheralID]?.stallTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(threshold))
             guard !Task.isCancelled, let self,
-                  self.connectionSessions[peripheralID] == session
+                  self.links[peripheralID]?.session == session
             else { return }
             let current = self.connectionStates[peripheralID] ?? .disconnected
             let diagnosis: BluetoothDiagnostics.StallDiagnosis
@@ -649,7 +606,7 @@ final class BluetoothManager: NSObject {
         }
     }
 
-    private func subscriptionCandidate(for characteristic: CBCharacteristic) -> BluetoothDiscoveryState.Candidate? {
+    private func subscriptionCandidate(for characteristic: CBCharacteristic, on peripheralID: UUID) -> BluetoothDiscoveryState.Candidate? {
         let metrics: Set<MetricKind>
         switch characteristic.uuid {
         case GATT.heartRateMeasurement:
@@ -665,14 +622,14 @@ final class BluetoothManager: NSObject {
             return nil
         }
         let id = "\(characteristic.uuid.uuidString)#\(ObjectIdentifier(characteristic).hashValue)"
-        characteristicSubscriptionIDs[ObjectIdentifier(characteristic)] = id
+        links[peripheralID]?.subscriptionIDs[ObjectIdentifier(characteristic)] = id
         return BluetoothDiscoveryState.Candidate(id: id, metrics: metrics)
     }
 
     /// A vendor control channel: required for the ring session, but never a metric.
-    private func controlChannelCandidate(for characteristic: CBCharacteristic) -> BluetoothDiscoveryState.Candidate {
+    private func controlChannelCandidate(for characteristic: CBCharacteristic, on peripheralID: UUID) -> BluetoothDiscoveryState.Candidate {
         let id = "\(characteristic.uuid.uuidString)#\(ObjectIdentifier(characteristic).hashValue)"
-        characteristicSubscriptionIDs[ObjectIdentifier(characteristic)] = id
+        links[peripheralID]?.subscriptionIDs[ObjectIdentifier(characteristic)] = id
         return BluetoothDiscoveryState.Candidate(id: id, metrics: [])
     }
 
@@ -719,8 +676,7 @@ final class BluetoothManager: NSObject {
             note(metric: .heartRate, for: id)
         }
 
-        guard !measurement.rrIntervalsMS.isEmpty else { return }
-        var accumulator = hrvAccumulators[id] ?? HRVAccumulator()
+        guard !measurement.rrIntervalsMS.isEmpty, var accumulator = links[id]?.hrv else { return }
         accumulator.add(intervals: measurement.rrIntervalsMS, at: now)
         // The only thing shown is the beat count towards the first HRV reading, so publish
         // when that changes and stop once the target is reached instead of every frame.
@@ -746,7 +702,7 @@ final class BluetoothManager: NSObject {
             // emitted rather than being a measurement of its own.
             hrvQuality[id] = HRVQuality(metrics: metrics, measuredAt: now)
         }
-        hrvAccumulators[id] = accumulator
+        links[id]?.hrv = accumulator
     }
 
     fileprivate func handlePulseOximeter(_ data: Data, from peripheral: CBPeripheral, isSpotCheck: Bool) {
@@ -889,11 +845,9 @@ final class BluetoothManager: NSObject {
         from peripheral: CBPeripheral
     ) {
         let id = peripheral.identifier
-        guard ringSessions[id] != nil else { return }
+        guard ringSessions[id] != nil, links[id] != nil else { return }
         let now = Date.now
-        var assembler = ringAssemblers[id]?[channel] ?? YCBTFrameAssembler()
-        let outputs = assembler.append(data)
-        ringAssemblers[id, default: [:]][channel] = assembler
+        let outputs = links[id]?.ring.assemble(data, on: channel) ?? []
 
         for output in outputs {
             switch output {
@@ -927,12 +881,12 @@ final class BluetoothManager: NSObject {
         for action in actions {
             switch action {
             case .write(let data, let purpose):
-                guard let characteristic = ringCharacteristics[id]?[.command],
+                guard let characteristic = links[id]?.ring.characteristics[.command],
                       let session = ringSessions[id]
                 else { continue }
                 diagnostics[id]?.recordCommand(purpose: purpose.rawValue, bytes: data.count, at: .now)
                 if session.writeWithResponse {
-                    pendingRingWrites[id, default: []].append(purpose)
+                    links[id]?.ring.noteWriteSent(purpose)
                     peripheral.writeValue(data, for: characteristic, type: .withResponse)
                 } else {
                     // No transport callback exists for this write type; the ring's reply is
@@ -942,16 +896,16 @@ final class BluetoothManager: NSObject {
                 }
 
             case .scheduleTimeout(let timeout, let seconds, let token):
-                ringTimeoutTasks[id]?.cancel()
-                let session = connectionSessions[id]
-                ringTimeoutTasks[id] = Task { [weak self] in
+                links[id]?.ring.timeoutTask?.cancel()
+                let session = links[id]?.session
+                links[id]?.ring.timeoutTask = Task { [weak self] in
                     try? await Task.sleep(for: .seconds(seconds))
                     guard !Task.isCancelled, let self,
-                          self.connectionSessions[id] == session,
+                          self.links[id]?.session == session,
                           var ring = self.ringSessions[id],
                           let peripheral = self.peripherals[id]
                     else { return }
-                    self.ringTimeoutTasks[id] = nil
+                    self.links[id]?.ring.timeoutTask = nil
                     let actions = ring.timeoutElapsed(timeout, token: token)
                     self.ringSessions[id] = ring
                     if peripheral.state == .connected {
@@ -1017,9 +971,7 @@ final class BluetoothManager: NSObject {
 
     fileprivate func handleRingWriteResult(for peripheral: CBPeripheral, error: (any Error)?) {
         let id = peripheral.identifier
-        guard var pending = pendingRingWrites[id], !pending.isEmpty else { return }
-        let purpose = pending.removeFirst()
-        pendingRingWrites[id] = pending
+        guard let purpose = links[id]?.ring.takeWriteResult() else { return }
         diagnostics[id]?.recordWrite(purpose: purpose.rawValue, error: error?.localizedDescription)
         guard var session = ringSessions[id] else { return }
         let actions = session.writeFinished(purpose, error: error?.localizedDescription)
@@ -1060,7 +1012,7 @@ final class BluetoothManager: NSObject {
         else { return }
 
         let id = peripheral.identifier
-        var info = pendingModelInfo[id] ?? DeviceInformation()
+        var info = records[id]?.deviceInformation ?? DeviceInformation()
         switch characteristic.uuid {
         case GATT.manufacturerNameString:   info.manufacturer = text
         case GATT.modelNumberString:        info.model = text
@@ -1070,7 +1022,7 @@ final class BluetoothManager: NSObject {
         case GATT.firmwareRevisionString:   info.firmware = text
         default: return
         }
-        pendingModelInfo[id] = info
+        records[id, default: PeripheralRecord()].deviceInformation = info
 
         let combined = info.displayString
         diagnostics[id]?.deviceIdentity = combined.isEmpty ? nil : combined
@@ -1089,18 +1041,28 @@ extension BluetoothManager: CBCentralManagerDelegate {
         MainActor.assumeIsolated {
             self.state = newState
             if newState == .poweredOn {
+                // Links iOS handed back at restoration are discovered now, once the central
+                // can use them, and exactly once: `reconnectKnownDevices` below leaves a link
+                // that already has a session alone.
+                for peripheral in self.peripherals.values
+                where peripheral.state == .connected && self.links[peripheral.identifier] == nil {
+                    self.discoverServices(on: peripheral)
+                }
                 self.reconnectKnownDevices()
             } else {
                 // Ends the scan properly rather than only flipping the flag: the timeout
                 // and coalescing tasks have to stop too, and the last packets published.
                 self.stopScan()
                 // Pending reconnects cannot succeed without a radio, and would otherwise
-                // spend their attempt ceiling while Bluetooth is off.
-                for task in self.reconnectTasks.values { task.cancel() }
-                self.reconnectTasks.removeAll()
-                // An explicit Reconnect cannot complete without a radio either.
-                for id in self.pendingFreshReconnects { self.cancelFreshReconnect(for: id) }
-                for id in Array(self.discoveryStates.keys) { self.endConnectionSession(for: id) }
+                // spend their attempt ceiling while Bluetooth is off. An explicit Reconnect
+                // cannot complete without a radio either.
+                for id in Array(self.records.keys) {
+                    self.records[id]?.cancelPendingReconnect()
+                    self.records[id]?.cancelFreshReconnect()
+                }
+                // No disconnect callback arrives for these links, so they end here: the HRV
+                // window among them, which must not join beats across the outage.
+                for id in Array(self.links.keys) { self.endLink(for: id) }
                 // Mark everything disconnected so the UI does not keep showing stale
                 // "streaming" badges after the radio goes away.
                 for key in self.connectionStates.keys {
@@ -1160,8 +1122,8 @@ extension BluetoothManager: CBCentralManagerDelegate {
             self.logger.info("Connected to \(peripheral.identifier.uuidString, privacy: .public)")
             // A connection that actually succeeded resets the backoff, so a device that
             // drops once an hour never accumulates its way to the attempt ceiling.
-            self.cancelPendingReconnect(for: peripheral.identifier)
-            self.reconnectAttempts[peripheral.identifier] = nil
+            self.records[peripheral.identifier]?.cancelPendingReconnect()
+            self.records[peripheral.identifier]?.reconnectAttempts = 0
             self.store?.markSeen(sourceID: peripheral.identifier.uuidString)
             self.discoverServices(on: peripheral)
         }
@@ -1203,19 +1165,14 @@ extension BluetoothManager: CBCentralManagerDelegate {
             let id = peripheral.identifier
             self.connectionStates[id] = .disconnected
             // The HRV window is only meaningful over a continuous recording, so a
-            // disconnection invalidates it rather than pausing it.
-            self.hrvAccumulators[id]?.reset()
-            self.readingAdmission.reset(sourceID: id.uuidString)
-            self.hrvProgress[id] = nil
-            self.hrvQuality[id] = nil
-            self.pulseOximeterQuality[id] = nil
-            // Pending vendor writes, timers, and half-assembled frames die with the link.
-            self.endConnectionSession(for: id)
+            // disconnection invalidates it rather than pausing it. Pending vendor writes,
+            // timers, and half-assembled frames die with the link too.
+            self.endLink(for: id)
 
             // An explicit Reconnect was waiting for exactly this callback. Connect once,
             // now, and skip the automatic backoff so it cannot schedule a second attempt.
-            if self.pendingFreshReconnects.contains(id) {
-                self.cancelFreshReconnect(for: id)
+            if self.records[id]?.awaitingFreshReconnect == true {
+                self.records[id]?.cancelFreshReconnect()
                 guard self.isPoweredOn,
                       let source = self.store?.source(id: id.uuidString), source.isEnabled
                 else { return }
@@ -1242,13 +1199,12 @@ extension BluetoothManager: CBCentralManagerDelegate {
             dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
         MainActor.assumeIsolated {
             // iOS relaunched the app to hand back live connections. Re-adopt them and
-            // re-attach the delegate, otherwise notifications arrive nowhere.
+            // re-attach the delegate, otherwise notifications arrive nowhere. Discovery
+            // waits for `.poweredOn`: the central cannot be used before it, and starting
+            // here as well used to run discovery twice on every restored link.
             for peripheral in restored {
                 self.peripherals[peripheral.identifier] = peripheral
                 peripheral.delegate = self
-                if peripheral.state == .connected {
-                    self.discoverServices(on: peripheral)
-                }
             }
             self.logger.info("Restored \(restored.count) peripheral(s) from background")
         }
@@ -1272,13 +1228,15 @@ extension BluetoothManager: CBPeripheralDelegate {
                     .unsupported("This device exposes no supported health service. Confirm it uses a standard Heart Rate, Pulse Oximeter, or Health Thermometer profile.")
                 return
             }
+            let id = peripheral.identifier
+            guard self.links[id] != nil else { return }
             var serviceIDs: Set<String> = []
             for (index, service) in services.enumerated() {
                 let serviceID = "\(service.uuid.uuidString)#\(index)"
-                self.serviceDiscoveryIDs[ObjectIdentifier(service)] = serviceID
+                self.links[id]?.serviceIDs[ObjectIdentifier(service)] = serviceID
                 serviceIDs.insert(serviceID)
             }
-            self.discoveryStates[peripheral.identifier] = BluetoothDiscoveryState(serviceIDs: serviceIDs)
+            self.links[id]?.discovery = BluetoothDiscoveryState(serviceIDs: serviceIDs)
             for service in services {
                 peripheral.discoverCharacteristics(nil, for: service)
             }
@@ -1291,10 +1249,10 @@ extension BluetoothManager: CBPeripheralDelegate {
         error: (any Error)?
     ) {
         MainActor.assumeIsolated {
-            guard var discovery = self.discoveryStates[peripheral.identifier],
-                  let serviceID = self.serviceDiscoveryIDs[ObjectIdentifier(service)]
-            else { return }
             let id = peripheral.identifier
+            guard var discovery = self.links[id]?.discovery,
+                  let serviceID = self.links[id]?.serviceIDs[ObjectIdentifier(service)]
+            else { return }
             let characteristics = service.characteristics ?? []
             let fullDiscovery = self.diagnostics[id]?.fullDiscovery == true
             var candidates: [BluetoothDiscoveryState.Candidate] = []
@@ -1318,7 +1276,7 @@ extension BluetoothManager: CBPeripheralDelegate {
 
             for characteristic in characteristics {
                 let key = "\(service.uuid.uuidString)/\(characteristic.uuid.uuidString)#\(ObjectIdentifier(characteristic).hashValue)"
-                self.characteristicKeys[ObjectIdentifier(characteristic)] = key
+                self.links[id]?.characteristicKeys[ObjectIdentifier(characteristic)] = key
                 self.diagnostics[id]?.recordCharacteristic(
                     key: key,
                     uuid: characteristic.uuid.uuidString,
@@ -1328,14 +1286,14 @@ extension BluetoothManager: CBPeripheralDelegate {
                 let canSubscribe = characteristic.properties.contains(.notify)
                     || characteristic.properties.contains(.indicate)
                 if GATT.notifyCharacteristics.contains(characteristic.uuid), canSubscribe {
-                    if let candidate = self.subscriptionCandidate(for: characteristic) {
+                    if let candidate = self.subscriptionCandidate(for: characteristic, on: id) {
                         candidates.append(candidate)
                         self.diagnostics[id]?.recordSubscription(key: key, status: .pending)
                         peripheral.setNotifyValue(true, for: characteristic)
                     }
                 } else if let channel = ringChannels[characteristic.uuid] {
-                    self.ringCharacteristics[id, default: [:]][channel] = characteristic
-                    candidates.append(self.controlChannelCandidate(for: characteristic))
+                    self.links[id]?.ring.characteristics[channel] = characteristic
+                    candidates.append(self.controlChannelCandidate(for: characteristic, on: id))
                     self.diagnostics[id]?.recordSubscription(key: key, status: .pending)
                     peripheral.setNotifyValue(true, for: characteristic)
                 } else if fullDiscovery, canSubscribe {
@@ -1354,8 +1312,8 @@ extension BluetoothManager: CBPeripheralDelegate {
                 candidates: candidates,
                 errorDescription: error?.localizedDescription
             )
-            self.discoveryStates[peripheral.identifier] = discovery
-            self.applyDiscoveryResolution(for: peripheral.identifier)
+            self.links[id]?.discovery = discovery
+            self.applyDiscoveryResolution(for: id)
         }
     }
 
@@ -1366,7 +1324,7 @@ extension BluetoothManager: CBPeripheralDelegate {
     ) {
         MainActor.assumeIsolated {
             let id = peripheral.identifier
-            let key = self.characteristicKeys[ObjectIdentifier(characteristic)]
+            let key = self.links[id]?.characteristicKeys[ObjectIdentifier(characteristic)]
             if let error {
                 self.diagnostics[id]?.recordCallbackError(key: key, error.localizedDescription)
                 self.connectionStates[id] = (
@@ -1420,17 +1378,17 @@ extension BluetoothManager: CBPeripheralDelegate {
             let id = peripheral.identifier
             let subscriptionError = error?.localizedDescription
                 ?? (characteristic.isNotifying ? nil : "Peripheral declined notifications")
-            if let key = self.characteristicKeys[ObjectIdentifier(characteristic)] {
+            if let key = self.links[id]?.characteristicKeys[ObjectIdentifier(characteristic)] {
                 self.diagnostics[id]?.recordSubscription(
                     key: key,
                     status: subscriptionError.map(BluetoothDiagnostics.SubscriptionStatus.failed) ?? .subscribed
                 )
             }
-            guard let subscriptionID = self.characteristicSubscriptionIDs[ObjectIdentifier(characteristic)],
-                  var discovery = self.discoveryStates[id]
+            guard let subscriptionID = self.links[id]?.subscriptionIDs[ObjectIdentifier(characteristic)],
+                  var discovery = self.links[id]?.discovery
             else { return }
             discovery.finishSubscription(id: subscriptionID, errorDescription: subscriptionError)
-            self.discoveryStates[id] = discovery
+            self.links[id]?.discovery = discovery
 
             // Both vendor channels must confirm before the ring session sends anything.
             let ringChannel: R11MRingSession.Channel? = switch characteristic.uuid {

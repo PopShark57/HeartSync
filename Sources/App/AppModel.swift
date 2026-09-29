@@ -55,14 +55,20 @@ final class AppModel {
         var configureBluetooth: @MainActor (
             HealthStore,
             _ onReading: @escaping @MainActor (Reading) -> Void,
-            _ onReadings: @escaping @MainActor ([Reading]) -> Void
+            _ onReadings: @escaping @MainActor ([Reading]) -> Void,
+            _ onLinkEnded: @escaping @MainActor () -> Void
         ) -> Void
         var reconnectBluetooth: @MainActor () -> Void
+        /// Reconnects known devices once the history has loaded. The central is created at
+        /// launch, before the source list exists, so this is the first moment it can.
+        var resumeBluetoothAfterLoad: @MainActor () -> Void = {}
         var stopBluetoothScan: @MainActor () -> Void
         var configureHealthKit: @MainActor (
             HealthStore,
             _ onReadings: @escaping @MainActor ([Reading], [DataSource], Set<UUID>) -> Bool
         ) -> Void
+        /// Installs HealthKit's background-delivery observer queries. Called at launch.
+        var registerHealthKitBackgroundDelivery: @MainActor () -> Void = {}
         var restoreHealthKit: @MainActor () async -> Void
         var isHealthKitAuthorized: @MainActor () -> Bool
         var syncHealthKit: @MainActor () async -> Void
@@ -76,6 +82,13 @@ final class AppModel {
         /// `minimumInterval` is how recent the last committed sync may be before an
         /// unattended call skips; zero always attempts (subject to a rate-limit backoff).
         var syncOura: @MainActor (_ userInitiated: Bool, _ minimumInterval: TimeInterval) async -> Void
+        /// Stops HealthKit imports before a reset and waits for the one in flight.
+        var beginHealthKitReset: @MainActor () async -> Void = {}
+        /// Resumes HealthKit imports; `true` clears the anchors first so history is re-read.
+        var finishHealthKitReset: @MainActor (_ rereadHistory: Bool) async -> Void = { _ in }
+        /// Cancels and awaits a running Oura sync, then removes its cache and readings.
+        /// Reports whether the cache and credential changes were saved.
+        var clearOura: @MainActor (_ keepingAuthorization: Bool) async -> Bool = { _ in true }
 
         static func live(
             bluetooth: BluetoothManager,
@@ -83,14 +96,21 @@ final class AppModel {
             oura: OuraManager
         ) -> Self {
             Self(
-                configureBluetooth: { store, onReading, onReadings in
-                    bluetooth.configure(store: store, onReading: onReading, onReadings: onReadings)
+                configureBluetooth: { store, onReading, onReadings, onLinkEnded in
+                    bluetooth.configure(
+                        store: store,
+                        onReading: onReading,
+                        onReadings: onReadings,
+                        onLinkEnded: onLinkEnded
+                    )
                 },
                 reconnectBluetooth: { bluetooth.reconnectKnownDevices() },
+                resumeBluetoothAfterLoad: { bluetooth.reconnectKnownDevices() },
                 stopBluetoothScan: { bluetooth.stopScan() },
                 configureHealthKit: { store, onReadings in
                     healthKit.configure(store: store, onReadings: onReadings)
                 },
+                registerHealthKitBackgroundDelivery: { healthKit.registerBackgroundObservers() },
                 restoreHealthKit: { await healthKit.restoreSessionIfNeeded() },
                 isHealthKitAuthorized: { healthKit.availability == .authorized },
                 syncHealthKit: { await healthKit.syncAll() },
@@ -106,13 +126,16 @@ final class AppModel {
                     } else {
                         await oura.syncIfDue(minimumInterval: minimumInterval)
                     }
-                }
+                },
+                beginHealthKitReset: { await healthKit.beginDataReset() },
+                finishHealthKitReset: { await healthKit.finishDataReset(rereadingHistory: $0) },
+                clearOura: { await oura.clearCachedData(keepingAuthorization: $0) }
             )
         }
 
         /// Does nothing and reports nothing authorized.
         static let inert = Self(
-            configureBluetooth: { _, _, _ in },
+            configureBluetooth: { _, _, _, _ in },
             reconnectBluetooth: {},
             stopBluetoothScan: {},
             configureHealthKit: { _, _ in },
@@ -136,15 +159,56 @@ final class AppModel {
     private(set) var startupState: StartupState = .loading
     private(set) var startupNotice: String?
 
+    /// Live Bluetooth values waiting to commit as one transaction (improvement 52).
+    private var bluetoothBuffer = BluetoothIngestBuffer()
+    private var bluetoothFlushTask: Task<Void, Never>?
+    private var hasLaunched = false
     private var derivedTask: Task<Void, Never>?
     private var maintenanceTask: Task<Void, Never>?
     private var ouraTimerTask: Task<Void, Never>?
     private var hasStarted = false
+    /// True while `resetLocalData` runs; a second reset is refused.
+    private(set) var isResettingData = false
+    /// Advanced by every reset. Work that read history before a reset (the derived
+    /// estimates, computed off the main actor) checks it before writing, so it cannot
+    /// write back values computed from history that no longer exists.
+    private var dataEpoch = 0
     /// Whether the user has chosen a retention period in this session, which is what lets a
     /// settings file that was reset or set aside delete history again.
     private var retentionChoiceIsUsers = false
 
     // MARK: - Lifecycle
+
+    /// The part of startup that must happen at process launch, from
+    /// `application(_:didFinishLaunchingWithOptions:)`, before any view exists
+    /// (improvement 53).
+    ///
+    /// iOS relaunches the app in the background to hand back a restored Bluetooth link or to
+    /// deliver new Health samples, and in either case expects the app to re-create its
+    /// central manager and register its observer queries during launch. Both used to wait for
+    /// the root view's `.task`, which is not a launch hook and may not run in the background.
+    /// Nothing here reads history: Bluetooth values that arrive before the store loads wait
+    /// in its bounded pre-load buffer, and the HealthKit handlers wait for `start()` to
+    /// finish before draining.
+    func launch() {
+        guard !hasLaunched else { return }
+        hasLaunched = true
+        #if DEBUG
+        guard !Self.debugDataIsolationEnabled else { return }
+        #endif
+        transports.configureBluetooth(
+            store,
+            { [weak self] reading in self?.bufferBluetooth(reading) },
+            // A ring history import commits as one idempotent batch, after anything live
+            // that was waiting, so a value is never committed behind an older one.
+            { [weak self] readings in
+                self?.flushBluetoothBuffer()
+                self?.ingest(readings)
+            },
+            { [weak self] in self?.flushBluetoothBuffer() }
+        )
+        transports.registerHealthKitBackgroundDelivery()
+    }
 
     func start() async {
         guard !hasStarted else { return }
@@ -236,16 +300,10 @@ final class AppModel {
         applyRetentionSettings()
         store.prune()
 
-        transports.configureBluetooth(
-            store,
-            { [weak self] reading in
-                self?.ingest([reading])
-            },
-            // A ring history import commits as one idempotent batch.
-            { [weak self] readings in
-                self?.ingest(readings)
-            }
-        )
+        // Normally done at launch already; a test or a preview that calls `start()` directly
+        // gets it here. The central now sees the loaded source list, so reconnect the rest.
+        launch()
+        transports.resumeBluetoothAfterLoad()
         transports.configureHealthKit(store) { [weak self] readings, sources, deletedIDs in
             self?.ingest(
                 readings,
@@ -328,7 +386,7 @@ final class AppModel {
         if settings.snapshot.autoSyncOura || userInitiated, transports.hasOuraAuthorization() {
             await transports.syncOura(userInitiated, Self.minimumForegroundOuraInterval(settings.snapshot))
         }
-        recomputeDerivedMetrics()
+        await recomputeDerivedMetrics()
         watchCompanion.publishNow()
     }
 
@@ -406,6 +464,8 @@ final class AppModel {
         guard !Self.pairwiseDemoEnabled, !Self.chartGalleryEnabled else { return }
         #endif
         transports.stopBluetoothScan()
+        // Nothing waits in memory while the process may be suspended.
+        flushBluetoothBuffer()
         // Held open with a background-task assertion: prune, compaction, and the checkpoint
         // can outlast the moment the scene changes phase, and a suspended process would leave
         // them half done.
@@ -424,25 +484,61 @@ final class AppModel {
 
     /// Performs one coordinated reset and reports whether the database, settings, and Oura
     /// cache reached durable storage. Apple Health itself is never deleted.
+    ///
+    /// Exclusive with every import (improvement 47). HealthKit's observers are stopped and
+    /// its drain in flight is awaited, and a running Oura sync is cancelled and awaited,
+    /// before anything is deleted; both managers then drop any page fetched before the
+    /// reset, so nothing from before it can be committed after it. Only then does HealthKit
+    /// resume: from cleared anchors for a resync, or from the committed ones for "forget",
+    /// so old Health history does not return and only later samples arrive.
     func resetLocalData(_ mode: DataResetMode) async -> Bool {
+        guard !isResettingData else { return false }
+        isResettingData = true
+        defer { isResettingData = false }
+        dataEpoch &+= 1
+
+        await transports.beginHealthKitReset()
+        // Live values waiting in the buffer are committed now, so they go with the rest.
+        flushBluetoothBuffer()
+        let ouraSaved = await transports.clearOura(mode == .clearForResync)
+        // No suspension between the Oura clear returning and this delete, so no import can
+        // slip in between them.
         let storeCleared = store.deleteAllReadings()
-        let ouraSaved: Bool
-        switch mode {
-        case .clearForResync:
-            healthKit.resetAnchors()
-            ouraSaved = await oura.clearCachedData(keepingAuthorization: true)
-        case .forgetImportedHistory:
-            // Keeping HealthKit anchors means old imported Health history does not
-            // immediately return; future samples after the committed anchors still do.
-            ouraSaved = await oura.clearCachedData(keepingAuthorization: false)
-        }
-        recomputeDerivedMetrics()
+        await transports.finishHealthKitReset(mode == .clearForResync)
+
+        await recomputeDerivedMetrics()
         let storeSaved = await store.saveNow()
         let settingsSaved = await settings.saveNow()
         return storeCleared && ouraSaved && storeSaved && settingsSaved
     }
 
     // MARK: - Ingest
+
+    /// Holds a live Bluetooth value for at most `BluetoothIngestBuffer.flushInterval`, so a
+    /// streaming strap commits a batch every couple of seconds instead of a transaction per
+    /// value.
+    private func bufferBluetooth(_ reading: Reading) {
+        let now = Date.now
+        if bluetoothBuffer.append(reading, at: now) {
+            flushBluetoothBuffer()
+            return
+        }
+        guard bluetoothFlushTask == nil else { return }
+        bluetoothFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(BluetoothIngestBuffer.flushInterval))
+            guard !Task.isCancelled else { return }
+            self?.flushBluetoothBuffer()
+        }
+    }
+
+    /// Commits every waiting Bluetooth value now, as one transaction.
+    func flushBluetoothBuffer() {
+        bluetoothFlushTask?.cancel()
+        bluetoothFlushTask = nil
+        let batch = bluetoothBuffer.drain()
+        guard !batch.isEmpty else { return }
+        ingest(batch)
+    }
 
     /// The single routing seam for all three transports.
     ///
@@ -496,14 +592,14 @@ final class AppModel {
             while !Task.isCancelled {
                 // The model is named only for the duration of the call: holding it across the
                 // sleep would keep a released model alive for up to five more minutes.
-                guard self?.runDerivedTick() != nil else { return }
+                guard await self?.runDerivedTick() != nil else { return }
                 try? await Task.sleep(for: .seconds(300))
             }
         }
     }
 
-    private func runDerivedTick() {
-        recomputeDerivedMetrics()
+    private func runDerivedTick() async {
+        await recomputeDerivedMetrics()
     }
 
     /// Prune, compact, and checkpoint on a timer. HealthKit pages and Bluetooth batches no
@@ -525,28 +621,46 @@ final class AppModel {
 
     static let maintenanceInterval: TimeInterval = 900
 
-    func recomputeDerivedMetrics() {
+    /// Computes HeartSync's estimates off the main actor (`DerivedEstimates`), then
+    /// reconciles and writes them here.
+    func recomputeDerivedMetrics() async {
         // Estimates are only reconciled against a loaded store: before that, "no estimate
         // is current" would be judged against nothing.
         guard store.loadState == .loaded || !store.persistenceEnabled else { return }
-        let vo2 = vo2MaxEstimates()
-        let bloodPressure = bloodPressureEstimateReadings() ?? []
-        let produced = vo2 + bloodPressure
+        let history = store.history
+        let inputs = DerivedEstimates.Inputs(
+            vo2MaxEnabled: settings.snapshot.vo2MaxEstimateEnabled,
+            estimatedMaxHeartRate: settings.profile.estimatedMaxHeartRate,
+            bloodPressureCalibration: settings.canEstimateBloodPressure ? settings.profile.bpCalibration : nil,
+            estimateSourceID: Self.estimateSourceID
+        )
+        let now = Date.now
+        let epoch = dataEpoch
+        let result = await HealthHistory.offMain(priority: .utility) {
+            DerivedEstimates.compute(history: history, inputs: inputs, now: now)
+        }
+        // Computed from a read taken before a reset: writing it would restore estimates of
+        // history that no longer exists.
+        guard epoch == dataEpoch else { return }
+        applyDerivedEstimates(result, now: now)
+    }
 
-        let startOfToday = Calendar.current.startOfDay(for: .now)
+    private func applyDerivedEstimates(_ result: DerivedEstimates.Result, now: Date) {
+        let startOfToday = Calendar.current.startOfDay(for: now)
         store.reconcileEstimates(
             kinds: [.vo2Max],
-            keeping: Set(vo2.map(\.id)),
+            keeping: Set(result.vo2Max.map(\.id)),
             currentSince: settings.snapshot.vo2MaxEstimateEnabled ? startOfToday : nil
         )
         // Scoped to the synthetic estimate source. A ring reports its blood pressure as an
         // estimate under its own source, and that must never be swept up here.
         store.reconcileEstimates(
             kinds: [.bloodPressureSystolic, .bloodPressureDiastolic],
-            keeping: Set(bloodPressure.map(\.id)),
-            currentSince: settings.canEstimateBloodPressure ? Date.now.addingTimeInterval(-300) : nil,
+            keeping: Set(result.bloodPressure.map(\.id)),
+            currentSince: settings.canEstimateBloodPressure ? now.addingTimeInterval(-300) : nil,
             sourceID: Self.estimateSourceID
         )
+        let produced = result.all
         guard !produced.isEmpty else { return }
         // Estimates are revisable documents, not append-only measurements. Stable IDs make
         // an identical recomputation a no-op and let new inputs revise the same day/slot.
@@ -554,107 +668,8 @@ final class AppModel {
         // leave the readings filed under "Unknown device".
         _ = store.upsertBatch(
             readings: produced,
-            updatingSources: bloodPressure.isEmpty ? [] : [Self.estimateSourceDescriptor]
+            updatingSources: result.bloodPressure.isEmpty ? [] : [Self.estimateSourceDescriptor]
         )
-    }
-
-    /// A VO\u{2082} max estimate per source that reports resting heart rate but no measured
-    /// VO\u{2082} max of its own.
-    ///
-    /// Sources that measure VO\u{2082} max directly (an Apple Watch does) are skipped: replacing
-    /// or duplicating a real measurement with a model would be worse data, and comparing a
-    /// device against an estimate derived from itself is circular.
-    private func vo2MaxEstimates() -> [Reading] {
-        guard settings.snapshot.vo2MaxEstimateEnabled else { return [] }
-        guard let maxHR = settings.profile.estimatedMaxHeartRate else { return [] }
-
-        let window = DateInterval(start: .now.addingTimeInterval(-7 * 86_400), end: .now)
-        var result: [Reading] = []
-
-        // One read of each kind for all sources, not one per source.
-        let measuredSources = Set(
-            store.readings(kind: .vo2Max, in: window)
-                .filter { $0.provenance == .measured }
-                .map(\.sourceID)
-        )
-        let restingReadings = store.readings(kind: .restingHeartRate, in: window)
-
-        for source in store.enabledSources {
-            // Skip sources that already measure it.
-            if measuredSources.contains(source.id) { continue }
-
-            guard let latest = restingReadings.last(where: { $0.sourceID == source.id }) else { continue }
-            guard let value = Estimators.vo2Max(
-                restingHeartRate: latest.value,
-                maxHeartRate: maxHR
-            ) else { continue }
-
-            // One estimate per source per day; the id makes repeats collapse.
-            let day = Calendar.current.startOfDay(for: latest.end)
-            result.append(Reading(
-                id: UUID(stableFrom: "derived.vo2.\(source.id).\(Int(day.timeIntervalSince1970))"),
-                sourceID: source.id,
-                kind: .vo2Max,
-                value: value,
-                start: day,
-                end: day.addingTimeInterval(86_400),
-                provenance: .estimated,
-                metadata: ReadingMetadata(modelledBy: ReadingMetadata.heartSyncModel)
-            ))
-        }
-        return result
-    }
-
-    /// The blood-pressure trend index, when the user has enabled it and calibrated it.
-    private func bloodPressureEstimateReadings() -> [Reading]? {
-        guard settings.canEstimateBloodPressure,
-              let calibration = settings.profile.bpCalibration
-        else { return nil }
-
-        // Anchor on the most recent heart rate from any enabled source, since the index
-        // describes the user's state rather than any one device's opinion of it.
-        let recent = DateInterval(start: .now.addingTimeInterval(-600), end: .now)
-        let hrWindows = ComparisonEngine.windows(from: store.readings(kind: .heartRate, in: recent), kind: .heartRate)
-        guard let latestHR = hrWindows.last?.consensus else { return nil }
-
-        let rmssdWindows = ComparisonEngine.windows(
-            from: store.readings(kind: .hrvRMSSD, in: DateInterval(start: .now.addingTimeInterval(-3600), end: .now)),
-            kind: .hrvRMSSD
-        )
-        let latestRMSSD = rmssdWindows.last?.consensus
-
-        guard let estimate = Estimators.bloodPressure(
-            calibration: calibration,
-            currentHeartRate: latestHR,
-            currentRMSSD: latestRMSSD
-        ) else { return nil }
-
-        // Quantise the timestamp to five minutes so repeated recomputation within a window
-        // updates one reading rather than accumulating dozens.
-        let slot = Int(Date.now.timeIntervalSince1970 / 300)
-        let stamp = Date(timeIntervalSince1970: Double(slot) * 300)
-        let metadata = ReadingMetadata(modelledBy: ReadingMetadata.heartSyncModel)
-
-        return [
-            Reading(
-                id: UUID(stableFrom: "derived.bp.sys.\(slot)"),
-                sourceID: Self.estimateSourceID,
-                kind: .bloodPressureSystolic,
-                value: estimate.systolic,
-                start: stamp,
-                provenance: .estimated,
-                metadata: metadata
-            ),
-            Reading(
-                id: UUID(stableFrom: "derived.bp.dia.\(slot)"),
-                sourceID: Self.estimateSourceID,
-                kind: .bloodPressureDiastolic,
-                value: estimate.diastolic,
-                start: stamp,
-                provenance: .estimated,
-                metadata: metadata
-            ),
-        ]
     }
 
     /// A synthetic source that owns values HeartSync modelled rather than read from a

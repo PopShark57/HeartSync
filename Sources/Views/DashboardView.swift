@@ -100,11 +100,13 @@ struct DashboardView: View {
                 )
                 try? await Task.sleep(for: .seconds(wait))
                 guard !Task.isCancelled else { return }
-                snapshot = DashboardSnapshot(
-                    store: model.store,
-                    now: .now,
-                    sparklineCache: snapshot?.sparklineCache ?? [:]
-                )
+                let history = model.store.history
+                let cache = snapshot?.sparklineCache ?? [:]
+                let resolved = await HealthHistory.offMain {
+                    DashboardSnapshot(history: history, now: .now, sparklineCache: cache)
+                }
+                guard !Task.isCancelled else { return }
+                snapshot = resolved
                 lastLoadedAt = .now
                 lastRetryToken = retryToken
             }

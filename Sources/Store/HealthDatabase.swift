@@ -3,9 +3,20 @@ import SQLite3
 
 /// Transactional, indexed persistence for sources and readings.
 ///
+/// The connection runs `synchronous = FULL` in WAL mode, so every commit is on disk when it
+/// returns. `NORMAL` would survive an app crash but can lose the last transactions to a
+/// power cut, and HealthKit's anchor and Oura's cache move on the strength of a commit
+/// returning: a lost commit there is data that is never fetched again. The fsync is paid
+/// per transaction instead, which is why Bluetooth values are batched
+/// (`BluetoothIngestBuffer`) rather than committed one at a time.
+///
 /// The payload columns keep Codable compatibility while the scalar columns provide the
-/// stable-id, metric, source, and time indexes used by every query. All calls are made from
-/// `HealthStore` on the main actor; transactions are short and batch-oriented.
+/// stable-id, metric, source, and time indexes used by every query.
+///
+/// One instance is one SQLite connection and is not thread-safe. `HealthStore` owns the
+/// single writer connection on the main actor; history reads use read-only connections from
+/// `HealthDatabase.ReaderPool`, one per thread at a time, so a snapshot can read and decode
+/// off the main actor while the writer commits. WAL gives each read its own consistent view.
 final class HealthDatabase {
     enum WriteMode: Equatable { case append, upsert }
 
@@ -23,12 +34,32 @@ final class HealthDatabase {
         return base.appendingPathComponent("health.sqlite3")
     }
 
+    /// Schema this build writes. Each step in `migrate()` raises `PRAGMA user_version` by
+    /// one; a database from a newer build is opened as it is and never lowered.
+    ///
+    /// - 2: the indexed readings, sources, and metadata tables.
+    /// - 3: `value` and `has_metadata` columns, so a reading without metadata is rebuilt
+    ///   from its columns instead of decoding its JSON payload. Rows written before 3 have
+    ///   NULL there and are decoded from the payload until maintenance backfills them.
+    static let schemaVersion = 3
+
     let wasNew: Bool
     private(set) var requiresLegacyMigration = false
-    private let fileURL: URL?
+    /// The file every connection opens. A store without persistence gets a private file in
+    /// the temporary directory (`isEphemeral`), not `:memory:`, because an in-memory
+    /// database cannot be shared with a second connection.
+    let fileURL: URL
+    let isEphemeral: Bool
+    let isReadOnly: Bool
     private var handle: OpaquePointer?
+    /// Committed write transactions on this connection since it opened. The device
+    /// performance workload reports it as commits per minute (improvement 52).
+    private(set) var commitCount = 0
+    /// Whether the WAL and shared-memory files have had their protection class set since
+    /// this connection opened. They are created by the first write, after `init` has run.
+    private var companionFilesProtected = false
     private var failNextCommit = false
-    private var failQueries = false
+    fileprivate(set) var failQueries = false
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .custom(PayloadDates.encode)
@@ -88,12 +119,19 @@ final class HealthDatabase {
         }
     }
 
+    /// Opens (creating if needed) the writer connection.
+    ///
+    /// - Parameter url: the database file; nil for a throwaway database in the temporary
+    ///   directory, removed when this connection is released.
     init(url: URL?) throws {
-        fileURL = url
-        wasNew = url.map { !FileManager.default.fileExists(atPath: $0.path) } ?? true
-        let path = url?.path ?? ":memory:"
+        let ephemeral = url == nil
+        let fileURL = try url ?? Self.ephemeralURL()
+        self.fileURL = fileURL
+        self.isEphemeral = ephemeral
+        self.isReadOnly = false
+        wasNew = !FileManager.default.fileExists(atPath: fileURL.path)
         guard sqlite3_open_v2(
-            path,
+            fileURL.path,
             &handle,
             SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
             nil
@@ -103,7 +141,8 @@ final class HealthDatabase {
         do {
             try execute("PRAGMA foreign_keys = ON")
             try execute("PRAGMA journal_mode = WAL")
-            try execute("PRAGMA synchronous = FULL")
+            // A throwaway database has nothing to lose to a power cut.
+            try execute(ephemeral ? "PRAGMA synchronous = OFF" : "PRAGMA synchronous = FULL")
             try execute("PRAGMA busy_timeout = 3000")
             try execute("""
                 CREATE TABLE IF NOT EXISTS sources (
@@ -148,7 +187,7 @@ final class HealthDatabase {
             requiresLegacyMigration = try scalarText(
                 "SELECT value FROM metadata WHERE key = 'legacy_migration'"
             ) != "complete"
-            try execute("PRAGMA user_version = 2")
+            try migrate()
             protectFiles()
         } catch {
             sqlite3_close(handle)
@@ -157,27 +196,180 @@ final class HealthDatabase {
         }
     }
 
-    deinit { sqlite3_close(handle) }
+    /// Opens a read-only connection to the same file as `writer`, for `ReaderPool`.
+    ///
+    /// Opened only after the writer has created and migrated the schema. `query_only`
+    /// makes any write through it fail rather than take the write lock.
+    private init(readerOf writer: HealthDatabase) throws {
+        fileURL = writer.fileURL
+        isEphemeral = false
+        isReadOnly = true
+        wasNew = false
+        guard sqlite3_open_v2(
+            writer.fileURL.path,
+            &handle,
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+            nil
+        ) == SQLITE_OK else {
+            let failure = error("open read connection")
+            sqlite3_close(handle)
+            handle = nil
+            throw failure
+        }
+        do {
+            try execute("PRAGMA busy_timeout = 3000")
+            try execute("PRAGMA query_only = ON")
+        } catch {
+            sqlite3_close(handle)
+            handle = nil
+            throw error
+        }
+    }
+
+    deinit {
+        sqlite3_close(handle)
+        if isEphemeral { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+    }
+
+    private static func ephemeralURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HeartSync-ephemeral", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("health.sqlite3")
+    }
+
+    /// Raises the schema to `schemaVersion` one step at a time, each step in its own
+    /// transaction with its version bump, so an interrupted launch resumes at the step it
+    /// stopped on. Only additive steps belong here: the payload stays authoritative, so an
+    /// older build can still read every row.
+    private func migrate() throws {
+        var version = try scalarInt("PRAGMA user_version")
+        // 0 is a file created just now or by the first SQLite build, which never set it; both
+        // hold exactly the version-2 tables created above.
+        if version < 2 {
+            try execute("PRAGMA user_version = 2")
+            version = 2
+        }
+        if version < 3 {
+            try transaction {
+                let columns = try columnNames(of: "readings")
+                if !columns.contains("value") { try execute("ALTER TABLE readings ADD COLUMN value REAL") }
+                if !columns.contains("has_metadata") { try execute("ALTER TABLE readings ADD COLUMN has_metadata INTEGER") }
+                try execute("PRAGMA user_version = 3")
+            }
+            version = 3
+        }
+    }
+
+    private func columnNames(of table: String) throws -> Set<String> {
+        let statement = try prepare("PRAGMA table_info(\(table))")
+        defer { sqlite3_finalize(statement) }
+        var names: Set<String> = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let name = sqlite3_column_text(statement, 1) { names.insert(String(cString: name)) }
+        }
+        return names
+    }
+
+    /// Fills `value` and `has_metadata` for up to `limit` rows written before schema 3.
+    /// Returns how many rows it filled; zero means none are left.
+    ///
+    /// Bounded so maintenance can spread a large history over several runs instead of
+    /// holding the write lock for all of it at once. A row that is never backfilled is
+    /// still read correctly, from its payload.
+    @discardableResult
+    func backfillValueColumns(limit: Int = 20_000) throws -> Int {
+        try transaction {
+            try execute(
+                """
+                UPDATE readings
+                SET value = json_extract(CAST(payload AS TEXT), '$.value'),
+                    has_metadata = (json_type(CAST(payload AS TEXT), '$.metadata') IS NOT NULL)
+                WHERE rowid IN (SELECT rowid FROM readings WHERE value IS NULL LIMIT ?)
+                """,
+                bindings: [.int(max(1, limit))]
+            )
+            return Int(sqlite3_changes(handle))
+        }
+    }
+
+    /// Rows still waiting for `backfillValueColumns`.
+    func rowsAwaitingValueBackfill() throws -> Int {
+        try scalarInt("SELECT COUNT(*) FROM readings WHERE value IS NULL")
+    }
+
+    // MARK: - Reader pool
+
+    /// Read-only connections for history reads, handed out one caller at a time.
+    ///
+    /// A pool rather than one shared reader, so the main actor's small reads never wait
+    /// behind a month-long snapshot read on another thread: each caller gets its own
+    /// connection, opening one when all are busy. Idle connections are kept up to
+    /// `maximumIdle`. `Sendable` because the connections are only reached through `read`,
+    /// which never lends one to two callers at once.
+    final class ReaderPool: @unchecked Sendable {
+        private let writer: HealthDatabase
+        private let lock = NSLock()
+        private var idle: [HealthDatabase] = []
+        private var failQueries = false
+        private let maximumIdle = 3
+
+        /// The writer is retained so an ephemeral file outlives every reader using it.
+        init(writer: HealthDatabase) {
+            self.writer = writer
+        }
+
+        func read<T>(_ body: (HealthDatabase) throws -> T) throws -> T {
+            let (connection, failing) = try checkOut()
+            connection.failQueries = failing
+            defer { checkIn(connection) }
+            return try body(connection)
+        }
+
+        func injectQueryFailureForTesting(_ failing: Bool) {
+            lock.withLock { failQueries = failing }
+        }
+
+        private func checkOut() throws -> (HealthDatabase, Bool) {
+            let pooled: (HealthDatabase?, Bool) = lock.withLock { (idle.popLast(), failQueries) }
+            if let connection = pooled.0 { return (connection, pooled.1) }
+            return (try HealthDatabase(readerOf: writer), pooled.1)
+        }
+
+        private func checkIn(_ connection: HealthDatabase) {
+            lock.withLock {
+                if idle.count < maximumIdle { idle.append(connection) }
+            }
+        }
+    }
 
     func allSources() throws -> [DataSource] {
         try decodedRows("SELECT payload FROM sources ORDER BY rowid", as: DataSource.self)
     }
 
     func allReadings() throws -> [Reading] {
-        try decodedRows("SELECT payload FROM readings ORDER BY end, rowid", as: Reading.self)
+        try readingRows("SELECT \(Self.readingColumns) FROM readings ORDER BY end, rowid")
     }
 
     func readingCount() throws -> Int {
         try scalarInt("SELECT COUNT(*) FROM readings")
     }
 
+    /// - Parameter sourceIDs: when given, only these sources' rows, filtered in SQL so a
+    ///   hidden or paused source's rows are never decoded. An empty set returns nothing.
     func readings(
         kind: MetricKind? = nil,
         range: DateInterval? = nil,
         sourceID: String? = nil,
+        sourceIDs: Set<String>? = nil,
         limit: Int? = nil,
         offset: Int = 0
     ) throws -> [Reading] {
+        if let sourceIDs, sourceIDs.isEmpty {
+            try checkInjectedQueryFailure("decode rows")
+            return []
+        }
         var clauses: [String] = []
         var bindings: [Binding] = []
         if let kind {
@@ -193,7 +385,15 @@ final class HealthDatabase {
             clauses.append("source_id = ?")
             bindings.append(.text(sourceID))
         }
-        var sql = "SELECT payload FROM readings"
+        if let sourceIDs {
+            let ordered = sourceIDs.sorted()
+            // `+source_id` keeps the planner on the (kind, midpoint) index for a metric read;
+            // the source list is a filter on those rows, not a reason to scan by source.
+            let column = kind == nil ? "source_id" : "+source_id"
+            clauses.append("\(column) IN (\(Array(repeating: "?", count: ordered.count).joined(separator: ", ")))")
+            bindings.append(contentsOf: ordered.map { .text($0) })
+        }
+        var sql = "SELECT \(Self.readingColumns) FROM readings"
         if !clauses.isEmpty { sql += " WHERE " + clauses.joined(separator: " AND ") }
         sql += " ORDER BY end, rowid"
         if let limit {
@@ -201,7 +401,7 @@ final class HealthDatabase {
             bindings.append(.int(max(0, limit)))
             bindings.append(.int(max(0, offset)))
         }
-        return try decodedRows(sql, bindings: bindings, as: Reading.self)
+        return try readingRows(sql, bindings: bindings)
     }
 
     /// Readings that end at or after `end`, of every metric, whose midpoint lies in `range`.
@@ -211,22 +411,20 @@ final class HealthDatabase {
     /// would let it pick `(kind, midpoint)` and scan that metric's whole history to find
     /// the last few minutes.
     func readings(endingAtOrAfter end: Date, midpointIn range: DateInterval) throws -> [Reading] {
-        try decodedRows(
-            "SELECT payload FROM readings WHERE end >= ? AND +midpoint >= ? AND +midpoint <= ? ORDER BY end, rowid",
+        try readingRows(
+            "SELECT \(Self.readingColumns) FROM readings WHERE end >= ? AND +midpoint >= ? AND +midpoint <= ? ORDER BY end, rowid",
             bindings: [
                 .double(end.timeIntervalSince1970),
                 .double(range.start.timeIntervalSince1970),
                 .double(range.end.timeIntervalSince1970),
-            ],
-            as: Reading.self
+            ]
         )
     }
 
     func latest(kind: MetricKind, sourceID: String) throws -> Reading? {
-        try decodedRows(
-            "SELECT payload FROM readings WHERE kind = ? AND source_id = ? ORDER BY end DESC, rowid DESC LIMIT 1",
-            bindings: [.text(kind.rawValue), .text(sourceID)],
-            as: Reading.self
+        try readingRows(
+            "SELECT \(Self.readingColumns) FROM readings WHERE kind = ? AND source_id = ? ORDER BY end DESC, rowid DESC LIMIT 1",
+            bindings: [.text(kind.rawValue), .text(sourceID)]
         ).first
     }
 
@@ -260,23 +458,71 @@ final class HealthDatabase {
 
     /// Determines the exact changed subset without mutating. `HealthStore` uses this before
     /// updating source metadata, then commits both together in one transaction.
+    ///
+    /// One `IN (…)` lookup per few hundred candidates rather than one query per reading:
+    /// a Bluetooth batch used to cost a statement per value before its insert.
     func changedReadings(_ candidates: [Reading], mode: WriteMode) throws -> [Reading] {
-        var changed: [Reading] = []
-        for reading in candidates {
-            let existing = try payload(forReadingID: reading.id)
-            switch mode {
-            case .append:
-                if existing == nil { changed.append(reading) }
-            case .upsert:
-                let payload = try encoder.encode(reading)
-                if existing != payload { changed.append(reading) }
+        guard !candidates.isEmpty else { return [] }
+        switch mode {
+        case .append:
+            let existing = try existingIDs(candidates.map(\.id))
+            return candidates.filter { !existing.contains($0.id) }
+        case .upsert:
+            let stored = try payloads(forReadingIDs: candidates.map(\.id))
+            return try candidates.filter { reading in
+                guard let payload = stored[reading.id] else { return true }
+                return try encoder.encode(reading) != payload
             }
         }
-        return changed
     }
 
     func contains(readingID: UUID) throws -> Bool {
         try payload(forReadingID: readingID) != nil
+    }
+
+    /// Which of `ids` are stored, in batches of `lookupBatchSize`.
+    func existingIDs(_ ids: [UUID]) throws -> Set<UUID> {
+        var found: Set<UUID> = []
+        try forEachIDBatch(ids, columns: "id") { statement in
+            if let text = sqlite3_column_text(statement, 0), let id = UUID(uuidString: String(cString: text)) {
+                found.insert(id)
+            }
+        }
+        return found
+    }
+
+    private func payloads(forReadingIDs ids: [UUID]) throws -> [UUID: Data] {
+        var found: [UUID: Data] = [:]
+        try forEachIDBatch(ids, columns: "id, payload") { statement in
+            if let text = sqlite3_column_text(statement, 0),
+               let id = UUID(uuidString: String(cString: text)),
+               let payload = data(at: 1, statement: statement) {
+                found[id] = payload
+            }
+        }
+        return found
+    }
+
+    /// Well under SQLite's default limit of 32,766 bound parameters.
+    private static let lookupBatchSize = 500
+
+    private func forEachIDBatch(_ ids: [UUID], columns: String, row: (OpaquePointer?) -> Void) throws {
+        let unique = Array(Set(ids))
+        var start = 0
+        while start < unique.count {
+            let batch = unique[start..<min(start + Self.lookupBatchSize, unique.count)]
+            start += batch.count
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ", ")
+            let statement = try prepare("SELECT \(columns) FROM readings WHERE id IN (\(placeholders))")
+            defer { sqlite3_finalize(statement) }
+            try bind(batch.map { .text($0.uuidString) }, to: statement)
+            while true {
+                let result = sqlite3_step(statement)
+                if result == SQLITE_ROW { row(statement); continue }
+                if result == SQLITE_DONE { break }
+                throw error("look up readings")
+            }
+        }
     }
 
     @discardableResult
@@ -367,10 +613,9 @@ final class HealthDatabase {
             clauses.append("end >= ?")
             bindings.append(.double(since.timeIntervalSince1970))
         }
-        return try decodedRows(
-            "SELECT payload FROM readings WHERE \(clauses.joined(separator: " AND ")) ORDER BY end, rowid",
-            bindings: bindings,
-            as: Reading.self
+        return try readingRows(
+            "SELECT \(Self.readingColumns) FROM readings WHERE \(clauses.joined(separator: " AND ")) ORDER BY end, rowid",
+            bindings: bindings
         )
     }
 
@@ -594,13 +839,76 @@ final class HealthDatabase {
     private func write(_ reading: Reading, mode: WriteMode) throws {
         let verb = mode == .append ? "INSERT OR IGNORE" : "INSERT OR REPLACE"
         try execute(
-            "\(verb) INTO readings(id, source_id, kind, start, end, midpoint, provenance, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "\(verb) INTO readings(id, source_id, kind, start, end, midpoint, provenance, payload, value, has_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             bindings: [
                 .text(reading.id.uuidString), .text(reading.sourceID), .text(reading.kind.rawValue),
                 .double(reading.start.timeIntervalSince1970), .double(reading.end.timeIntervalSince1970),
                 .double(reading.midpoint.timeIntervalSince1970), .text(reading.provenance.rawValue),
                 .blob(try encoder.encode(reading)),
+                .double(reading.value), .int(reading.metadata == nil ? 0 : 1),
             ]
+        )
+    }
+
+    /// Columns `readingRows` reads, in its order.
+    private static let readingColumns =
+        "id, source_id, kind, start, end, provenance, value, has_metadata, payload"
+
+    /// Rows selected with `readingColumns`, rebuilt without JSON where the row allows.
+    ///
+    /// A row with a stored `value`, no metadata, and recognised enum spellings is built from
+    /// its columns: that is every plain heart-rate sample, which is almost the whole table.
+    /// Anything else decodes its payload exactly as before, so a row this build does not
+    /// fully understand fails the same way it always did.
+    ///
+    /// The column times are the full-precision `Double`s the indexes use; the payload keeps
+    /// milliseconds. The two differ below a millisecond, never at a window boundary a
+    /// payload date could land on the other side of.
+    private func readingRows(_ sql: String, bindings: [Binding] = []) throws -> [Reading] {
+        try checkInjectedQueryFailure("decode rows")
+        let statement = try prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        try bind(bindings, to: statement)
+        var result: [Reading] = []
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                if let reading = columnReading(statement) {
+                    result.append(reading)
+                    continue
+                }
+                guard let payload = data(at: 8, statement: statement) else {
+                    throw DatabaseError(operation: "decode row", message: "missing payload")
+                }
+                result.append(try decoder.decode(Reading.self, from: payload))
+            case SQLITE_DONE:
+                return result
+            default:
+                throw error("step query")
+            }
+        }
+    }
+
+    private func columnReading(_ statement: OpaquePointer?) -> Reading? {
+        guard sqlite3_column_type(statement, 6) != SQLITE_NULL,
+              sqlite3_column_type(statement, 7) != SQLITE_NULL,
+              sqlite3_column_int64(statement, 7) == 0,
+              let idText = sqlite3_column_text(statement, 0),
+              let id = UUID(uuidString: String(cString: idText)),
+              let sourceText = sqlite3_column_text(statement, 1),
+              let kindText = sqlite3_column_text(statement, 2),
+              let kind = MetricKind(rawValue: String(cString: kindText)),
+              let provenanceText = sqlite3_column_text(statement, 5),
+              let provenance = Provenance(rawValue: String(cString: provenanceText))
+        else { return nil }
+        return Reading(
+            id: id,
+            sourceID: String(cString: sourceText),
+            kind: kind,
+            value: sqlite3_column_double(statement, 6),
+            start: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3)),
+            end: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)),
+            provenance: provenance
         )
     }
 
@@ -732,7 +1040,14 @@ final class HealthDatabase {
             }
             let result = try body()
             try execute("COMMIT")
-            protectFiles()
+            commitCount += 1
+            // Once per connection, after the first write has created the WAL; after that at
+            // open and at each checkpoint. Three `setAttributes` calls per commit added up to
+            // tens of thousands of file-system calls over a night of 1 Hz ingest.
+            if !companionFilesProtected {
+                protectFiles()
+                companionFilesProtected = true
+            }
             return result
         } catch {
             try? execute("ROLLBACK")
@@ -748,7 +1063,7 @@ final class HealthDatabase {
     }
 
     private func protectFiles() {
-        guard let fileURL else { return }
+        guard !isEphemeral, !isReadOnly else { return }
         let attributes: [FileAttributeKey: Any] = [
             .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
         ]
