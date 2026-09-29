@@ -280,11 +280,11 @@ final class HeartSyncCheckerUITests: XCTestCase {
         application.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch
     }
 
-    private func openHeartRate(in application: XCUIApplication) {
+    private func openHeartRate(in application: XCUIApplication, timeout: TimeInterval = 5) {
         let heartRate = application.buttons.matching(NSPredicate(
             format: "label BEGINSWITH %@", "Heart Rate"
         )).firstMatch
-        XCTAssertTrue(heartRate.waitForExistence(timeout: 5))
+        XCTAssertTrue(heartRate.waitForExistence(timeout: timeout))
         heartRate.tap()
     }
 
@@ -432,6 +432,9 @@ final class HeartSyncCheckerUITests: XCTestCase {
     /// Improvement 41: screenshots of the main chart screens from a month of fixture data,
     /// in portrait and landscape. CI also runs this on an iPad simulator for the layouts
     /// of improvement 38.
+    /// How long the gallery waits for a screen whose snapshot reads the whole fixture month.
+    private static let gallerySnapshotTimeout: TimeInterval = 45
+
     func testChartGalleryScreenshots() {
         let application = XCUIApplication()
         application.launchArguments = ["--chart-gallery"]
@@ -441,12 +444,15 @@ final class HeartSyncCheckerUITests: XCTestCase {
         XCTAssertTrue(element("now.sparkline.heartRate", in: application).waitForExistence(timeout: 10))
         attachScreenshot("Now", of: application)
 
+        // Each screen below appears only once its snapshot of a month of four sources has
+        // loaded. The iOS 26 iPad simulator on CI has taken a minute just to go idle after
+        // the Compare tap, so these waits are generous; a fast run is not slowed by them.
         application.buttons.matching(identifier: "Compare").firstMatch.tap()
-        openHeartRate(in: application)
+        openHeartRate(in: application, timeout: Self.gallerySnapshotTimeout)
         let range = element("metric.range", in: application)
-        XCTAssertTrue(range.waitForExistence(timeout: 10))
+        XCTAssertTrue(range.waitForExistence(timeout: Self.gallerySnapshotTimeout))
         let chart = element("metric.chart", in: application)
-        XCTAssertTrue(chart.waitForExistence(timeout: 10))
+        XCTAssertTrue(chart.waitForExistence(timeout: Self.gallerySnapshotTimeout))
         chart.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.5))
             .press(forDuration: 1, thenDragTo: chart.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5)))
         let clear = element("metric.clearSelection", in: application)
@@ -458,7 +464,7 @@ final class HeartSyncCheckerUITests: XCTestCase {
         XCTAssertTrue(waitForDisappearance(of: clear, timeout: 15))
 
         range.buttons["30D"].tap()
-        XCTAssertTrue(chart.waitForExistence(timeout: 10))
+        XCTAssertTrue(chart.waitForExistence(timeout: Self.gallerySnapshotTimeout))
         chart.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.5)).press(forDuration: 1)
         XCTAssertTrue(clear.waitForExistence(timeout: 5))
         attachScreenshot("Metric detail, 30 days, selected window", of: application)
@@ -466,7 +472,7 @@ final class HeartSyncCheckerUITests: XCTestCase {
         let pair = element("metric.pair", in: application)
         XCTAssertTrue(scrollToElement(pair, in: application))
         pair.tap()
-        XCTAssertTrue(element("pairwise.range", in: application).waitForExistence(timeout: 10))
+        XCTAssertTrue(element("pairwise.range", in: application).waitForExistence(timeout: Self.gallerySnapshotTimeout))
         let next = element("pairwise.next", in: application)
         XCTAssertTrue(scrollToElement(next, in: application))
         // Starting from no selection picks the first window, exercising an edge callout.
