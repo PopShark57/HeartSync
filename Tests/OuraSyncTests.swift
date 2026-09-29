@@ -926,6 +926,59 @@ struct OuraSyncOrchestrationTests {
             #expect(store.readings.map(\.sourceID) == ["strap"])
         }
     }
+
+    @Test("A clear during a running sync waits for it, and nothing that sync fetched is written")
+    func clearDuringSyncWritesNothing() async throws {
+        let now = Date.now
+        let stamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-600))
+        let gate = OuraRequestGate()
+        let handler: @Sendable (URLRequest) -> OuraStubReply = { request in
+            let path = request.url?.path ?? ""
+            if path.hasSuffix("/heartrate") {
+                return .json(#"{"data":[{"bpm":61,"source":"rest","timestamp":"\#(stamp)"}],"next_token":null}"#)
+            }
+            // Held until the test has started the clear: the cycle has fetched heart rate
+            // and is in the middle of its next collection.
+            if path.hasSuffix("/daily_activity") { gate.hold() }
+            return ouraEmptyCollections(request)
+        }
+
+        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager, store in
+            store.upsert(DataSource(id: DataSource.ouraSourceID, displayName: "Oura Ring", transport: .oura))
+            let sync = Task { await manager.sync(days: 14) }
+            for _ in 0..<500 where !gate.isHolding {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(gate.isHolding, "The sync never reached the held request")
+
+            let clear = Task { await manager.clearCachedData(keepingAuthorization: true) }
+            try await Task.sleep(for: .milliseconds(50))
+            gate.release()
+            let cleared = await clear.value
+            await sync.value
+
+            #expect(cleared)
+            #expect(store.readings(kind: .heartRate, enabledOnly: false).isEmpty)
+            #expect(manager.snapshot.heartRates.isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: ouraArchiveURL().path))
+        }
+    }
+}
+
+/// Holds one stubbed request on the URL loading thread until the test releases it.
+private final class OuraRequestGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var holding = false
+
+    var isHolding: Bool { lock.withLock { holding } }
+
+    func hold() {
+        lock.withLock { holding = true }
+        _ = semaphore.wait(timeout: .now() + 10)
+    }
+
+    func release() { semaphore.signal() }
 }
 
 // MARK: - Keychain reads
