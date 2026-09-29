@@ -103,7 +103,7 @@ code and does not access HealthKit. App Group sharing is local to the watch, not
 - Framework-specific: `Sources/Bluetooth` for CoreBluetooth, `Sources/Health` for HealthKit, and the OAuth presentation code in `Sources/Oura/OuraOAuth.swift` for AuthenticationServices/UIKit.
 - Security-specific: `Sources/Store/Keychain.swift` and CryptoKit-based `StableID.swift`.
 
-Do not assume the model layer can already be moved into a Foundation-only package: `DataSource`, `MetricKind`, and `Discrepancy` currently import SwiftUI for presentation colors. `DataSource` also imports UIKit, behind `#if canImport(UIKit)`, so that each source palette slot resolves a light or dark value. Source colours are defined as numbers (`SourcePaletteSlot`, `SRGBColor`) so that `Tests/ColourVisionTests.swift` measures exactly what is drawn. Change a slot's values in place, never renumber the slots, and keep that test passing.
+Do not assume the model layer can already be moved into a Foundation-only package: `DataSource`, `MetricKind`, and `Discrepancy` currently import SwiftUI for presentation colors. `DataSource` also imports UIKit, behind `#if canImport(UIKit)`, so that each source palette slot resolves a light or dark value. Source colours are defined as numbers (`SourcePaletteSlot`, `SRGBColor`) so that `Tests/ColourVisionTests.swift` measures exactly what is drawn. Change a slot's values in place, never renumber the slots, and keep that test passing. There are ten slots. The first six are checked under colour-vision simulation; red, gold, teal, and orchid (added later) are checked for ordinary vision only, by owner decision, and rely on shapes for colour-blind readers. A new source takes a random least-worn slot (`DataSource.leastUsedColorIndex`, random among equals so devices do not always get the same colours), and load repairs devices that share one (`colorIndexRepairs`: enabled first, oldest keeps it), so devices are never drawn in fewer colours than there are slots. There are seven shapes (`SourceSymbol`); slots past the seventh repeat one, and `MetricDetailSnapshot.symbols(for:)` gives a visible repeat a spare.
 
 ## State Management and Dependency Injection
 
@@ -528,6 +528,8 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/OuraOAuthTests.swift`: 13 tests covering exact authorization URL/scopes, callback/state/token metadata, scope-related 401 behavior, expiry, and compatibility behavior.
 - `Tests/OuraDataTests.swift`: 14 tests covering decoding, snapshot/upsert behavior, injected-`URLProtocol` request/error behavior, and the Oura heart-rate chart series (window anchoring, unparseable timestamps, and plot thinning).
 - `Tests/PairwiseExportTests.swift`: 10 tests covering stable schemas, canonical A/B semantics, aggregation evidence, RFC escaping, evidence language, metadata isolation, UTC, and fallback output.
+- `Tests/SourceColourSeparationTests.swift`: 8 tests covering least-worn and random slot
+  choice, repair of devices sharing a slot, paused devices yielding, and re-enabling.
 - `Tests/HealthStoreTests.swift`: 38 tests covering validation, indexed queries, batch ingestion, deletion, persistence safety, retention, and bounded compaction.
 - `Tests/ReadingArchiveTests.swift`: 20 tests covering envelopes, legacy payloads, unique corrupt preservation, unreadable-file handling, and Oura cache compatibility.
 - `Tests/HealthKitConversionTests.swift`: 19 tests covering type mappings, minimal read scope, self-source rejection and cleanup, writer identity, scaling, and deletion conversion.
@@ -622,9 +624,10 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/HistoryReaderTests.swift`: 9 tests covering off-main snapshots, reader visibility of commits, column and payload decoding, SQL source filters, failures and not-loaded history, temporary files, and the schema-3 migration and backfill.
 - `Tests/ResetAndIngestTests.swift`: 11 tests covering reset order and exclusivity, batched Bluetooth ingest, batched existence checks, changed-source persistence, and launch-time transport setup.
 - `Tests/PeripheralStateTests.swift`: 6 tests covering `PeripheralLink`, `RingLink`, and `PeripheralRecord`.
-- `Tests/ColourVisionTests.swift`: 11 tests. They pin the Machado/CAM02-UCS validator to
-  published values and enforce ΔE ≥ 15 under protan, deutan, and tritan simulation:
-  between source slots, against the reference-line ink, and between sleep stages. They
+- `Tests/ColourVisionTests.swift`: 12 tests. They pin the Machado/CAM02-UCS validator to
+  published values and enforce ΔE ≥ 15 in ordinary vision between all source slots, and
+  under protan, deutan, and tritan simulation between the first six slots, against the
+  reference-line ink, and between sleep stages. They
   also cover 3:1 graphical contrast and stable per-slot shapes.
 - `PerformanceTests/HealthStorePerformanceTests.swift`: the manual physical-iPhone
   fourteen-day 1 Hz indexed persistence workload, plus:

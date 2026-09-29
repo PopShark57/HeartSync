@@ -34,12 +34,13 @@ struct ChartPoint: Identifiable {
 /// Dash patterns are deliberately *not* used here \u{2014} the chart already spends dashes on
 /// "this value is modelled, not measured", and one visual channel cannot carry two meanings.
 ///
-/// One shape per palette slot, chosen from the source's persisted `colorIndex`. Shape
+/// One shape per palette slot up to seven; later slots repeat a shape, and
+/// `MetricDetailSnapshot.symbols(for:)` gives a visible repeat a spare one. Shape
 /// used to be positional within a chart, so a device's symbol changed whenever another
 /// device entered or left the range; now a device keeps its shape exactly as it keeps its
 /// colour, on every chart that draws it.
 enum SourceSymbol: Int, CaseIterable, Hashable, Sendable {
-    case circle, square, triangle, diamond, pentagon, cross
+    case circle, square, triangle, diamond, pentagon, cross, asterisk
 
     /// The shape paired with a palette slot. Negative indices wrap rather than trap.
     static func forColorIndex(_ index: Int) -> SourceSymbol {
@@ -55,6 +56,7 @@ enum SourceSymbol: Int, CaseIterable, Hashable, Sendable {
         case .diamond:  .diamond
         case .pentagon: .pentagon
         case .cross:    .cross
+        case .asterisk: .asterisk
         }
     }
 
@@ -67,6 +69,7 @@ enum SourceSymbol: Int, CaseIterable, Hashable, Sendable {
         case .diamond:  "diamond"
         case .pentagon: "pentagon"
         case .cross:    "cross"
+        case .asterisk: "asterisk"
         }
     }
 }
@@ -366,9 +369,9 @@ struct MetricDetailSnapshot {
     /// once per device and never reuses while that device exists, so a device keeps its
     /// colour and its shape across ranges, charts, and relaunches.
     ///
-    /// Only past six devices can two visible sources share a slot. Then the later one takes
-    /// the first shape no other visible series uses, so the two stay apart by shape even
-    /// though their colours match.
+    /// Only past ten devices can two visible sources share a colour. Slots past the seventh
+    /// repeat an earlier slot's shape, and then the later of two visible sources with one
+    /// shape takes the first shape no other visible series uses.
     ///
     /// Labels are disambiguated only where they collide. A user with one "Polar H10" sees
     /// "Polar H10"; a user whose ring is visible over both Bluetooth and Apple Health sees

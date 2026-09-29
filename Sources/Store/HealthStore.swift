@@ -360,7 +360,15 @@ final class HealthStore {
 
     @discardableResult
     func setEnabled(_ enabled: Bool, forSource id: String) -> SourceMutationResult {
-        mutateSource(id) { $0.isEnabled = enabled }
+        let takenByEnabled = Set(sources.filter { $0.isEnabled && $0.id != id }.map(\.colorIndex))
+        let others = sources.filter { $0.id != id }
+        return mutateSource(id) {
+            $0.isEnabled = enabled
+            // A device coming back must not take a colour an enabled one is wearing.
+            if enabled, takenByEnabled.contains($0.colorIndex) {
+                $0.colorIndex = DataSource.leastUsedColorIndex(among: others)
+            }
+        }
     }
 
     @discardableResult
@@ -401,9 +409,25 @@ final class HealthStore {
     }
 
     private func nextColorIndex() -> Int {
-        let used = Set(sources.map(\.colorIndex))
-        for index in 0..<DataSource.palette.count where !used.contains(index) { return index }
-        return sources.count % DataSource.palette.count
+        DataSource.leastUsedColorIndex(among: sources)
+    }
+
+    /// Gives a device that shares its colour with another the least used one, and writes
+    /// the change. A failed write leaves the new colours in memory; the same repair runs
+    /// again at the next launch.
+    private func separateSharedColors() {
+        let repairs = DataSource.colorIndexRepairs(for: sources)
+        guard !repairs.isEmpty else { return }
+        var changed: [DataSource] = []
+        for index in sources.indices {
+            guard let slot = repairs[sources[index].id] else { continue }
+            sources[index].colorIndex = slot
+            changed.append(sources[index])
+        }
+        if let detail = persistSourcesIfReady(changed) {
+            logger.error("Source colours not saved: \(detail, privacy: .public)")
+        }
+        dataGeneration &+= 1
     }
 
     // MARK: - Readings
@@ -1017,6 +1041,7 @@ final class HealthStore {
             unavailableBuffer.removeAll()
             bufferedIDs.removeAll()
             loadState = .loaded
+            separateSharedColors()
             lastPersistenceError = nil
             compactionCursor = nil
             dataGeneration &+= 1

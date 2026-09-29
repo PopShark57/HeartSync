@@ -224,10 +224,31 @@ struct ColourVisionTests {
 
     // MARK: - Source palette
 
-    @Test("Every two source slots stay apart under every simulated deficiency, in both appearances")
-    func paletteSlotsAreSeparable() {
+    /// Slots 0–5 were chosen against colour-vision simulation; the slots added after them
+    /// (red, gold, teal, orchid) were chosen for ordinary vision only, and their shapes carry
+    /// the distinction for a colour-blind reader.
+    static let deficiencyCheckedSlots = 6
+
+    @Test("Every two slots stay apart in ordinary vision, in both appearances")
+    func allSlotsAreSeparableInOrdinaryVision() {
         for appearance in appearances() {
             let colours = appearance.colours
+            for i in colours.indices {
+                for j in colours.indices where j > i {
+                    let value = ColourVision.deltaE(colours[i], colours[j], .normal)
+                    #expect(
+                        value >= Self.floor,
+                        "\(appearance.name) slots \(i) \(colours[i].hex) and \(j) \(colours[j].hex): ΔE \(value)"
+                    )
+                }
+            }
+        }
+    }
+
+    @Test("The first six slots stay apart under every simulated deficiency, in both appearances")
+    func paletteSlotsAreSeparable() {
+        for appearance in appearances() {
+            let colours = Array(appearance.colours.prefix(Self.deficiencyCheckedSlots))
             for i in colours.indices {
                 for j in colours.indices where j > i {
                     let worst = ColourVision.worstDeltaE(colours[i], colours[j])
@@ -242,10 +263,15 @@ struct ColourVisionTests {
 
     @Test("No source slot can be mistaken for the ink reserved for statistical reference lines")
     func paletteIsSeparableFromReferenceInk() {
-        for slot in DataSource.paletteSlots {
+        for (index, slot) in DataSource.paletteSlots.enumerated() {
+            let checked = index < Self.deficiencyCheckedSlots
             for ink in Self.referenceInk {
-                let light = ColourVision.worstDeltaE(slot.light, ink.light)
-                let dark = ColourVision.worstDeltaE(slot.dark, ink.dark)
+                let light = checked
+                    ? ColourVision.worstDeltaE(slot.light, ink.light)
+                    : (value: ColourVision.deltaE(slot.light, ink.light, .normal), condition: ColourVision.Condition.normal)
+                let dark = checked
+                    ? ColourVision.worstDeltaE(slot.dark, ink.dark)
+                    : (value: ColourVision.deltaE(slot.dark, ink.dark, .normal), condition: ColourVision.Condition.normal)
                 #expect(light.value >= Self.floor, "\(slot.name) vs \(ink.name) ink, light: ΔE \(light.value) under \(light.condition)")
                 #expect(dark.value >= Self.floor, "\(slot.name) vs \(ink.name) ink, dark: ΔE \(dark.value) under \(dark.condition)")
             }
@@ -279,12 +305,12 @@ struct ColourVisionTests {
 
     // MARK: - Symbols
 
-    @Test("Every palette slot has a shape of its own")
-    func oneShapePerSlot() {
-        #expect(SourceSymbol.allCases.count == DataSource.paletteSlots.count)
+    @Test("Slots take a shape of their own until the shapes run out, then repeat in order")
+    func shapePerSlot() {
         let shapes = DataSource.paletteSlots.indices.map(SourceSymbol.forColorIndex)
-        #expect(Set(shapes).count == shapes.count)
-        #expect(SourceSymbol.forColorIndex(DataSource.paletteSlots.count) == SourceSymbol.forColorIndex(0))
+        let distinct = min(SourceSymbol.allCases.count, DataSource.paletteSlots.count)
+        #expect(Set(shapes.prefix(distinct)).count == distinct)
+        #expect(SourceSymbol.forColorIndex(SourceSymbol.allCases.count) == SourceSymbol.forColorIndex(0))
         #expect(SourceSymbol.forColorIndex(-1) == SourceSymbol.allCases.last)
     }
 

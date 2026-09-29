@@ -261,9 +261,9 @@ struct WatchChartSeries: Codable, Equatable, Identifiable, Sendable {
     var shape: WatchSourceShape { WatchSourceShape(rawValue: symbol) ?? .circle }
 }
 
-/// The iPhone's six source shapes, in `SourceSymbol` order.
+/// The iPhone's seven source shapes, in `SourceSymbol` order.
 enum WatchSourceShape: Int, CaseIterable, Sendable {
-    case circle, square, triangle, diamond, pentagon, cross
+    case circle, square, triangle, diamond, pentagon, cross, asterisk
 }
 
 struct WatchColor: Codable, Equatable, Sendable {

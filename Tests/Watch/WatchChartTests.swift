@@ -92,7 +92,7 @@ struct WatchChartTests {
         #expect(rejected { $0.series[0].offsets[2] = 30_000 })
         #expect(rejected { $0.series[0].offsets.removeLast() })
         #expect(rejected { $0.series[0].values[0] = 900 })
-        #expect(rejected { $0.series[0].symbol = 6 })
+        #expect(rejected { $0.series[0].symbol = 7 })
         #expect(rejected { $0.series[0].color.red = 2 })
         #expect(rejected { $0.series.append($0.series[0]) })
         #expect(rejected { $0.pair?.pairedWindows = 4 })
@@ -298,14 +298,15 @@ struct WatchChartTests {
     @Test("Two sources sharing a colour slot are told apart by shape, as on iPhone")
     func sharedSlotShapes() throws {
         let store = HealthStore(persistenceEnabled: false)
-        for index in 0..<7 {
+        // One more device than there are slots: exactly one pair shares a slot, and which
+        // pair is random, so find it.
+        for index in 0...DataSource.paletteSlots.count {
             store.upsert(DataSource(id: "s\(index)", displayName: "Source \(index)", transport: .bluetooth))
         }
-        let first = try #require(store.source(id: "s0"))
-        let seventh = try #require(store.source(id: "s6"))
-        #expect(first.colorIndex % DataSource.paletteSlots.count == seventh.colorIndex % DataSource.paletteSlots.count)
-        populate(store, sourceID: "s0", value: 70)
-        populate(store, sourceID: "s6", value: 72)
+        let shared = Dictionary(grouping: store.sources, by: \.colorIndex).values.first { $0.count == 2 }
+        let pair = try #require(shared)
+        populate(store, sourceID: pair[0].id, value: 70)
+        populate(store, sourceID: pair[1].id, value: 72)
         let chart = try #require(WatchSnapshotBuilder.make(store: store, now: now).metrics.first?.chart)
         #expect(chart.series.count == 2)
         #expect(Set(chart.series.map(\.symbol)).count == 2)
