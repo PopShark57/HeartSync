@@ -70,6 +70,20 @@ struct YCBTFrameCodecTests {
         #expect(assembler.buffer.isEmpty)
     }
 
+    @Test("The identity reply carries the battery percent and charging state")
+    func deviceInfoBattery() {
+        // Device id 0xD3E0, firmware 1.07, charging, 76%, then bind and sync state.
+        let charging = YCBTFrameCodec.Frame(group: 0x02, command: 0x00, payload: [0xE0, 0xD3, 0x07, 0x01, 0x01, 76, 0x00, 0x00])
+        #expect(YCBTFrameCodec.message(for: charging) == .deviceInfo(.init(payloadLength: 8, batteryPercent: 76, isCharging: true)))
+        let idle = YCBTFrameCodec.Frame(group: 0x02, command: 0x00, payload: [0xE0, 0xD3, 0x07, 0x01, 0x00, 100])
+        #expect(YCBTFrameCodec.message(for: idle) == .deviceInfo(.init(payloadLength: 6, batteryPercent: 100, isCharging: false)))
+        // Too short for the battery bytes, or an impossible percentage: identity only.
+        let short = YCBTFrameCodec.Frame(group: 0x02, command: 0x00, payload: [0xE0, 0xD3, 0x07, 0x01, 0x00])
+        #expect(YCBTFrameCodec.message(for: short) == .deviceInfo(.init(payloadLength: 5)))
+        let impossible = YCBTFrameCodec.Frame(group: 0x02, command: 0x00, payload: [0xE0, 0xD3, 0x07, 0x01, 0x00, 101])
+        #expect(YCBTFrameCodec.message(for: impossible) == .deviceInfo(.init(payloadLength: 6)))
+    }
+
     @Test("Short payloads decode as truncated, never as values")
     func truncated() {
         let frame = YCBTFrameCodec.Frame(group: 0x06, command: 0x01, payload: [])
@@ -90,7 +104,7 @@ struct R11MRingSessionTests {
         var session = R11MRingSession(writeWithResponse: true)
         _ = session.subscriptionFinished(.command, error: nil)
         _ = session.subscriptionFinished(.events, error: nil)
-        _ = session.received(.deviceInfo(payloadLength: 24), at: .now)
+        _ = session.received(.deviceInfo(.init(payloadLength: 24)), at: .now)
         return session
     }
 
@@ -107,6 +121,41 @@ struct R11MRingSessionTests {
             command.lowercased(): [.writeWithoutResponse, .indicate],
             events.lowercased(): [.indicate],
         ]]) == .matched(writeWithResponse: false))
+    }
+
+    @Test("An identity reply reports the battery, and an idle ring can be asked again")
+    func battery() {
+        var session = R11MRingSession(writeWithResponse: true)
+        _ = session.subscriptionFinished(.command, error: nil)
+        #expect(session.refreshBattery().isEmpty)
+        _ = session.subscriptionFinished(.events, error: nil)
+        #expect(session.refreshBattery().isEmpty)
+
+        let reply = YCBTFrameCodec.Message.deviceInfo(.init(payloadLength: 8, batteryPercent: 42, isCharging: false))
+        #expect(session.received(reply, at: .now) == [.battery(percent: 42, isCharging: false)])
+        #expect(session.isIdentified)
+        #expect(session.refreshBattery() == [.write(YCBTFrameCodec.deviceInfoRequest(), purpose: .batteryQuery)])
+
+        // A later reply updates the battery without disturbing the phase.
+        let later = YCBTFrameCodec.Message.deviceInfo(.init(payloadLength: 8, batteryPercent: 41, isCharging: true))
+        #expect(session.received(later, at: .now) == [.battery(percent: 41, isCharging: true)])
+        #expect(session.phase == .ready(last: nil))
+        // A failed battery query changes nothing.
+        #expect(session.writeFinished(.batteryQuery, error: "Busy").isEmpty)
+        #expect(session.phase == .ready(last: nil))
+
+        // Never while a measurement owns the channel.
+        _ = session.startHeartRate()
+        #expect(session.refreshBattery().isEmpty)
+    }
+
+    @Test("A reply without battery bytes identifies the ring and reports nothing")
+    func identityWithoutBattery() {
+        var session = R11MRingSession(writeWithResponse: true)
+        _ = session.subscriptionFinished(.command, error: nil)
+        _ = session.subscriptionFinished(.events, error: nil)
+        #expect(session.received(.deviceInfo(.init(payloadLength: 4)), at: .now).isEmpty)
+        #expect(session.isIdentified)
     }
 
     @Test("No command is written until both vendor channels confirm")

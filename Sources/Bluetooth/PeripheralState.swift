@@ -41,6 +41,7 @@ struct PeripheralLink<Characteristic> {
     func cancelScheduledWork() {
         stallTask?.cancel()
         ring.timeoutTask?.cancel()
+        ring.batteryTask?.cancel()
     }
 }
 
@@ -53,6 +54,8 @@ struct RingLink<Characteristic> {
     /// Purposes of writes sent with a response, oldest first.
     private(set) var pendingWrites: [R11MRingSession.Purpose] = []
     var timeoutTask: Task<Void, Never>?
+    /// The next idle battery query (`R11MRingSession.refreshBattery`).
+    var batteryTask: Task<Void, Never>?
 
     /// Feeds one notification to its channel's assembler.
     mutating func assemble(_ data: Data, on channel: R11MRingSession.Channel) -> [YCBTFrameAssembler.Output] {

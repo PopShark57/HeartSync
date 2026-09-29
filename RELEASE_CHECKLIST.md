@@ -74,7 +74,21 @@ Record the ring's model, firmware, and the diagnostic report with each result.
   read in local time; record the phone's time zone). SmartHealth still shows its history
   afterwards. A second import adds nothing. With the ring's clock never set, records are
   skipped, not imported at a wrong time.
+- [ ] Battery: after identification the ring's percent appears on its Devices row and Now chip
+  and matches SmartHealth's figure. On the charger the meter turns green with a bolt within 15
+  minutes; off it, the level updates within 15 minutes. The diagnostics report shows one
+  "Battery query" command per interval and none during a measurement or import.
 - [ ] A chest strap and a standard pulse oximeter still work unchanged.
+
+## Liquid Glass (iOS 26+, and the iOS 18 fallback)
+
+- [ ] On an iOS 26+ iPhone: Now's large title shares the Refresh button's row with no empty band
+  above the source chips; cards, chips, and the History and agreement buttons are glass; the tab
+  bar shrinks while scrolling down. Check light, dark, Increase Contrast, and Reduce
+  Transparency (glass must fall back to legible solid surfaces).
+- [ ] On iOS 18: the same screens keep the material cards and bordered buttons, with the same
+  layout, and the navigation bar has its material background.
+- [ ] iPad: the sidebar, Compare's split view, and Now's adaptive grid look right with glass.
 
 ## Apple Health
 
@@ -195,8 +209,8 @@ but not the platform behavior.
   permission off in Health and confirm Settings reports it instead of failing silently.
 - [ ] Complications: watch the reload count while a strap streams; a new delivery that changes no
   displayed value must not reload the timelines.
-- [ ] Watch workout: pause, resume, and stop in quick succession several times; the workout ends
-  in review with the right elapsed time and never returns to running.
+- [ ] Watch periods: 3H appears between 1H and 24H on the detail and Compare pages, all five
+  buttons fit a 41 mm watch, and 3H has its own verdict and chart.
 - [ ] Diagnostics: open Devices while a strap streams and confirm the list stays still, and that
   **Export diagnostics…** builds the report only when tapped.
 
@@ -220,7 +234,5 @@ but not the platform behavior.
   after a few maintenance runs `rowsAwaitingValueBackfill` reaches zero.
 - [ ] Batched ingest (52): run `batchedStrapIngest` on the device and record commits per minute; log
   an hour of real strap use with the Energy Log instrument, before and after.
-- [ ] Mirroring (72): start a watch workout with **Show live on iPhone** on and HeartSync open on
-  iPhone: Now shows the watch heart rate beside the strap, marked display only; nothing new appears
-  in the store until the workout syncs through Health. With HeartSync closed, record what iOS does
-  (no Live Activity is provided).
+- [ ] Mirroring (72) no longer applies: watch workouts were removed. Confirm the watch app offers
+  no workout, requests no Health permission, and the iPhone shows no mirrored-workout card.

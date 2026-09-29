@@ -25,6 +25,9 @@ struct OuraDashboardView: View {
                 }
             }
             .navigationTitle("Oura")
+            .toolbarTitleDisplayMode(.inlineLarge)
+            .background { HeartSyncAmbientBackground() }
+            .heartSyncChrome()
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     if model.oura.isSyncing {
@@ -81,7 +84,7 @@ struct OuraDashboardView: View {
                         Label("Set up Oura (advanced)", systemImage: "link")
                             .frame(maxWidth: 260)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .heartSyncButtonStyle(prominent: true)
                     .controlSize(.large)
                 }
                 .padding(.vertical, 26)
@@ -235,7 +238,7 @@ struct OuraDashboardView: View {
                     Button("Sync now") {
                         Task { await model.oura.sync() }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .heartSyncButtonStyle(prominent: true)
                 }
             }
         }
@@ -284,7 +287,7 @@ struct OuraDashboardView: View {
                         Image(systemName: model.oura.hasAuthorization ? "arrow.clockwise" : "link")
                     }
                 }
-                .buttonStyle(.bordered)
+                .heartSyncButtonStyle()
                 .tint(.white)
                 .disabled(model.oura.isSyncing)
                 .accessibilityLabel(model.oura.hasAuthorization ? "Sync Oura now" : "Reconnect Oura")

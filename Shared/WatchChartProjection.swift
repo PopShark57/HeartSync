@@ -77,6 +77,7 @@ enum WatchChartProjection {
     static func tickSpacing(for range: WatchChartRange) -> TimeInterval {
         switch range {
         case .hour:  20 * 60
+        case .threeHours: 3_600
         case .day:   8 * 3_600
         case .week:  2 * 86_400
         case .month: 10 * 86_400
@@ -110,7 +111,7 @@ enum WatchChartProjection {
     /// month. Never a month name and a time together, which cannot fit on the watch.
     static func axisFormat(for range: WatchChartRange) -> Date.FormatStyle {
         switch range {
-        case .hour:  .dateTime.hour(.defaultDigits(amPM: .omitted)).minute()
+        case .hour, .threeHours: .dateTime.hour(.defaultDigits(amPM: .omitted)).minute()
         case .day:   .dateTime.hour(.defaultDigits(amPM: .abbreviated))
         case .week:  .dateTime.weekday(.abbreviated)
         case .month: .dateTime.month(.defaultDigits).day()

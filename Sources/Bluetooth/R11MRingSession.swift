@@ -11,7 +11,8 @@ import Foundation
 /// - The adapter is chosen from GATT topology (service plus both characteristics with usable
 ///   properties), never from the advertised name.
 /// - No command is written until both vendor channels have confirmed their subscription.
-/// - The only command sent unprompted is a read-only identity query. A measurement command or
+/// - The only command sent unprompted is a read-only identity query, repeated while the ring
+///   is idle to refresh its battery level (`refreshBattery`). A measurement command or
 ///   a history request is sent only after that query produced a CRC-valid reply, and only
 ///   when the user asks.
 /// - Live values during a measurement are provisional. The ring's early values are a warm-up
@@ -263,6 +264,8 @@ struct R11MRingSession: Equatable, Sendable {
 
     enum Purpose: Equatable, Sendable {
         case identify
+        /// The identity query again, for its battery bytes.
+        case batteryQuery
         case start(Measurement)
         case stop(Measurement)
         case historyRequest(YCBTHistory.Kind)
@@ -272,6 +275,7 @@ struct R11MRingSession: Equatable, Sendable {
         var rawValue: String {
             switch self {
             case .identify:               "Identity query"
+            case .batteryQuery:           "Battery query"
             case .start(let measurement): "Start \(measurement.title) measurement"
             case .stop(let measurement):  "Stop \(measurement.title) measurement"
             case .historyRequest(let kind): "Request stored \(kind.title) history"
@@ -289,9 +293,14 @@ struct R11MRingSession: Equatable, Sendable {
         case emit(RingValue, measuredAt: Date)
         /// Records from the ring's memory whose transfer checked out.
         case emitHistory([YCBTHistory.Sample])
+        /// The battery level from an identity reply. Metadata, never a reading.
+        case battery(percent: Int, isCharging: Bool)
     }
 
     static let identificationTimeout: TimeInterval = 10
+    /// How often an idle, identified ring is asked for its battery. SmartRingWatcher polls
+    /// the same query every minute; a ring battery moves a few percent an hour.
+    static let batteryRefreshInterval: TimeInterval = 15 * 60
     /// The referenced ring finishes a spot heart rate in about 35 seconds. Ninety leaves room
     /// for a slow optical lock without leaving the user waiting indefinitely.
     static let defaultAcquisitionTimeout: TimeInterval = 90
@@ -419,6 +428,13 @@ struct R11MRingSession: Equatable, Sendable {
         return requestHistoryActions(first)
     }
 
+    /// Asks an idle, identified ring for its battery with the same read-only identity query.
+    /// Nothing is sent while a measurement or an import owns the channel.
+    mutating func refreshBattery() -> [Action] {
+        guard canStartMeasurement else { return [] }
+        return [.write(YCBTFrameCodec.deviceInfoRequest(), purpose: .batteryQuery)]
+    }
+
     /// Stops an in-flight measurement or import, for example when the user cancels or pauses
     /// the source. Values an import already emitted stay stored; they were complete.
     mutating func cancel() -> [Action] {
@@ -474,11 +490,15 @@ struct R11MRingSession: Equatable, Sendable {
     /// Handles one decoded vendor frame, from either channel.
     mutating func received(_ message: YCBTFrameCodec.Message, at date: Date) -> [Action] {
         switch message {
-        case .deviceInfo:
-            guard case .identifying = phase else { return [] }
+        case .deviceInfo(let info):
+            var actions: [Action] = []
+            if let percent = info.batteryPercent {
+                actions.append(.battery(percent: percent, isCharging: info.isCharging ?? false))
+            }
+            guard case .identifying = phase else { return actions }
             token += 1
             phase = .ready(last: nil)
-            return []
+            return actions
 
         case .measurementAck(let status):
             guard case .starting(let measurement) = phase else { return [] }

@@ -15,7 +15,7 @@ struct RingVitalsTests {
         var session = R11MRingSession(writeWithResponse: true, historyTimeZone: timeZone)
         _ = session.subscriptionFinished(.command, error: nil)
         _ = session.subscriptionFinished(.events, error: nil)
-        _ = session.received(.deviceInfo(payloadLength: 24), at: Self.now)
+        _ = session.received(.deviceInfo(.init(payloadLength: 24)), at: Self.now)
         return session
     }
 

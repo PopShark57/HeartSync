@@ -863,8 +863,8 @@ final class BluetoothManager: NSObject {
                     if session.isMeasuring { diagnostics[id]?.reject(.provisional) }
                 case .truncated:
                     diagnostics[id]?.reject(.malformed)
-                case .deviceInfo(let length):
-                    diagnostics[id]?.adapterNote = "Identity reply received (\(length)-byte payload)."
+                case .deviceInfo(let info):
+                    diagnostics[id]?.adapterNote = "Identity reply received (\(info.payloadLength)-byte payload)."
                 default:
                     break
                 }
@@ -932,6 +932,35 @@ final class BluetoothManager: NSObject {
 
             case .emitHistory(let samples):
                 emitRingHistory(samples, from: id)
+
+            case .battery(let percent, let isCharging):
+                store?.updateBattery(percent, isCharging: isCharging, forSource: id.uuidString)
+                scheduleRingBatteryRefresh(for: peripheral)
+            }
+        }
+    }
+
+    /// Re-arms the idle battery query. Each reply schedules the next one, so a ring that
+    /// stops answering is not asked again until its next identity reply; the task belongs
+    /// to the link and ends with it.
+    private func scheduleRingBatteryRefresh(for peripheral: CBPeripheral) {
+        let id = peripheral.identifier
+        guard links[id] != nil else { return }
+        links[id]?.ring.batteryTask?.cancel()
+        let session = links[id]?.session
+        links[id]?.ring.batteryTask = Task { [weak self] in
+            var delay = R11MRingSession.batteryRefreshInterval
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled, let self, self.links[id]?.session == session else { return }
+                guard self.ringSessions[id]?.canStartMeasurement == true else {
+                    // Busy with a measurement or an import: try again shortly.
+                    delay = 60
+                    continue
+                }
+                self.links[id]?.ring.batteryTask = nil
+                self.updateRingSession(sourceID: id.uuidString) { $0.refreshBattery() }
+                return
             }
         }
     }

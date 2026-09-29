@@ -109,19 +109,21 @@ struct WatchChartTests {
 
     // MARK: Builder
 
-    @Test("Periods match iPhone's 1H/24H/7D/30D; daily metrics offer only 7D and 30D")
+    @Test("Periods are 1H/3H/24H/7D/30D; daily metrics offer only 7D and 30D")
     func periods() {
-        #expect(WatchChartRange.allCases.map(\.rawValue) == ["1H", "24H", "7D", "30D"])
-        #expect(WatchChartRange.allCases.map(\.duration) == [TimeRange.hour, .day, .week, .month].map(\.duration))
+        #expect(WatchChartRange.allCases.map(\.rawValue) == ["1H", "3H", "24H", "7D", "30D"])
+        #expect(WatchChartRange.allCases.map(\.duration) == [3_600, 10_800, 86_400, 604_800, 2_592_000])
         #expect(WatchChartRange.available(for: .heartRate) == WatchChartRange.allCases)
         #expect(WatchChartRange.available(for: .restingHeartRate) == [.week, .month])
         #expect(WatchSnapshotBuilder.standardRange(for: .heartRate) == .day)
         #expect(WatchSnapshotBuilder.standardRange(for: .restingHeartRate) == .week)
         #expect(WatchChartRange.resolved(.hour, among: [.week, .month]) == .week)
+        #expect(WatchChartRange.resolved(.threeHours, among: [.hour, .day]) == .day)
         #expect(WatchChartRange.resolved(.month, among: [.hour]) == .hour)
         #expect(WatchChartRange.resolved(.day, among: []) == nil)
 
         #expect(WatchSnapshotBuilder.chartBucket(for: .heartRate, range: .hour) == 120)
+        #expect(WatchSnapshotBuilder.chartBucket(for: .heartRate, range: .threeHours) == 360)
         #expect(WatchSnapshotBuilder.chartBucket(for: .heartRate, range: .day) == 2_880)
         #expect(WatchSnapshotBuilder.chartBucket(for: .bloodPressureSystolic, range: .hour) == 600)
         #expect(WatchSnapshotBuilder.chartBucket(for: .restingHeartRate, range: .month) == 86_400)
@@ -143,7 +145,7 @@ struct WatchChartTests {
         let metric = try #require(snapshot.metrics.first { $0.kind == .heartRate })
         #expect(metric.availableRanges == WatchChartRange.allCases)
         #expect(metric.chart?.range == .day)
-        #expect(metric.rangeCharts?.map(\.range) == [.hour, .week, .month])
+        #expect(metric.rangeCharts?.map(\.range) == [.hour, .threeHours, .week, .month])
         #expect(metric.comparison.lookback == 86_400)
         for range in WatchChartRange.allCases {
             let chart = try #require(metric.periodChart(range))
@@ -195,6 +197,7 @@ struct WatchChartTests {
         let fourth = try #require(WatchSnapshotBuilder.make(store: store, now: now.addingTimeInterval(90), cache: cache).metrics.first)
         #expect(fourth.periodChart(.month)?.series.contains { $0.sourceName == "Renamed" } == true)
         #expect(WatchChartCache.refreshInterval(for: .hour) == 0)
+        #expect(WatchChartCache.refreshInterval(for: .threeHours) == 0)
         #expect(WatchChartCache.refreshInterval(for: .month) == 3_600)
     }
 
@@ -439,7 +442,7 @@ struct WatchChartTests {
                 omittedSourceCount: 0,
                 comparison: WatchComparison(readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: 86_400),
                 chart: chart(kind, .day),
-                rangeCharts: [.hour, .week, .month].map { chart(kind, $0) },
+                rangeCharts: [.hour, .threeHours, .week, .month].map { chart(kind, $0) },
                 availableRanges: WatchChartRange.allCases
             )
         }

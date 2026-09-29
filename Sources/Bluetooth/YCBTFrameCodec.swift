@@ -122,7 +122,7 @@ enum YCBTFrameCodec {
     /// `R11MRingSession` sees the ring declare that measurement complete, and history records
     /// only after their transfer's length and CRC check out.
     enum Message: Equatable, Sendable {
-        case deviceInfo(payloadLength: Int)
+        case deviceInfo(DeviceInfo)
         /// A reply to start/stop. `status == 0` is acceptance.
         case measurementAck(status: UInt8)
         case measurementFinished(sensor: UInt8, result: UInt8)
@@ -137,17 +137,46 @@ enum YCBTFrameCodec {
         /// Record bytes of one history type, to be concatenated before decoding.
         case historyData(YCBTHistory.Kind, payload: [UInt8])
         case historyBlockEnd(YCBTHistory.BlockEnd)
-        /// A CRC-valid frame HeartSync does not interpret (battery, status, history\u{2026}).
+        /// A CRC-valid frame HeartSync does not interpret (status, history\u{2026}).
         case other(Opcode)
         /// A CRC-valid frame whose payload is too short for its opcode.
         case truncated(Opcode)
+    }
+
+    /// The Get Device Info reply. Its layout, from the vendor SDK as SmartRingWatcher reads
+    /// it: device id (u16), firmware minor, firmware major, battery state, battery percent,
+    /// then bind and sync state. Only the two battery bytes are used.
+    struct DeviceInfo: Equatable, Sendable {
+        var payloadLength: Int
+        /// 0...100, or nil when the reply is too short or the byte is out of range.
+        var batteryPercent: Int?
+        /// The raw state byte is non-zero while the ring charges.
+        var isCharging: Bool?
+
+        static let batteryStateOffset = 4
+        static let batteryPercentOffset = 5
+
+        init(payload: [UInt8]) {
+            payloadLength = payload.count
+            guard payload.count > Self.batteryPercentOffset else { return }
+            let percent = Int(payload[Self.batteryPercentOffset])
+            guard percent <= 100 else { return }
+            batteryPercent = percent
+            isCharging = payload[Self.batteryStateOffset] != 0
+        }
+
+        init(payloadLength: Int, batteryPercent: Int? = nil, isCharging: Bool? = nil) {
+            self.payloadLength = payloadLength
+            self.batteryPercent = batteryPercent
+            self.isCharging = isCharging
+        }
     }
 
     static func message(for frame: Frame) -> Message {
         let payload = frame.payload
         switch frame.opcode {
         case .deviceInfo:
-            return .deviceInfo(payloadLength: payload.count)
+            return .deviceInfo(DeviceInfo(payload: payload))
         case .measurementControl:
             guard let status = payload.first else { return .truncated(frame.opcode) }
             return .measurementAck(status: status)

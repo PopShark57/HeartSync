@@ -28,7 +28,7 @@ HeartSyncApp
                                                                         -> SwiftUI views/export
 ```
 
-- `HeartSyncApp`'s `AppDelegate` (`@UIApplicationDelegateAdaptor`) owns the single root `AppModel`. `application(_:didFinishLaunchingWithOptions:)` calls `AppModel.launch()` — the Bluetooth central with its restoration identifier, HealthKit's `HKObserverQuery` background delivery, and the workout-mirroring handler — and starts `start()`, because a background relaunch runs no view `.task`. The scene injects the model with `.environment`, keeps a `.task { start() }` (idempotent), and forwards `scenePhase` changes.
+- `HeartSyncApp`'s `AppDelegate` (`@UIApplicationDelegateAdaptor`) owns the single root `AppModel`. `application(_:didFinishLaunchingWithOptions:)` calls `AppModel.launch()` — the Bluetooth central with its restoration identifier, and HealthKit's `HKObserverQuery` background delivery — and starts `start()`, because a background relaunch runs no view `.task`. The scene injects the model with `.environment`, keeps a `.task { start() }` (idempotent), and forwards `scenePhase` changes.
 - `AppModel` is the concrete composition root. It creates `HealthStore`, `AppSettings`, `BluetoothManager`, `HealthKitManager`, and `OuraManager`, configures their callbacks, and owns periodic derived-metric and Oura-sync tasks.
 - `RootView` presents five tabs: Now, Oura, Compare, Devices, and Settings.
 - Transport managers convert framework/API-specific values into repository models. Views must not parse transport payloads or write alternate stores.
@@ -49,9 +49,9 @@ HeartSyncApp
 | `Sources/Store` | Observable store boundary, transactional indexed SQLite database, small atomic JSON archives, settings, Keychain wrapper, and stable-ID generation. |
 | `Sources/Bluetooth` | CoreBluetooth lifecycle, SIG GATT constants, safe binary reader, typed measurement parsers, per-connection diagnostics, and the topology-gated YCBT ring session and frame codec. |
 | `Sources/Watch` | iPhone snapshot projection and coalesced WatchConnectivity publication. |
-| `Shared` | Versioned display payload, WatchConnectivity session, and workout presentation values compiled into both apps. |
-| `WatchApp` | Native watchOS SwiftUI dashboard, HealthKit workout manager, resources, and entitlements. |
-| `WatchComplications` | WidgetKit measurement and workout complications, metric intent, resources, and App Group entitlement. |
+| `Shared` | Versioned display payload, WatchConnectivity session, and complication projection compiled into both apps. |
+| `WatchApp` | Native watchOS SwiftUI dashboard and Compare pages, `WatchTheme` glass surfaces, resources, and entitlements. |
+| `WatchComplications` | WidgetKit measurement complication, metric intent, resources, and App Group entitlement. |
 | `Sources/Health` | HealthKit authorization, anchored queries, unit/source conversion, background delivery, and measured-value write-back. |
 | `Sources/Oura` | OAuth, Keychain-backed credentials, API transport/DTOs, endpoint status, token-free cache, sync orchestration, and scalar mapping. |
 | `Sources/Analysis` | Comparison/windowing/statistics, HRV, estimators, and pairwise export. These are mostly pure or value-oriented. |
@@ -95,8 +95,7 @@ The app uses only Apple system frameworks and libraries: SwiftUI, Observation, C
 Every file under `Sources` is compiled into the iOS app module. `Shared` plus `MetricKind`, `DiscrepancySeverity`, and `Provenance` are also compiled directly into the watchOS app. There is no separate shared framework or package. The watch does not compile the iPhone store, transports, or views.
 
 The complication extension compiles only its own sources, the watch snapshot/projection/cache,
-and the selected metric/provenance models. It does not compile `CompanionSession` or workout
-code and does not access HealthKit. App Group sharing is local to the watch, not a phone sync path.
+and the selected metric/provenance models. It does not compile `CompanionSession` and does not access HealthKit. App Group sharing is local to the watch, not a phone sync path.
 
 - Mostly value-oriented and reusable: `Sources/Analysis`, most of `Sources/Model`, `OuraClient`/Oura DTOs, `ReadingArchive`, and stable IDs.
 - iOS/UI-specific: `Sources/App` and `Sources/Views`.
@@ -185,8 +184,9 @@ Readiness and diagnostics (`RingFix.md`):
 Vendor ring candidate (`R11MRingSession`, `YCBTFrameCodec`):
 
 - It is selected only from GATT topology: the YCBT service with a writable, subscribable command characteristic and a subscribable event characteristic. Never select it from the advertised name.
-- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query. A measurement or history import starts only after a CRC-valid identity reply, and only from the user's Measure heart rate / blood oxygen / blood pressure or Import stored readings action.
+- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query, which is repeated every 15 minutes while the session is idle (`refreshBattery`, `RingLink.batteryTask`, purpose `.batteryQuery`) and never during a measurement or import. A measurement or history import starts only after a CRC-valid identity reply, and only from the user's Measure heart rate / blood oxygen / blood pressure or Import stored readings action.
 - Live values are provisional. Only the ring's completion event for the running sensor emits a reading (the last live value, through `emit`). Zero, no-contact, rejection, timeout, and another sensor's frames store nothing.
+- Battery: the identity reply (`02 00`) is decoded as `YCBTFrameCodec.DeviceInfo`; payload byte 4 is the charging state (non-zero while charging) and byte 5 the percent (above 100 is discarded), as `SmartRingWatcher`'s `YCParsers.deviceInfo` reads them. The session emits `.battery`, which `BluetoothManager` stores with `HealthStore.updateBattery(_:isCharging:forSource:)` on `DataSource.batteryPercent`/`batteryIsCharging`. It is source metadata, never a reading.
 - `YCBTHistory` reads stored heart-rate, blood-pressure, combined, SpO₂, and temperature records (`05` group). A type is decoded only when its concatenated bytes match the terminal block's length and CRC; the app then acknowledges (`05 80 00`, or `04` on failure). Nothing is ever deleted from the ring. Timestamps are the ring's local wall clock since 2000; records older than 30 days, in the future, or with a repeated timestamp are skipped. History IDs are `UUID(stableFrom:)` of source, metric, and timestamp, and a batch goes through `onReadings`, bypassing receipt-time admission only because it is one user-started, checked import.
 - Ring blood pressure and temperature are `.estimated` (`R11MRingSession.provenance(for:)`); heart rate, SpO₂, and respiratory rate are measured, as other vendor values are. The vendor HRV byte is not imported (RMSSD versus SDNN is undocumented); stress and sleep have no metric.
 - While the session owns heart rate, the same ring's `2A37` frames are counted as superseded, not ingested.
@@ -196,7 +196,7 @@ The restoration identifier is `com.heartsync.central`. `UIBackgroundModes = blue
 
 ## HealthKit and Apple Watch Architecture
 
-The native watchOS companion records user-started workouts with `HKWorkoutSession` and `HKLiveWorkoutBuilder`. Its heart-rate samples arrive on iPhone through the existing HealthKit import after system sync. If the user turns on "Show live on iPhone", the watch mirrors the session and sends a versioned `MirroredWorkoutPayload` per heart-rate update; `MirroredWorkoutMonitor` shows it on Now. It is display only: never stored, compared, exported, or written to Health. No Live Activity or iOS background mode exists for it, so it is reliable only while HeartSync runs. WatchConnectivity carries a display snapshot from iPhone and refresh requests from watch; it never ingests a second copy of workout samples. Do not add or imply direct Apple Watch BLE access.
+Apple Watch data reaches iPhone only through the HealthKit import. The watchOS companion is display only: it records no workouts, does not use HealthKit, and has no workout-mirroring path (workout recording, `MirroredWorkoutPayload`, and `MirroredWorkoutMonitor` were removed at the user's request). WatchConnectivity carries a display snapshot from iPhone and refresh requests from watch; it never carries measurements. Do not add or imply direct Apple Watch BLE access.
 
 `HealthKitManager.TypeMapping` owns the HealthKit identifier, metric, unit, and scale. Current reads include heart rate, resting heart rate, SDNN HRV, oxygen saturation, respiratory rate, VO2 max, body temperature, and blood pressure. HealthKit oxygen saturation is a fraction and is multiplied by 100 on ingestion. There is no HealthKit RMSSD mapping.
 
@@ -222,27 +222,27 @@ The manager starts each process with authorization state `.notDetermined`, and s
 
 `HeartSyncWatch` is a watchOS 11+ application embedded in `HeartSync.app/Watch`, with the
 `HeartSyncWatchComplications` WidgetKit extension in its `PlugIns` directory.
-The watch app can record workouts without a reachable iPhone. Its dashboard requires a
-snapshot from the paired iPhone and always labels measurement time separately from sync time.
+The watch app's dashboard requires a snapshot from the paired iPhone and always labels measurement time separately from sync time.
 
 - `WatchSnapshotBuilder` uses `HealthStore` indexed queries and `ComparisonEngine`. Only the
   four most recent sources per metric are displayed, but comparisons include every enabled
-  source. The watch offers iPhone's 1H/24H/7D/30D periods (`WatchChartRange`; a daily metric
-  only 7D and 30D). `WatchMetric.chart` and `comparison` carry the standard period (24H, or 7D
+  source. The watch offers 1H/3H/24H/7D/30D periods (`WatchChartRange`; a daily metric
+  only 7D and 30D). Compatibility with watch builds older than 3H is not a goal: both apps
+  ship together. `WatchMetric.chart` and `comparison` carry the standard period (24H, or 7D
   for daily metrics) so an older watch still works; `rangeCharts` carry the others and
   `availableRanges` lists what was computed, so a listed period without a chart means no
   readings, never agreement. Each chart holds its own `comparison`, each shown source's window
   medians (about 30 per period, whole multiples of the comparison window), its iPhone palette
   colour and the shape `MetricDetailSnapshot.symbols(for:)` gives it, and one ready pair's
   Bland–Altman figures; a pair below five paired windows is never sent. `WatchChartCache`
-  (owned by the publisher) reuses 24H for 2 min, 7D for 15 min, and 30D for 60 min, and drops
+  (owned by the publisher) rebuilds 1H and 3H every publication, reuses 24H for 2 min, 7D for 15 min, and 30D for 60 min, and drops
   an entry at once when shown or enabled sources change or a removal reaches it: one that
   removed a row ending at or after the period's current start (`HealthStore.recentRemovals`,
   `HealthHistory.latestRemovedEnd`). Deletions inside the period, source removal, a shortened
   retention, reset, and reload qualify; routine pruning of rows older than 30 days and
   estimate reconciliation do not. The fingerprint and shapes use sources sorted by stable ID.
   Periods that need building come from one read of the longest of them, sliced by midpoint.
-  `fittedPayload` drops 30D, then 7D, then 1H, then 24H charts rather than exceed the 60 KB
+  `fittedPayload` drops 30D, then 7D, then 1H, then 3H, then 24H charts rather than exceed the 60 KB
   cap, and returns the encoding it ended on; the publisher hands those bytes to
   `CompanionSession.publish(encoded:)`, so a snapshot is encoded once, off the main actor. Watch charts label the x axis with round local times inside the plot edges
   (`WatchChartProjection.axisTicks`/`axisFormat`), break at gaps, dash estimates, use neutral
@@ -267,28 +267,17 @@ snapshot from the paired iPhone and always labels measurement time separately fr
   opening shows Older or Median when either applies.
   Preserve derived/median labels, explicit empty/old states, and measurement-time freshness.
   Schedule a future stale entry; WidgetKit reload timing remains system-controlled. Mark
-  measurement views privacy-sensitive. `heartsync-watch` links open metric details or workout
-  controls and must never start a workout. Preview fixtures must not enter the shared cache.
-- `WatchWorkoutManager` receives every session and builder callback through one `AsyncStream` applied by a single main-actor task, so events apply in the order HealthKit reported them.
-- `WatchWorkoutManager` requests only Workouts/Heart Rate, collects heart rate in a genuine
-  user-started workout, supports pause/resume and review/save/discard, retains a failed save
-  for retry, and reconnects a recovered session through `WKApplicationDelegate`.
-- Use HealthKit's builder elapsed time, which excludes pauses. Use the sample timestamp to
-  mark heart rate older than 15 seconds; receipt time does not make an old sample live.
-- Always On: the workout and dashboard read `isLuminanceReduced`, keep heart rate and elapsed
-  time prominent, dim secondary content, and hide the trend. Live heart-rate values are
-  `privacySensitive()`, as the complications are. `WorkoutHeartRateTrend` holds the last
-  five minutes of builder samples in memory only and resets at Start and Discard. Do not
-  persist it or add zones without estimate labelling.
-- Read permission is never inferred from authorization-sheet completion. A workout may
-  contain no accessible heart-rate samples. Discarding the workout does not promise deletion
-  of samples Apple Watch independently collected.
-- The watch's separate App ID needs HealthKit and the same team `7RLDYXQTNX`. Its generated
-  plist declares `WKApplication`, the exact iPhone companion ID, workout processing, and
-  Health privacy text. Do not add HealthKit background delivery or location/route access.
+  measurement views privacy-sensitive. `heartsync-watch` links open metric details only. Preview fixtures must not enter the shared cache.
+- Always On: the dashboard reads `isLuminanceReduced`, keeps values prominent, dims secondary
+  content, and hides trends. Measurement values are `privacySensitive()`, as the complications are.
+- The watch's App ID needs only the App Group and the same team `7RLDYXQTNX`. Its generated
+  plist declares `WKApplication` and the exact iPhone companion ID. Do not add HealthKit,
+  workout processing, or location/route access without an explicit request.
+- Glass: `WatchTheme.swift` (`WatchCardBackground`, `watchGlassButton`, `watchGlassCapsule`)
+  uses Liquid Glass on watchOS 26 behind `#if compiler(>=6.2)` and `#available`, with tinted
+  fills before.
 - `--watch-demo` in Debug displays synthetic dashboard data without activating connectivity.
-  Workout recording still requires an explicit Start action; never start workouts during
-  screenshot-only validation. See `WatchApp/README.md` for build and hardware checks.
+  See `WatchApp/README.md` for build and hardware checks.
 
 ## Oura Networking and OAuth
 
@@ -365,7 +354,7 @@ These abstractions encode product correctness and should be reused rather than r
 - Estimates HeartSync computes carry `ReadingMetadata.modelledBy`, and `HealthStore.reconcileEstimates` deletes only within its scope: blood-pressure estimates under `AppModel.estimateSourceID`, VO₂ max estimates that are HeartSync's own. A ring's estimated blood pressure and temperature are never candidates.
 - `HRVCalculator`/`HRVAccumulator`: RR filtering and HRV derivation.
 - `Estimators`: estimated VO2 max and blood-pressure trend rules/provenance.
-- `Components.swift`: `SourceDot`, `SourceValueRow`, `AgreementBadge`, `EmptyStateView`, `EstimateDisclaimer`, `BatteryBadge`, `SignalBars`, and `metricCard()`.
+- `Components.swift`: `SourceDot`, `SourceValueRow`, `AgreementBadge`, `EmptyStateView`, `EstimateDisclaimer`, `BatteryMeter`, `BatteryBadge`, `SignalBars`, and `metricCard()`.
 
 Preserve these comparison rules:
 
@@ -396,6 +385,7 @@ Preserve measurement semantics:
 The application is SwiftUI-first and targets iOS 18:
 
 - Use Observation environment state, the iOS 18 `Tab` API, `NavigationStack`, `List`/`Form`, sheets, toolbars, `refreshable`, and Swift Charts consistently with nearby screens.
+- Liquid Glass: the theme owns every glass call. `HeartSyncCardBackground` (behind `metricCard()` and `ouraCard()`), `heartSyncGlassCapsule(tint:)`, `GlassChipRow`, `heartSyncButtonStyle(prominent:)`, `heartSyncChrome()`, `heartSyncScreenBackground()`, and `heartSyncTabBarMinimizes()` use glass on iOS 26+ behind `#if compiler(>=6.2)` (CI's macos-15 runner builds with Xcode 16) and `#available`, and fall back to the earlier material styling with the same geometry. Do not call `glassEffect` or the glass button styles directly from a screen. Tab roots use `.toolbarTitleDisplayMode(.inlineLarge)` so the title shares the toolbar row. Never tint glass with a colour that would change a semantic meaning (severity, source).
 - Prefer existing semantic components in `Sources/Views/Components.swift` (including `FlowLayout` for wrapping chips) and the existing Oura card helpers before introducing another visual vocabulary. Content cards share one surface, `HeartSyncCardBackground`.
 - Chart heights, inks, band opacity, and `axisFormat(span:)` come from `HeartSyncTheme.Chart`. Size every history chart with `heartSyncChartHeight(_:)`, which grows with Dynamic Type and the available width, never a fixed `.frame(height:)`.
 - A chart whose automatic Audio Graph would name series by source ID gets an `AXChartDescriptorRepresentable` (`ChartAudioGraph.swift`) that names devices.
@@ -437,7 +427,7 @@ There are no storyboards or XIBs. Do not introduce UIKit architecture for an iso
 - Real Bluetooth and meaningful HealthKit behavior require a physical iPhone; simulator builds only validate compilation, pure logic, mocked networking, and fixture-driven UI.
 - The app declares base HealthKit and HealthKit background-delivery entitlements; the HealthKit access array is empty. The background-delivery capability and provisioning remain unverified on a signed physical-device build.
 - The shipped plist contains Bluetooth and Health privacy descriptions, the Oura custom URL scheme, and `bluetooth-central` background mode.
-- The watch app and its WidgetKit extension share one App Group for complications. There are no iPhone App Groups, Keychain sharing groups, iCloud/CloudKit containers, local/push notification code, notification extensions, or BGTaskScheduler registrations. The watch declares workout processing and uses WatchConnectivity; it has no route/location capability.
+- The watch app and its WidgetKit extension share one App Group for complications. There are no iPhone App Groups, Keychain sharing groups, iCloud/CloudKit containers, local/push notification code, notification extensions, or BGTaskScheduler registrations. The watch uses WatchConnectivity; it has no HealthKit, workout-processing, or route/location capability.
 
 Any new capability must be explicitly requested and must update `project.yml`, generated resource files, signing/provisioning, documentation, and validation. Do not infer that a capability exists because a system framework is imported.
 
@@ -564,9 +554,6 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/AppModelTests.swift`: 15 tests over temporary files and inert transports covering saved retention across relaunch, unreadable/corrupt/newer-schema settings deleting nothing, a lost settings file not shortening a longer period, the user's choice lifting the hold, refresh gating, Oura throttling, ring blood pressure surviving reconciliation, and a failed removal reporting.
 - `Tests/StoreMaintenanceTests.swift`: 22 tests covering source mutations that roll back, estimate reconciliation scope, ingest not pruning, compaction across a pass boundary, SQL-counted retention impact and session summaries, sub-second payload dates, coarse last-seen updates, and CSV formula neutralisation.
 - `Tests/HealthKitWriteBackTests.swift`: 7 tests covering the Gregorian date of birth and the write plan (sync identifier, device, scaling, refusals), the bounded queue, and refusal classification.
-- `Tests/Watch/WorkoutLifecycleTests.swift`: 19 tests covering the watch workout transition
-  rules in `Shared/WorkoutLifecycle.swift` — duplicate Start/Stop taps, stale callbacks,
-  interruption, save failure and retry, double-save refusal, discard, and recovery.
 - `Tests/ComparisonSourceSelectionTests.swift`: 6 tests covering comparison-only source
   hiding, settings archive backward compatibility, and same-device pair disclosure.
 - `Tests/ComparisonSessionTests.swift`: 11 tests covering fixed versus rolling periods,
@@ -601,7 +588,7 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   transfer (acknowledgement, empty types, bad CRC, silence, cancel, overflow), record
   decoding, clock guards, local wall-clock conversion, estimate provenance, and stable IDs.
 - `Tests/Watch/WatchChartTests.swift`: 23 tests covering chart payload compatibility and
-  validation, the 1H/24H/7D/30D periods and their windows, per-period evidence, empty periods,
+  validation, the 1H/3H/24H/7D/30D periods and their windows, per-period evidence, empty periods,
   the long-period cache and its invalidation (only by removals that reach a period, routine
   pruning kept, the bounded removal record), one read sliced into every period, palette
   colours and shared-slot shapes, pair choice and threshold, estimate marking, the size drop
@@ -610,16 +597,15 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   end, one source), one snapshot across a mid-export deletion, the off-main writer against
   the whole-string export, progress, Cancel and empty exports leaving no file, a not-loaded
   store, the export job, the launch sweep, and pairwise files written together.
-- `Tests/RingSessionTests.swift`: 25 tests covering the YCBT codec (CRC check value,
-  framing, reassembly, bad CRC and length), topology selection, subscription gating,
+- `Tests/RingSessionTests.swift`: 28 tests covering the YCBT codec (CRC check value,
+  framing, reassembly, bad CRC and length, the identity reply's battery bytes), the battery
+  query, topology selection, subscription gating,
   identification, warm-up and completion, no contact, rejection, timeouts, cancel and repeat,
   heart-rate-only readiness, control channels, late callbacks, stall diagnosis, raw-capture
   bounds, command stages, and stream cadence.
 - `Tests/DashboardTrendTests.swift`: 8 tests covering Now sparklines (window medians, gaps,
   single points, spans, spoken summary, per-window caching), chip status, and the
   `--chart-gallery` fixture.
-- `Tests/Watch/WorkoutTrendTests.swift`: 4 tests covering the workout trend buffer.
-- `Tests/Watch/MirroredWorkoutTests.swift`: 5 tests covering the mirrored-workout payload, its validation and freshness, and that it never reaches the store.
 - `Tests/ComparisonHonestyTests.swift`: 13 tests covering interval averages (no windowed pair, no compaction, never concluding), session titles across days, RMSSD adjacency, the t quantile and effective sample size, and clock skew.
 - `Tests/HistoryReaderTests.swift`: 9 tests covering off-main snapshots, reader visibility of commits, column and payload decoding, SQL source filters, failures and not-loaded history, temporary files, and the schema-3 migration and backfill.
 - `Tests/ResetAndIngestTests.swift`: 11 tests covering reset order and exclusivity, batched Bluetooth ingest, batched existence checks, changed-source persistence, and launch-time transport setup.
@@ -661,7 +647,7 @@ export, presentation-projection and watch-lifecycle suites. Adding `BluetoothMan
 `HealthKitManager` (and its `+Session`/`+WriteBack` files), `OuraManager`, `OuraData`, `AppModel`,
 `WatchCompanionPublisher`, `WatchSnapshotBuilder`, `BackgroundWork`, `BluetoothIngestBuffer`,
 `PeripheralState`, `HealthHistory`, `DerivedEstimates`, `HealthKitManager+Background`,
-`MirroredWorkoutMonitor`, and `Sources/Debug` lets the
+and `Sources/Debug` lets the
 `AppModel`, Oura orchestration, and HealthKit conversion suites run too, with two harness-only
 stand-ins: a `CompanionSession` stub (WatchConnectivity does not exist on macOS) and a copy of
 `Sources/Oura/OuraOAuth.swift` with its UIKit window lookup replaced. It cannot compile the SwiftUI
@@ -761,7 +747,7 @@ When a comment and implementation disagree, document the discrepancy and test ac
 - Do not change the CoreBluetooth queue while retaining `MainActor.assumeIsolated` delegate handling.
 - Do not weaken validity checks or parser units to accommodate one device without representative frames and regression tests.
 - Do not claim proprietary/vendor BLE support beyond the topology-gated YCBT candidate, and do not describe that candidate as verified until a device run in `RELEASE_CHECKLIST.md` records it. Never select a vendor path from a device name, and never write to a characteristic before its session's gating says so.
-- Keep watch workout sample import on HealthKit. Do not duplicate live samples into the iPhone store over WatchConnectivity or treat the wrist display snapshot as new measurements.
+- Keep Apple Watch data on the HealthKit import. Do not send measurements into the iPhone store over WatchConnectivity or treat the wrist display snapshot as new measurements.
 - Do not claim App Groups, CloudKit, Keychain sharing, widgets, notifications, or background tasks that are not configured.
 - Do not use a simulator build as proof that BLE, HealthKit, background delivery, signing, OAuth presentation, or TCC/privacy behavior works.
 - Do not add broad abstractions, dependencies, style rewrites, or unrelated refactors for a narrowly scoped task.

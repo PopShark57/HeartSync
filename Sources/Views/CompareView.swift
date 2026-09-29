@@ -155,6 +155,8 @@ struct CompareView: View {
             }
         }
         .navigationTitle("Compare")
+        .toolbarTitleDisplayMode(.inlineLarge)
+        .heartSyncScreenBackground()
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
             ToolbarItem(placement: .topBarLeading) {

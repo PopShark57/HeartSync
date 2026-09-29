@@ -80,14 +80,4 @@ struct WatchSnapshotTests {
         #expect(reading.isStale(kind: .heartRate, now: now.addingTimeInterval(901)))
         #expect(!reading.isStale(kind: .restingHeartRate, now: now.addingTimeInterval(901)))
     }
-
-    @Test("Live workout heart rate rejects invalid values and stops appearing current")
-    func liveWorkoutFreshness() throws {
-        #expect(WorkoutHeartRate.validated(value: .nan, timestamp: now, now: now) == nil)
-        #expect(WorkoutHeartRate.validated(value: 500, timestamp: now, now: now) == nil)
-        #expect(WorkoutHeartRate.validated(value: 72, timestamp: now.addingTimeInterval(61), now: now) == nil)
-        let reading = try #require(WorkoutHeartRate.validated(value: 72, timestamp: now, now: now))
-        #expect(reading.isCurrent(at: now.addingTimeInterval(15)))
-        #expect(!reading.isCurrent(at: now.addingTimeInterval(16)))
-    }
 }

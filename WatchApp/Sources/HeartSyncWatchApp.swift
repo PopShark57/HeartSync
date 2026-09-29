@@ -5,7 +5,7 @@ import OSLog
 
 /// The vertical pages, in order.
 enum WatchPage: Int {
-    case dashboard, compare, workout
+    case dashboard, compare
 }
 
 @main
@@ -22,8 +22,7 @@ struct HeartSyncWatchApp: App {
                 NavigationStack(path: $metricPath) {
                     WatchDashboardView(
                         connection: connection,
-                        openCompare: { selectedPage = .compare },
-                        openWorkout: { selectedPage = .workout }
+                        openCompare: { selectedPage = .compare }
                     )
                         .navigationDestination(for: MetricKind.self) { kind in
                             if let snapshot = connection.snapshot,
@@ -40,10 +39,6 @@ struct HeartSyncWatchApp: App {
                     WatchCompareView(connection: connection)
                 }
                 .tag(WatchPage.compare)
-                NavigationStack {
-                    WatchWorkoutView(workout: delegate.workout)
-                }
-                .tag(WatchPage.workout)
             }
             .tabViewStyle(.verticalPage)
             .tint(.pink)
@@ -53,8 +48,6 @@ struct HeartSyncWatchApp: App {
                 case .metric(let kind):
                     selectedPage = .dashboard
                     metricPath = [kind]
-                case .workout:
-                    selectedPage = .workout
                 }
             }
             .task {
@@ -66,9 +59,6 @@ struct HeartSyncWatchApp: App {
                 #endif
                 connection.start()
             }
-            .onChange(of: delegate.workout.phase) { _, phase in
-                if phase == .starting || phase == .running { selectedPage = .workout }
-            }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { connection.resume() }
             }
@@ -78,7 +68,6 @@ struct HeartSyncWatchApp: App {
 
 @MainActor
 final class WatchAppDelegate: NSObject, WKApplicationDelegate {
-    let workout = WatchWorkoutManager()
     let connection = CompanionSession()
     private var connectivityTasks: Set<WKWatchConnectivityRefreshBackgroundTask> = []
 
@@ -122,9 +111,5 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
             connection.start()
             connection.completeBackgroundDeliveryIfReady()
         }
-    }
-
-    func handleActiveWorkoutRecovery() {
-        Task { await workout.recover() }
     }
 }

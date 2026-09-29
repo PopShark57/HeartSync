@@ -156,6 +156,7 @@ struct MetricDetailView: View {
         }
         .navigationTitle(kind.title)
         .navigationBarTitleDisplayMode(.inline)
+        .heartSyncScreenBackground()
         // Cancels a superseded load and rejects a late one, so a slow month-range result
         // cannot replace a newer hour-range selection.
         .task(id: loadKey) {
