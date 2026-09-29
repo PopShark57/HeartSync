@@ -199,3 +199,28 @@ but not the platform behavior.
   in review with the right elapsed time and never returns to running.
 - [ ] Diagnostics: open Devices while a strap streams and confirm the list stays still, and that
   **Export diagnostics…** builds the report only when tapped.
+
+## Second pass: resets, off-main reads, batching, launch, mirroring (items 46–72)
+
+- [ ] Background relaunch (53): connect a strap, background HeartSync, and have iOS terminate it
+  (Xcode's Debug › Terminate while backgrounded does not count; use memory pressure or wait).
+  The strap keeps recording, and on reopening the readings from the gap are there. The console
+  shows one discovery per restored link, not two.
+- [ ] Health background delivery (53): with the app terminated, record a heart-rate sample on
+  Apple Watch. It appears in HeartSync without opening the app (check `lastAttemptAt` or the
+  console), and HealthKit keeps delivering over a day.
+- [ ] Resets (47): during an active Apple Watch heart-rate stream, use **Clear local cache; data may
+  resync**; older Health history is re-read. Use **Forget imported history** during an Oura sync;
+  nothing from before the reset returns, and the Oura account is signed out.
+- [ ] Off-main reads (50): with two weeks of a 1 Hz strap, open Compare (30 days), metric detail
+  (30 days), and the pair screen while the strap streams; Instruments shows no main-thread hang,
+  and the watch publication does not hitch the UI. Run `HeartSyncCheckerPerformance` and write the
+  budgets down here.
+- [ ] Schema 3 (50): install over a build with existing history. Everything reads unchanged, and
+  after a few maintenance runs `rowsAwaitingValueBackfill` reaches zero.
+- [ ] Batched ingest (52): run `batchedStrapIngest` on the device and record commits per minute; log
+  an hour of real strap use with the Energy Log instrument, before and after.
+- [ ] Mirroring (72): start a watch workout with **Show live on iPhone** on and HeartSync open on
+  iPhone: Now shows the watch heart rate beside the strap, marked display only; nothing new appears
+  in the store until the workout syncs through Health. With HeartSync closed, record what iOS does
+  (no Live Activity is provided).

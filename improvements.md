@@ -84,9 +84,10 @@ Suggested order:
 
 ### Implementation status (2026-09-29)
 
-**Implemented:** 42, 43, 44, 45, 48, 51, 54, 55, 56, 57, 58, 60, 61, 62, 63, 64, 65, 67, 68, 70,
-and 71. **Not implemented:** 46, 47, 49 (except the cache fingerprint that `WatchChartTests.cache()`
-needs), 50, 52, 53, 59, 66, 69, and 72. Where an item was done in part, the part left is named.
+**Implemented:** 42–48, 50–58, 60–72, in two passes (the second, for 46, 47, 50, 52, 53, 66, 69,
+and 72, is described under [Second pass](#second-pass-2026-09-29)). **Not implemented:** 49 (except
+the cache fingerprint that `WatchChartTests.cache()` needs; its off-main snapshot building came with
+50) and 59. Where an item was done in part, the part left is named.
 
 How it was checked, and what was not:
 
@@ -125,6 +126,35 @@ How it was checked, and what was not:
 | 68 | The types and strings this item names, and every English plural ternary found, use `String(localized:)`; plurals are catalog variations. The tolerance summary no longer compares a localised unit with `"%"`. | Two interval-only strings (`Past N days/hours`) have no plural variation because N is at least 2. |
 | 70 | `Discrepancy` and its engine functions removed, with their four tests moved to the pairwise analysis. Documents corrected. Restore no longer syncs twice. A renamed source keeps its name across syncs. One share-sheet wrapper. | Nothing. |
 | 71 | Cached personal info holds only id and email. Keychain reads distinguish absent, undecodable, and unavailable; only the first two clear. | Nothing. |
+
+#### Second pass (2026-09-29)
+
+Items 46, 47, 50, 52, 53, 66, 69, and 72, on branch `claude/audit-fixes-46-72`.
+
+How it was checked, and what was not:
+
+- `build-for-testing` of the `HeartSyncChecker` scheme for the generic iOS Simulator (app, watch
+  app, complications, unit and UI bundles) and a build of the `HeartSyncWatch` scheme for the
+  generic watchOS Simulator, with no warnings. The simulator runtimes were still unusable
+  (Xcode-beta 27.2), so **no hosted test, UI test, or app launch was run**.
+- The scratch macOS harness ran 640 tests, all passing, including the 45 added here. A mutation
+  check confirmed the Oura clear-during-sync test fails when the clear does not wait for the sync.
+- The new device workload (`batchedStrapIngest`) was run once on the Mac only: 20 commits a
+  minute batched against 61 a minute per value, about half the time committing. That is not a
+  device figure; the energy and main-thread measurements the items ask for still need a device.
+- Nothing touching Bluetooth restoration, HealthKit background delivery, or workout mirroring was
+  exercised on hardware.
+
+| Item | Done | Left |
+| --- | --- | --- |
+| 46 | A reading longer than its metric's comparison window (`Reading.isIntervalAverage`) is left out of windowing by default, never compacted, and exempt from the compacted-window rejection. Opted in, its pairs are timed `intervalAverage` and excluded from the threshold and statistics. Compare does not count such a source toward a comparable metric. Metric detail draws them as spans with a caption and VoiceOver text. | Nothing. |
+| 47 | `resetLocalData` is exclusive: HealthKit observers stop and a running drain is awaited, a running Oura sync is cancelled and awaited, then the store is cleared; HealthKit resumes from cleared anchors (resync) or committed ones (forget). Both managers carry a reset epoch, so a page or cycle begun before the reset writes nothing after it. Derived estimates computed before a reset are dropped. | The HealthKit epoch path is not unit-testable without HealthKit; tested through `AppModel`'s seams and the Oura manager. |
+| 50 | Reads go through a pool of read-only connections behind a `Sendable` `HealthHistory`; Compare, metric detail, zoom, brushed period, the pair screen, Now, calibration, the derived estimates, and the watch publisher build off the main actor. Schema 3 adds `value`/`has_metadata` through a `user_version` ladder; plain rows skip JSON, and maintenance backfills older rows 20,000 at a time. Source filters are in SQL. Non-persistent stores use a temporary file. | Writes (ingest, compaction, prune) stay on the main actor's writer connection. No device trace, so the budgets are not written down. |
+| 52 | Live Bluetooth values commit in batches of up to two seconds (and at 240 values, link end, reset, background). Existence checks are one `IN` query per 500, only changed source rows are written, file protection is set at open, first write, and checkpoints. `synchronous = FULL` kept, with the reason recorded on `HealthDatabase`. `HealthStore.commitCount` and the `batchedStrapIngest` workload report commits per minute. | Device energy measurement. |
+| 53 | An `AppDelegate` configures Bluetooth (central with its restoration identifier), registers one `HKObserverQuery` per type, and starts loading history at launch. Observer handlers wait up to 20 s for startup, drain through `syncAll`, and always call the completion handler. Restoration only adopts peripherals; discovery runs once at power-on. | The `RELEASE_CHECKLIST.md` background steps on a signed device. |
+| 66 | The private per-peripheral dictionaries are one `PeripheralLink` per session and one `PeripheralRecord` per device, with ring plumbing in `RingLink`; session numbers are global. Forget removes both; a radio power-off ends links, and their HRV windows, like a disconnect. Published dictionaries are unchanged so views stay finely invalidated. | Nothing. |
+| 69 | A session across days prints the end's date. RMSSD and pNN50 use adjacent normal-to-normal pairs, never across a rejected beat or a stream gap. Bias and limit intervals use a t quantile on an AR(1) effective sample size, shown in the pair screen and stated in the export. The store accepts the five-minute future skew Bluetooth does. | Nothing. |
+| 72 | Opt-in on the watch's start screen. The watch mirrors the workout and sends a versioned payload per heart-rate update; iPhone sets the mirroring handler at launch and shows it on Now beside Bluetooth heart rate. Display only: never stored, compared, exported, or written to Health. | No Live Activity (it needs an iOS widget extension) or new background mode was added, so the card is reliable only while HeartSync is running. That capability decision is the user's. |
 
 ### 42. Apply the saved retention before any prune; never prune on defaulted settings
 
