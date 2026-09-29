@@ -14,6 +14,7 @@ extension WatchSourceShape {
         case .diamond:  .diamond
         case .pentagon: .pentagon
         case .cross:    .cross
+        case .asterisk: .asterisk
         }
     }
 
@@ -26,6 +27,7 @@ extension WatchSourceShape {
         case .diamond:  "diamond.fill"
         case .pentagon: "pentagon.fill"
         case .cross:    "xmark"
+        case .asterisk: "asterisk"
         }
     }
 }

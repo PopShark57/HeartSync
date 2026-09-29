@@ -48,6 +48,19 @@ struct SourceSymbolShape: Shape {
                 )
             }
             return path
+        case .asterisk:
+            // Three bars through the centre, at 60° steps.
+            let bar = min(rect.width, rect.height) * 0.22
+            var path = Path()
+            for angle in [CGFloat.zero, .pi / 3, 2 * .pi / 3] {
+                let transform = CGAffineTransform(translationX: rect.midX, y: rect.midY)
+                    .rotated(by: angle)
+                path.addPath(
+                    Path(CGRect(x: -rect.width / 2, y: -bar / 2, width: rect.width, height: bar)),
+                    transform: transform
+                )
+            }
+            return path
         }
     }
 

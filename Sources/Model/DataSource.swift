@@ -158,12 +158,13 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
 
     /// Source colour slots, in `colorIndex` order. Sources are assigned round-robin on add.
     ///
-    /// Measured, not asserted: `ColourVisionTests` simulates every pair under protan,
-    /// deutan, and tritan deficiency (Machado et al. 2009, full severity) and requires a
-    /// CAM02-UCS ΔE of at least 15 between every two slots, and between every slot and the
-    /// neutral ink reserved for statistical reference lines, in both appearances. The
-    /// previous palette fell as low as 4.4 (green and teal under tritan). Each slot also
-    /// keeps at least 3:1 contrast against the list backgrounds it is drawn on.
+    /// Measured, not asserted. `ColourVisionTests` requires a CAM02-UCS ΔE of at least 15
+    /// between every two slots in ordinary vision, and between every slot and the neutral
+    /// ink reserved for statistical reference lines, in both appearances. The first six
+    /// slots also hold that floor under simulated protan, deutan, and tritan deficiency
+    /// (Machado et al. 2009, full severity); the four added later (red, gold, teal, orchid)
+    /// do not, so each slot's shape (`SourceSymbol`) is what keeps devices apart there.
+    /// Each slot keeps at least 3:1 contrast against the list backgrounds it is drawn on.
     ///
     /// `colorIndex` persists, so slots are changed in place and never renumbered: every
     /// device keeps its slot, and its shape (`SourceSymbol`), across this change.
@@ -198,7 +199,107 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
             light: SRGBColor(red: 0.09, green: 0.59, blue: 0.78),    // #1796C7
             dark: SRGBColor(red: 0.07, green: 0.87, blue: 1.00)      // #12DEFF
         ),
+        SourcePaletteSlot(
+            name: "red",
+            light: SRGBColor(red: 0.71, green: 0.06, blue: 0.02),    // #B51005
+            dark: SRGBColor(red: 0.65, green: 0.34, blue: 0.32)      // #A75751
+        ),
+        SourcePaletteSlot(
+            name: "gold",
+            light: SRGBColor(red: 0.56, green: 0.44, blue: 0.11),    // #8F701D
+            dark: SRGBColor(red: 1.00, green: 0.87, blue: 0.22)      // #FFDE37
+        ),
+        SourcePaletteSlot(
+            name: "teal",
+            light: SRGBColor(red: 0.03, green: 0.59, blue: 0.52),    // #089684
+            dark: SRGBColor(red: 0.13, green: 0.62, blue: 0.51)      // #219F81
+        ),
+        SourcePaletteSlot(
+            name: "orchid",
+            light: SRGBColor(red: 0.56, green: 0.13, blue: 0.62),    // #8F229E
+            dark: SRGBColor(red: 0.96, green: 0.47, blue: 0.98)      // #F479FB
+        ),
     ]
+
+    /// The slot for a source about to be added: one of those the fewest devices wear,
+    /// preferring slots that no enabled device wears, and chosen at random among equals so
+    /// a new device does not always arrive in the same colour. The colour is then stored
+    /// in `colorIndex`, so it stays with the device. Sharing only starts once every slot is
+    /// worn; this keeps it to the least possible.
+    static func leastUsedColorIndex(
+        among sources: [DataSource],
+        using generator: inout some RandomNumberGenerator
+    ) -> Int {
+        let count = paletteSlots.count
+        var enabled = [Int](repeating: 0, count: count)
+        var total = [Int](repeating: 0, count: count)
+        for source in sources {
+            let slot = slotIndex(source.colorIndex)
+            total[slot] += 1
+            if source.isEnabled { enabled[slot] += 1 }
+        }
+        return leastUsedSlot(enabled: enabled, total: total, using: &generator)
+    }
+
+    static func leastUsedColorIndex(among sources: [DataSource]) -> Int {
+        var generator = SystemRandomNumberGenerator()
+        return leastUsedColorIndex(among: sources, using: &generator)
+    }
+
+    private static func leastUsedSlot(
+        enabled: [Int],
+        total: [Int],
+        using generator: inout some RandomNumberGenerator
+    ) -> Int {
+        let slots = enabled.indices
+        let best = slots.map { (enabled[$0], total[$0]) }.min { $0 < $1 } ?? (0, 0)
+        let candidates = slots.filter { (enabled[$0], total[$0]) == best }
+        return candidates.randomElement(using: &generator) ?? 0
+    }
+
+    /// New slots for sources whose colour another source already wears, keyed by source ID.
+    ///
+    /// Sources persisted before the store spread them (a seventh device took
+    /// `count % 6`, and removals left gaps) can share a slot, which drew two devices in one
+    /// colour. Enabled sources are placed first, oldest first, and keep their slot unless an
+    /// earlier one holds it; only the later one moves, to a least used slot chosen at random. Sources that
+    /// keep their slot are never listed, so an unshared device keeps its colour and shape,
+    /// and running this again on its own result changes nothing.
+    static func colorIndexRepairs(for sources: [DataSource]) -> [String: Int] {
+        var generator = SystemRandomNumberGenerator()
+        return colorIndexRepairs(for: sources, using: &generator)
+    }
+
+    static func colorIndexRepairs(
+        for sources: [DataSource],
+        using generator: inout some RandomNumberGenerator
+    ) -> [String: Int] {
+        let count = paletteSlots.count
+        var enabledUse = [Int](repeating: 0, count: count)
+        var totalUse = [Int](repeating: 0, count: count)
+        var repairs: [String: Int] = [:]
+        let ordered = sources.sorted { lhs, rhs in
+            if lhs.isEnabled != rhs.isEnabled { return lhs.isEnabled }
+            if lhs.addedAt != rhs.addedAt { return lhs.addedAt < rhs.addedAt }
+            return lhs.id < rhs.id
+        }
+        for source in ordered {
+            var slot = slotIndex(source.colorIndex)
+            let keeps = source.isEnabled ? enabledUse[slot] == 0 : totalUse[slot] == 0
+            if !keeps {
+                slot = leastUsedSlot(enabled: enabledUse, total: totalUse, using: &generator)
+            }
+            totalUse[slot] += 1
+            if source.isEnabled { enabledUse[slot] += 1 }
+            if slot != source.colorIndex { repairs[source.id] = slot }
+        }
+        return repairs
+    }
+
+    private static func slotIndex(_ colorIndex: Int) -> Int {
+        let count = paletteSlots.count
+        return ((colorIndex % count) + count) % count
+    }
 
     /// The slots as colours that follow the system appearance.
     static let palette: [Color] = paletteSlots.map(\.color)
