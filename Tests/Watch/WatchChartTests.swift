@@ -5,8 +5,9 @@ import Testing
 @Suite("Watch comparison charts")
 @MainActor
 struct WatchChartTests {
-    /// 2026-09-29T12:00:00Z, a whole number of 480-second windows since the epoch.
-    private let now = Date(timeIntervalSince1970: 1_790_683_200)
+    /// Yesterday's UTC midnight: always in the past (the store rejects future readings) and a
+    /// whole number of every chart window and axis tick spacing since the epoch.
+    private let now = Date(timeIntervalSince1970: ((Date.now.timeIntervalSince1970 / 86_400).rounded(.down) - 1) * 86_400)
 
     private func populate(
         _ store: HealthStore,
@@ -108,19 +109,143 @@ struct WatchChartTests {
 
     // MARK: Builder
 
-    @Test("Periods and chart windows: six hours for fast metrics, seven days for daily ones")
+    @Test("Periods match iPhone's 1H/24H/7D/30D; daily metrics offer only 7D and 30D")
     func periods() {
-        #expect(WatchSnapshotBuilder.lookback(for: .heartRate) == 6 * 3_600)
-        #expect(WatchSnapshotBuilder.lookback(for: .restingHeartRate) == 7 * 86_400)
-        #expect(WatchSnapshotBuilder.chartBucket(for: .heartRate) == 480)
-        #expect(WatchSnapshotBuilder.chartBucket(for: .hrvRMSSD) == 600)
-        #expect(WatchSnapshotBuilder.chartBucket(for: .bloodPressureSystolic) == 600)
-        #expect(WatchSnapshotBuilder.chartBucket(for: .restingHeartRate) == 86_400)
+        #expect(WatchChartRange.allCases.map(\.rawValue) == ["1H", "24H", "7D", "30D"])
+        #expect(WatchChartRange.allCases.map(\.duration) == [TimeRange.hour, .day, .week, .month].map(\.duration))
+        #expect(WatchChartRange.available(for: .heartRate) == WatchChartRange.allCases)
+        #expect(WatchChartRange.available(for: .restingHeartRate) == [.week, .month])
+        #expect(WatchSnapshotBuilder.standardRange(for: .heartRate) == .day)
+        #expect(WatchSnapshotBuilder.standardRange(for: .restingHeartRate) == .week)
+        #expect(WatchChartRange.resolved(.hour, among: [.week, .month]) == .week)
+        #expect(WatchChartRange.resolved(.month, among: [.hour]) == .hour)
+        #expect(WatchChartRange.resolved(.day, among: []) == nil)
+
+        #expect(WatchSnapshotBuilder.chartBucket(for: .heartRate, range: .hour) == 120)
+        #expect(WatchSnapshotBuilder.chartBucket(for: .heartRate, range: .day) == 2_880)
+        #expect(WatchSnapshotBuilder.chartBucket(for: .bloodPressureSystolic, range: .hour) == 600)
+        #expect(WatchSnapshotBuilder.chartBucket(for: .restingHeartRate, range: .month) == 86_400)
         for kind in MetricKind.allCases {
-            let bucket = WatchSnapshotBuilder.chartBucket(for: kind)
-            #expect(bucket.truncatingRemainder(dividingBy: kind.comparisonWindow) == 0)
-            #expect(WatchSnapshotBuilder.lookback(for: kind) / bucket <= Double(WatchChart.maximumPoints - 1))
+            for range in WatchChartRange.available(for: kind) {
+                let bucket = WatchSnapshotBuilder.chartBucket(for: kind, range: range)
+                #expect(bucket.truncatingRemainder(dividingBy: kind.comparisonWindow) == 0)
+                #expect(range.duration / bucket <= Double(WatchChart.maximumPoints - 1))
+            }
         }
+    }
+
+    @Test("Every offered period is sent with its own evidence; the 24-hour one fills the legacy slot")
+    func builderRanges() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        populate(store, sourceID: "a", value: 70)
+        populate(store, sourceID: "b", value: 74)
+        let snapshot = WatchSnapshotBuilder.make(store: store, now: now)
+        let metric = try #require(snapshot.metrics.first { $0.kind == .heartRate })
+        #expect(metric.availableRanges == WatchChartRange.allCases)
+        #expect(metric.chart?.range == .day)
+        #expect(metric.rangeCharts?.map(\.range) == [.hour, .week, .month])
+        #expect(metric.comparison.lookback == 86_400)
+        for range in WatchChartRange.allCases {
+            let chart = try #require(metric.periodChart(range))
+            #expect(chart.comparison?.lookback == range.duration)
+            #expect(chart.comparison?.readyPairs == 1)
+            #expect(chart.span <= range.duration + chart.bucket)
+        }
+        #expect(try WatchSnapshot.decode(snapshot.encoded()) == snapshot)
+    }
+
+    @Test("A period without readings is offered but empty, never a green verdict")
+    func emptyPeriod() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        store.upsert(DataSource(id: "a", displayName: "Source a", transport: .bluetooth))
+        store.upsert(DataSource(id: "b", displayName: "Source b", transport: .bluetooth))
+        for index in 0..<10 {
+            let at = now.addingTimeInterval(-3 * 3_600 - Double(index) * 60)
+            store.append(Reading(sourceID: "a", kind: .heartRate, value: 70, start: at))
+            store.append(Reading(sourceID: "b", kind: .heartRate, value: 70, start: at))
+        }
+        let metric = try #require(WatchSnapshotBuilder.make(store: store, now: now).metrics.first)
+        #expect(metric.availableRanges?.contains(.hour) == true)
+        #expect(metric.periodChart(.hour) == nil)
+        #expect(metric.periodComparison(.hour).readyPairs == 0)
+        #expect(!metric.periodComparison(.hour).allPairsAgree)
+        #expect(metric.periodComparison(.day).allPairsAgree)
+    }
+
+    @Test("Long periods come from the cache until data is removed; the hour is always fresh")
+    func cache() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        populate(store, sourceID: "a", value: 70)
+        populate(store, sourceID: "b", value: 74)
+        let cache = WatchChartCache()
+        let first = try #require(WatchSnapshotBuilder.make(store: store, now: now, cache: cache).metrics.first)
+
+        let late = Reading(sourceID: "a", kind: .heartRate, value: 90, start: now.addingTimeInterval(10))
+        store.append(late)
+        let second = try #require(WatchSnapshotBuilder.make(store: store, now: now.addingTimeInterval(30), cache: cache).metrics.first)
+        #expect(second.periodChart(.month) == first.periodChart(.month))
+        #expect(second.periodChart(.hour)?.series.first { $0.sourceName == "Source a" }?.values.last == 90)
+
+        #expect(store.remove(readingIDs: [late.id]) == 1)
+        let third = try #require(WatchSnapshotBuilder.make(store: store, now: now.addingTimeInterval(60), cache: cache).metrics.first)
+        #expect(third.periodChart(.month)?.end == now.addingTimeInterval(60))
+
+        // A rename is visible at once, even in a cached period.
+        store.rename(sourceID: "a", to: "Renamed")
+        let fourth = try #require(WatchSnapshotBuilder.make(store: store, now: now.addingTimeInterval(90), cache: cache).metrics.first)
+        #expect(fourth.periodChart(.month)?.series.contains { $0.sourceName == "Renamed" } == true)
+        #expect(WatchChartCache.refreshInterval(for: .hour) == 0)
+        #expect(WatchChartCache.refreshInterval(for: .month) == 3_600)
+    }
+
+    @Test("Two sources sharing a colour slot are told apart by shape, as on iPhone")
+    func sharedSlotShapes() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        for index in 0..<7 {
+            store.upsert(DataSource(id: "s\(index)", displayName: "Source \(index)", transport: .bluetooth))
+        }
+        let first = try #require(store.source(id: "s0"))
+        let seventh = try #require(store.source(id: "s6"))
+        #expect(first.colorIndex % DataSource.paletteSlots.count == seventh.colorIndex % DataSource.paletteSlots.count)
+        populate(store, sourceID: "s0", value: 70)
+        populate(store, sourceID: "s6", value: 72)
+        let chart = try #require(WatchSnapshotBuilder.make(store: store, now: now).metrics.first?.chart)
+        #expect(chart.series.count == 2)
+        #expect(Set(chart.series.map(\.symbol)).count == 2)
+        #expect(chart.series[0].color == chart.series[1].color)
+    }
+
+    @Test("Axis ticks sit on round local times, away from both edges, two to four per period")
+    func axisTicks() throws {
+        let utc = try #require(TimeZone(secondsFromGMT: 0))
+        for range in WatchChartRange.allCases {
+            let start = now.addingTimeInterval(-range.duration)
+            let ticks = WatchChartProjection.axisTicks(range: range, start: start, end: now, timeZone: utc)
+            #expect((2...4).contains(ticks.count), "\(range): \(ticks.count) ticks")
+            let margin = range.duration * 0.08
+            for tick in ticks {
+                #expect(tick >= start.addingTimeInterval(margin) && tick <= now.addingTimeInterval(-margin))
+                #expect(tick.timeIntervalSince1970.truncatingRemainder(dividingBy: WatchChartProjection.tickSpacing(for: range)) == 0)
+            }
+        }
+    }
+
+    @Test("Dropping for size removes 30D first and keeps the 24-hour chart")
+    func dropOrder() throws {
+        var snapshot = chartFixture()
+        var day = try #require(snapshot.metrics[0].chart)
+        day.range = .day
+        var month = day
+        month.range = .month
+        month.series[0].offsets[0] = -1
+        snapshot.metrics[0].chart = day
+        snapshot.metrics[0].rangeCharts = [month]
+        snapshot.metrics[0].availableRanges = [.day, .month]
+        let fitted = WatchSnapshotBuilder.fitted(snapshot)
+        #expect(fitted.metrics[0].chart == day)
+        #expect(fitted.metrics[0].rangeCharts?.isEmpty == true)
+        #expect(fitted.metrics[0].availableRanges == [.day])
+        #expect((try? fitted.encoded()) != nil)
     }
 
     @Test("Each shown source gets its palette colour, shape, and window medians; the pair is A minus B")
@@ -131,7 +256,7 @@ struct WatchChartTests {
         let snapshot = WatchSnapshotBuilder.make(store: store, now: now)
         let metric = try #require(snapshot.metrics.first { $0.kind == .heartRate })
         let chart = try #require(metric.chart)
-        #expect(metric.comparison.lookback == 6 * 3_600)
+        #expect(metric.comparison.lookback == 86_400)
         #expect(chart.end == now)
         #expect(chart.series.count == 2)
         #expect(Set(chart.series.map(\.id)) == Set(metric.readings.map(\.id)))
@@ -142,7 +267,7 @@ struct WatchChartTests {
         #expect(seriesA.color == WatchColor(red: slot.dark.red, green: slot.dark.green, blue: slot.dark.blue))
         #expect(seriesA.symbol == SourceSymbol.forColorIndex(sourceA.colorIndex).rawValue)
         #expect(seriesA.values.allSatisfy { $0 == 70 })
-        #expect(seriesA.offsets.allSatisfy { $0 >= 0 && $0 % 480 == 0 })
+        #expect(seriesA.offsets.allSatisfy { $0 >= 0 && $0 % 2_880 == 0 })
         #expect(!seriesA.isEstimated)
 
         let pair = try #require(chart.pair)

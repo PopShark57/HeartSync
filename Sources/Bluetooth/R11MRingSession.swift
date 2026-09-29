@@ -121,6 +121,15 @@ struct R11MRingSession: Equatable, Sendable {
             }
         }
 
+        /// Sentence case, for the Measure menu.
+        var menuTitle: String {
+            switch self {
+            case .heartRate:     "Heart rate"
+            case .bloodOxygen:   "Blood oxygen"
+            case .bloodPressure: "Blood pressure (estimate)"
+            }
+        }
+
         var systemImage: String {
             switch self {
             case .heartRate:     "heart.text.square"
@@ -647,15 +656,18 @@ struct R11MRingSession: Equatable, Sendable {
         }
     }
 
+    /// Short enough for the one-line device row: counts first, details only when they
+    /// change what the user should do.
     private static func historyText(_ summary: HistorySummary) -> String {
         var parts = [summary.imported == 0
-            ? "The ring's memory held no new readings HeartSync can import."
-            : "Read \(summary.imported) value\(summary.imported == 1 ? "" : "s") from the ring's memory; already-imported ones are not duplicated."]
+            ? "The ring had no stored readings to import."
+            // Counted before the store drops ones already imported, so "read", not "added".
+            : "Read \(summary.imported) stored value\(summary.imported == 1 ? "" : "s")."]
         if summary.skipped > 0 {
-            parts.append("\(summary.skipped) record\(summary.skipped == 1 ? " was" : "s were") skipped: empty, older than 30 days, in the future, or sharing a timestamp. If many were skipped, open the ring's own app once so it sets the ring's clock.")
+            parts.append("\(summary.skipped) skipped (old, future, or clock not set).")
         }
         if !summary.failed.isEmpty {
-            parts.append("Not read: \(summary.failed.map(\.title).joined(separator: ", ")) (no reply, or the transfer failed its check).")
+            parts.append("Not read: \(summary.failed.map(\.title).joined(separator: ", ")).")
         }
         return parts.joined(separator: " ")
     }

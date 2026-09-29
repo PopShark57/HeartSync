@@ -314,26 +314,38 @@ struct DevicesView: View {
                 ? "Stops reading the ring's memory. Values already read stay saved."
                 : "Asks the ring to stop measuring. Nothing from this measurement is saved.")
         } else if ring.canStartMeasurement {
-            FlowLayout(spacing: 8) {
-                ForEach(R11MRingSession.Measurement.allCases, id: \.self) { measurement in
-                    Button {
-                        model.bluetooth.measure(measurement, sourceID: source.id)
-                    } label: {
-                        Label("Measure \(measurement.title)", systemImage: measurement.systemImage)
-                            .font(.caption.weight(.medium))
+            // One compact line: the three measurements share a menu, so the row stays the
+            // height of a caption instead of wrapping four labelled buttons.
+            HStack(spacing: 20) {
+                Menu {
+                    ForEach(R11MRingSession.Measurement.allCases, id: \.self) { measurement in
+                        Button {
+                            model.bluetooth.measure(measurement, sourceID: source.id)
+                        } label: {
+                            Label(measurement.menuTitle, systemImage: measurement.systemImage)
+                        }
+                        .accessibilityHint(measurementHint(measurement))
                     }
-                    .buttonStyle(.borderless)
-                    .accessibilityHint(measurementHint(measurement))
+                } label: {
+                    Label("Measure", systemImage: "waveform.path.ecg")
+                        .font(.caption.weight(.medium))
+                        .fixedSize()
                 }
+                // Takes the row's borderless button style, so only its label is a tap target.
+                .menuStyle(.button)
+                .accessibilityHint("Choose heart rate, blood oxygen, or blood pressure for one on-demand measurement.")
                 Button {
                     model.bluetooth.importRingHistory(sourceID: source.id)
                 } label: {
-                    Label("Import stored readings", systemImage: "arrow.down.circle")
+                    Label("Import stored", systemImage: "arrow.down.circle")
                         .font(.caption.weight(.medium))
+                        .fixedSize()
                 }
-                .buttonStyle(.borderless)
                 .accessibilityHint("Reads the heart rate, blood oxygen, blood pressure, and temperature the ring recorded on its own. Nothing on the ring is changed or deleted.")
+                Spacer(minLength: 0)
             }
+            .buttonStyle(.borderless)
+            .labelStyle(.titleAndIcon)
         }
     }
 

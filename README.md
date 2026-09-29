@@ -213,8 +213,10 @@ support the Smart Stack. Updates use the last iPhone snapshot and watchOS schedu
 
 The dashboard is a snapshot, not a live stream from iPhone. Older readings stay labelled;
 missing overlap never becomes agreement. It shows up to four sources per metric and compares
-all enabled sources using the iPhone engine over the past six hours for fast metrics and seven
-days for daily metrics. Each metric's detail charts every shown source's window medians in its
+all enabled sources using the iPhone engine. Like iPhone, the watch offers **1H, 24H, 7D, and
+30D** periods (daily metrics use 7D and 30D); the choice is remembered. Longer periods are
+refreshed less often (up to an hour for 30D) and show when they were computed. Each metric's
+detail charts every shown source's window medians in its
 iPhone colour and shape (estimates dashed, gaps left empty) and, once a pair has five paired
 windows, its mean difference and 95% limits with a difference plot. A **Compare** page lists
 every metric with two or more sources. Charts are hidden in Always On. Exports and the full

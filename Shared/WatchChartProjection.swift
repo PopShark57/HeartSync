@@ -71,6 +71,52 @@ enum WatchChartProjection {
         return (low - padding)...(high + padding)
     }
 
+    // MARK: Time axis
+
+    /// Tick spacing per period: two or three labels fit a watch-width plot.
+    static func tickSpacing(for range: WatchChartRange) -> TimeInterval {
+        switch range {
+        case .hour:  20 * 60
+        case .day:   8 * 3_600
+        case .week:  2 * 86_400
+        case .month: 10 * 86_400
+        }
+    }
+
+    /// Ticks on round local times (…:00/:20/:40, midnight/08:00/16:00, local midnights),
+    /// kept away from both ends of the axis so no label is clipped at the edge.
+    static func axisTicks(
+        range: WatchChartRange,
+        start: Date,
+        end: Date,
+        timeZone: TimeZone = .current
+    ) -> [Date] {
+        let spacing = tickSpacing(for: range)
+        let margin = end.timeIntervalSince(start) * 0.08
+        let lower = start.timeIntervalSince1970 + margin
+        let upper = end.timeIntervalSince1970 - margin
+        guard lower < upper else { return [] }
+        let offset = TimeInterval(timeZone.secondsFromGMT(for: Date(timeIntervalSince1970: lower)))
+        var tick = ((lower + offset) / spacing).rounded(.up) * spacing - offset
+        var ticks: [Date] = []
+        while tick <= upper, ticks.count < 6 {
+            ticks.append(Date(timeIntervalSince1970: tick))
+            tick += spacing
+        }
+        return ticks
+    }
+
+    /// Short labels only: a time within a day, a weekday for a week, a numeric date for a
+    /// month. Never a month name and a time together, which cannot fit on the watch.
+    static func axisFormat(for range: WatchChartRange) -> Date.FormatStyle {
+        switch range {
+        case .hour:  .dateTime.hour(.defaultDigits(amPM: .omitted)).minute()
+        case .day:   .dateTime.hour(.defaultDigits(amPM: .abbreviated))
+        case .week:  .dateTime.weekday(.abbreviated)
+        case .month: .dateTime.month(.defaultDigits).day()
+        }
+    }
+
     static func periodText(_ lookback: TimeInterval) -> String {
         if lookback >= 86_400 {
             let days = Int((lookback / 86_400).rounded())

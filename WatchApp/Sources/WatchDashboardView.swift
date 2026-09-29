@@ -97,7 +97,7 @@ private struct WatchMetricRow: View {
                     .opacity(isLuminanceReduced ? 0.6 : 1)
                 }
                 // Always On hides the trend, as the workout screen does.
-                if !isLuminanceReduced, let chart = metric.chart {
+                if !isLuminanceReduced, let chart = metric.chart, !chart.series.isEmpty {
                     WatchTrendChart(kind: metric.kind, chart: chart, lookback: metric.comparison.lookback, compact: true)
                 }
             }
@@ -110,6 +110,7 @@ struct WatchMetricDetailView: View {
     let metric: WatchMetric
     let generatedAt: Date
     @Environment(\.isLuminanceReduced) private var isLuminanceReduced
+    @AppStorage(WatchRangeSelection.storageKey) private var selectedRange: WatchChartRange = .standard
 
     var body: some View {
         List {
@@ -141,21 +142,48 @@ struct WatchMetricDetailView: View {
         .navigationTitle(metric.kind.shortTitle)
     }
 
+    /// Nil from an iPhone build without period choice; the single chart is then shown.
+    private var available: [WatchChartRange]? { metric.availableRanges }
+
+    /// The chosen period, or the nearest one this metric has (a daily metric has no 1H).
+    private var range: WatchChartRange? {
+        available.flatMap { WatchChartRange.resolved(selectedRange, among: $0) }
+    }
+
+    private var chart: WatchChart? {
+        if let range { return metric.periodChart(range) }
+        return available == nil ? metric.chart : nil
+    }
+
+    private var comparison: WatchComparison {
+        range.map(metric.periodComparison) ?? metric.comparison
+    }
+
     private var periodText: String {
-        WatchChartProjection.periodText(metric.comparison.lookback)
+        range?.spokenTitle ?? WatchChartProjection.periodText(metric.comparison.lookback)
     }
 
     @ViewBuilder
     private var trendSection: some View {
         Section {
-            if let chart = metric.chart {
+            if let available, !available.isEmpty {
+                WatchRangePicker(selection: $selectedRange, available: available)
+                    .listRowBackground(Color.clear)
+            }
+            if let chart, !chart.series.isEmpty {
                 if isLuminanceReduced {
                     Text("Trend hidden in Always On.")
                         .font(.caption2).foregroundStyle(.secondary)
                 } else {
-                    WatchTrendChart(kind: metric.kind, chart: chart, lookback: metric.comparison.lookback)
+                    WatchTrendChart(kind: metric.kind, chart: chart, lookback: comparison.lookback)
                     WatchChartLegend(chart: chart)
                 }
+            } else if range != nil {
+                Text("No readings from the shown sources in this period.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if available != nil {
+                Text("Open HeartSync on iPhone to send this period.")
+                    .font(.caption2).foregroundStyle(.secondary)
             } else {
                 Text("Update HeartSync on iPhone to see trends here.")
                     .font(.caption2).foregroundStyle(.secondary)
@@ -170,11 +198,10 @@ struct WatchMetricDetailView: View {
     @ViewBuilder
     private var comparisonSection: some View {
         Section("Comparison at sync") {
-            let comparison = metric.comparison
             WatchVerdictLabel(comparison: comparison)
             Text("\(comparison.readyPairs) ready \u{00B7} \(comparison.incompletePairs) incomplete")
                 .font(.caption)
-            if let chart = metric.chart, let pair = chart.pair {
+            if let chart, let pair = chart.pair {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("\(pair.sourceA) \u{2212} \(pair.sourceB)")
                         .font(.caption.weight(.semibold))
@@ -192,7 +219,9 @@ struct WatchMetricDetailView: View {
                     WatchDifferenceChart(kind: metric.kind, chart: chart, pair: pair)
                 }
             }
-            Text("\(periodText) \u{00B7} sent \(generatedAt.formatted(date: .omitted, time: .shortened))")
+            // Longer periods are refreshed less often than the snapshot, so say when this
+            // period's figures were computed.
+            Text("\(periodText) \u{00B7} through \((chart?.end ?? generatedAt).formatted(date: .omitted, time: .shortened))")
                 .font(.caption)
             Text("At least five paired windows are needed. Estimates are excluded. Agreement does not establish medical accuracy. Full analysis is on iPhone.")
                 .font(.caption).foregroundStyle(.secondary)
