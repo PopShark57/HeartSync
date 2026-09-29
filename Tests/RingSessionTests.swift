@@ -120,7 +120,7 @@ struct R11MRingSessionTests {
         #expect(session.phase == .identifying)
         #expect(actions.first == .write(YCBTFrameCodec.deviceInfoRequest(), purpose: .identify))
         // Identification alone never starts a measurement.
-        #expect(!actions.contains { if case .write(_, .startHeartRate) = $0 { true } else { false } })
+        #expect(!actions.contains { if case .write(_, .start) = $0 { true } else { false } })
     }
 
     @Test("A failed vendor subscription is named and sends nothing")
@@ -157,21 +157,21 @@ struct R11MRingSessionTests {
     func warmupThenCompletion() {
         var session = identifiedSession()
         let start = session.startHeartRate()
-        #expect(start.first == .write(YCBTFrameCodec.measurementRequest(start: true, sensor: .heartRate), purpose: .startHeartRate))
+        #expect(start.first == .write(YCBTFrameCodec.measurementRequest(start: true, sensor: .heartRate), purpose: .start(.heartRate)))
         #expect(session.received(.measurementAck(status: 0), at: .now).isEmpty)
 
         let t0 = Date(timeIntervalSince1970: 1_000)
         #expect(session.received(.liveHeartRate(bpm: 0), at: t0).isEmpty)
-        #expect(session.phase == .measuring(provisionalBPM: nil))
+        #expect(session.phase == .measuring(.heartRate, provisional: nil))
         #expect(session.received(.liveHeartRate(bpm: 46), at: t0.addingTimeInterval(22)).isEmpty)
         #expect(session.received(.liveHeartRate(bpm: 46), at: t0.addingTimeInterval(23)).isEmpty)
         let final = t0.addingTimeInterval(34)
         #expect(session.received(.liveHeartRate(bpm: 81), at: final).isEmpty)
-        #expect(session.phase == .measuring(provisionalBPM: 81))
+        #expect(session.phase == .measuring(.heartRate, provisional: .heartRate(bpm: 81)))
 
         let done = session.received(.measurementFinished(sensor: 0, result: 1), at: t0.addingTimeInterval(35))
-        #expect(done == [.emitHeartRate(bpm: 81, measuredAt: final)])
-        #expect(session.phase == .ready(last: .measured(bpm: 81, measuredAt: final)))
+        #expect(done == [.emit(.heartRate(bpm: 81), measuredAt: final)])
+        #expect(session.phase == .ready(last: .measured(.heartRate(bpm: 81), measuredAt: final)))
     }
 
     @Test("No contact, a rejected request, and a completion without values never emit")
@@ -205,7 +205,7 @@ struct R11MRingSessionTests {
         }
         _ = session.received(.liveHeartRate(bpm: 60), at: .now)
         let stop = session.timeoutElapsed(.acquisition, token: firstToken)
-        #expect(stop == [.write(YCBTFrameCodec.measurementRequest(start: false, sensor: .heartRate), purpose: .stopHeartRate)])
+        #expect(stop == [.write(YCBTFrameCodec.measurementRequest(start: false, sensor: .heartRate), purpose: .stop(.heartRate))])
         #expect(session.phase == .ready(last: .timedOut(livePackets: 1)))
 
         // A second measurement is unaffected by the first one's late timer.
@@ -238,15 +238,19 @@ struct R11MRingSessionTests {
     func writeFailure() {
         var session = identifiedSession()
         _ = session.startHeartRate()
-        _ = session.writeFinished(.startHeartRate, error: "Disconnected")
+        _ = session.writeFinished(.start(.heartRate), error: "Disconnected")
         #expect(session.phase == .ready(last: .writeFailed("Disconnected")))
     }
 
-    @Test("SpO2 frames are recognized but never become readings")
-    func spo2Ignored() {
+    @Test("Frames and completions of another measurement never become readings")
+    func otherMeasurementIgnored() {
         var session = identifiedSession()
         _ = session.startHeartRate()
         #expect(session.received(.liveSpO2(percent: 97), at: .now).isEmpty)
+        #expect(session.received(.liveBloodPressure(systolic: 120, diastolic: 80), at: .now).isEmpty)
+        #expect(session.livePackets == 0)
+        #expect(session.received(.measurementFinished(sensor: 0x02, result: 1), at: .now).isEmpty)
+        #expect(session.isMeasuring)
     }
 }
 

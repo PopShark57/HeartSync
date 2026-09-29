@@ -80,8 +80,16 @@ in the Smart Stack.
   sync time separately from each measurement's time. Fast measurements older than 15 minutes
   are marked older; daily metrics use their existing daily window for that label.
 - The four most recent enabled sources per metric are shown. Comparison uses all enabled
-  sources, the existing engine, and unthinned inputs. Fast metrics use one hour; daily metrics
-  use seven days. Estimates do not contribute evidence. Incomplete pairs prevent an overall
+  sources, the existing engine, and unthinned inputs. Fast metrics use six hours; daily metrics
+  use seven days. Estimates do not contribute evidence.
+- Charts: `WatchSnapshotBuilder` sends each shown source's window medians (windows are whole
+  multiples of the comparison window, about 48 per period), the source's iPhone palette colour
+  and shape, and the Bland–Altman figures of one ready pair (outside tolerance first) with a
+  thinned difference series. The payload stays optional in `WatchMetric.chart`, so either app
+  can be older; charts are dropped before the 60 KB cap would be exceeded. The watch draws
+  them with `WatchTrendChart` and `WatchDifferenceChart` (neutral reference inks, lines broken
+  at gaps, estimates dashed) and hides them in Always On. The Compare page is the second
+  vertical page, between the dashboard and the workout. Incomplete pairs prevent an overall
   green agreement claim. The detail screen explicitly describes the result as **at sync**.
 - Ordinary phone changes coalesce to at most one queued snapshot every 30 seconds while the
   process runs; foreground refresh and connection activation can publish sooner. Delivery

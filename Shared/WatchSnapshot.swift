@@ -56,6 +56,9 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
                       reading.timestamp <= generatedAt.addingTimeInterval(60)
                 else { throw PayloadError.invalid }
             }
+            if let chart = metric.chart {
+                guard chart.isValid(for: metric.kind, generatedAt: generatedAt) else { throw PayloadError.invalid }
+            }
         }
     }
 
@@ -81,6 +84,10 @@ struct WatchMetric: Codable, Equatable, Identifiable, Sendable {
     var readings: [WatchSourceReading]
     var omittedSourceCount: Int
     var comparison: WatchComparison
+    /// Per-source trend and one pair's agreement for the wrist charts. Optional so both
+    /// directions stay compatible: an older iPhone build sends none (the watch says so), and
+    /// an older watch build ignores the key.
+    var chart: WatchChart? = nil
     var id: MetricKind { kind }
 }
 
@@ -98,6 +105,121 @@ struct WatchSourceReading: Codable, Equatable, Identifiable, Sendable {
 
     func isStale(kind: MetricKind, now: Date) -> Bool {
         now > freshnessDeadline(kind: kind)
+    }
+}
+
+/// What the wrist charts draw: each displayed source's window medians over the comparison
+/// period, and the agreement of one ready pair. Times are whole-second offsets from `start`
+/// and values are rounded to a tenth, which keeps ten metrics inside the 60 KB payload.
+///
+/// This is a display projection. Statistics are computed on iPhone from every reading, never
+/// from these thinned points.
+struct WatchChart: Codable, Equatable, Sendable {
+    /// Upper bound accepted from the wire; the iPhone aims for about 48.
+    static let maximumPoints = 64
+    static let maximumDifferencePoints = 48
+
+    var start: Date
+    var end: Date
+    /// Width of one median window, in seconds.
+    var bucket: TimeInterval
+    var series: [WatchChartSeries]
+    /// Nil until some pair has at least five paired windows. Never implies agreement.
+    var pair: WatchPairAgreement?
+
+    var span: TimeInterval { end.timeIntervalSince(start) }
+
+    func isValid(for kind: MetricKind, generatedAt: Date) -> Bool {
+        guard start.timeIntervalSince1970.isFinite, end.timeIntervalSince1970.isFinite,
+              start < end, end <= generatedAt.addingTimeInterval(60),
+              bucket.isFinite, bucket > 0, bucket <= span,
+              series.count <= WatchSnapshot.maximumSourcesPerMetric,
+              Set(series.map(\.id)).count == series.count
+        else { return false }
+        let maximumOffset = Int(span.rounded(.up))
+        for item in series {
+            guard !item.id.isEmpty, item.id.count <= 160,
+                  !item.sourceName.isEmpty, item.sourceName.count <= 100,
+                  (0..<WatchSourceShape.allCases.count).contains(item.symbol),
+                  item.color.isValid,
+                  item.offsets.count == item.values.count,
+                  item.offsets.count <= Self.maximumPoints,
+                  item.offsets.allSatisfy({ (0...maximumOffset).contains($0) }),
+                  item.values.allSatisfy({ $0.isFinite && kind.plausibleRange.contains($0) })
+            else { return false }
+        }
+        if let pair {
+            guard pair.isValid(maximumOffset: maximumOffset) else { return false }
+        }
+        return true
+    }
+}
+
+struct WatchChartSeries: Codable, Equatable, Identifiable, Sendable {
+    /// Matches `WatchSourceReading.id` for the same source.
+    var id: String
+    var sourceName: String
+    /// The source's iPhone palette colour, as drawn on a dark background.
+    var color: WatchColor
+    /// The source's iPhone chart shape (`WatchSourceShape` raw value), so a colour is never
+    /// the only thing telling two sources apart.
+    var symbol: Int
+    /// Estimates are drawn dashed and stay out of the agreement figures.
+    var isEstimated: Bool
+    /// Window starts, in seconds from `WatchChart.start`, ascending.
+    var offsets: [Int]
+    var values: [Double]
+
+    var shape: WatchSourceShape { WatchSourceShape(rawValue: symbol) ?? .circle }
+}
+
+/// The iPhone's six source shapes, in `SourceSymbol` order.
+enum WatchSourceShape: Int, CaseIterable, Sendable {
+    case circle, square, triangle, diamond, pentagon, cross
+}
+
+struct WatchColor: Codable, Equatable, Sendable {
+    var red: Double
+    var green: Double
+    var blue: Double
+
+    var isValid: Bool {
+        [red, green, blue].allSatisfy { $0.isFinite && (0...1).contains($0) }
+    }
+}
+
+/// Bland\u{2013}Altman figures for one pair, A minus B in canonical order, as computed on
+/// iPhone from every paired window in the period.
+struct WatchPairAgreement: Codable, Equatable, Sendable {
+    /// The comparison engine's evidence threshold; a pair below it is never sent.
+    static let minimumPairedWindows = 5
+
+    var sourceA: String
+    var sourceB: String
+    var pairedWindows: Int
+    var meanBias: Double
+    var lowerLimit: Double
+    var upperLimit: Double
+    /// The mean absolute difference is inside the metric's tolerance.
+    var withinTolerance: Bool
+    /// A thinned set of per-window differences for the plot, widest ones always kept.
+    var differenceOffsets: [Int]
+    var differences: [Double]
+
+    func isValid(maximumOffset: Int) -> Bool {
+        guard !sourceA.isEmpty, sourceA.count <= 100,
+              !sourceB.isEmpty, sourceB.count <= 100,
+              pairedWindows >= Self.minimumPairedWindows
+        else { return false }
+        guard meanBias.isFinite, lowerLimit.isFinite, upperLimit.isFinite,
+              lowerLimit <= upperLimit
+        else { return false }
+        guard differenceOffsets.count == differences.count,
+              differences.count <= WatchChart.maximumDifferencePoints,
+              differenceOffsets.allSatisfy({ (0...maximumOffset).contains($0) }),
+              differences.allSatisfy({ $0.isFinite })
+        else { return false }
+        return true
     }
 }
 

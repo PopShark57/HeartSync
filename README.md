@@ -24,10 +24,22 @@ Many inexpensive rings measure only when asked, through a vendor protocol, and a
 Heart Rate subscription alone never produces a value. HeartSync has **candidate** support for
 one such protocol, Yucheng YCBT (found on some rings sold as R11M). It is chosen from the
 ring's GATT topology, never its name. HeartSync sends nothing but a read-only identity query
-until the ring answers it correctly, and then starts a heart-rate measurement only when you
-tap **Measure heart rate**. Only the value the ring reports when it finishes is saved. This
-path has not been verified on hardware; no specific model or firmware is claimed as
-supported. SpO₂ from the vendor protocol is not requested or stored.
+until the ring answers it correctly. After that, and only when you tap them:
+
+- **Measure heart rate**, **Measure blood oxygen**, and **Measure blood pressure** each start
+  one on-demand measurement. Only the value the ring reports when it finishes is saved.
+- **Import stored readings** reads what the ring recorded on its own schedule (the values its
+  vendor app, SmartHealth, shows): heart rate, blood pressure, SpO₂, respiratory rate, and
+  temperature. Reading does not delete anything from the ring. Each transfer must pass its
+  length and CRC check; records older than 30 days, in the future, or sharing a timestamp
+  (a clock that was never set) are skipped. Importing again does not duplicate readings.
+
+Ring blood pressure is a cuffless optical model and ring temperature is a vendor-adjusted
+finger reading, so both are stored as **estimates**: excluded from device agreement by
+default and never written to Apple Health. The vendor's HRV, stress ("pressure"), and sleep
+values are not imported: the public protocol notes do not say whether its HRV is RMSSD or
+SDNN, and HeartSync has no stress or sleep-stage metric. This path has not been verified on
+hardware; no specific model or firmware is claimed as supported.
 
 **Run Bluetooth diagnostics** in a device's menu on the Devices tab inventories every
 service and characteristic, counts packets before parsing, and names why any were rejected.
@@ -201,8 +213,12 @@ support the Smart Stack. Updates use the last iPhone snapshot and watchOS schedu
 
 The dashboard is a snapshot, not a live stream from iPhone. Older readings stay labelled;
 missing overlap never becomes agreement. It shows up to four sources per metric and compares
-all enabled sources using the iPhone engine. Fast metrics use the past hour; daily metrics use
-seven days. Full plots and exports remain on iPhone.
+all enabled sources using the iPhone engine over the past six hours for fast metrics and seven
+days for daily metrics. Each metric's detail charts every shown source's window medians in its
+iPhone colour and shape (estimates dashed, gaps left empty) and, once a pair has five paired
+windows, its mean difference and 95% limits with a difference plot. A **Compare** page lists
+every metric with two or more sources. Charts are hidden in Always On. Exports and the full
+interactive analysis remain on iPhone.
 
 Saved watch readings arrive through HealthKit sync and the existing iPhone import. Connect
 Apple Health in HeartSync on iPhone and refresh after system sync. HeartSync does not create a

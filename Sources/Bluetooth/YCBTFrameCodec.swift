@@ -53,14 +53,21 @@ enum YCBTFrameCodec {
         static let measurementFinished = Opcode(group: 0x04, command: 0x0E)
         /// Live heart rate (`06 01`): one byte, beats per minute.
         static let liveHeartRate = Opcode(group: 0x06, command: 0x01)
-        /// Live blood oxygen (`06 02`): one byte, percent. Recognized but not ingested; see
-        /// `R11MRingSession`.
+        /// Live blood oxygen (`06 02`): one byte, percent.
         static let liveSpO2 = Opcode(group: 0x06, command: 0x02)
+        /// Live blood pressure (`06 03`): systolic, then diastolic, one byte each, then fields
+        /// HeartSync does not read.
+        static let liveBloodPressure = Opcode(group: 0x06, command: 0x03)
+        /// End of one history transfer (`05 80`). See `YCBTHistory`.
+        static let historyBlockEnd = Opcode(group: YCBTHistory.group, command: YCBTHistory.blockEndCommand)
     }
 
-    /// The measurement sensors the start/stop command addresses.
-    enum Sensor: UInt8, Sendable {
+    /// The measurement sensors the start/stop command addresses. Both public references agree
+    /// on these three codes; others they list (temperature, HRV, stress) are not requested.
+    enum Sensor: UInt8, CaseIterable, Sendable {
         case heartRate = 0x00
+        case bloodPressure = 0x01
+        case bloodOxygen = 0x02
     }
 
     // MARK: Encoding
@@ -111,8 +118,9 @@ enum YCBTFrameCodec {
 
     // MARK: Messages
 
-    /// What a decoded frame means. Only `.liveHeartRate` can ever become a reading, and only
-    /// after `R11MRingSession` sees the ring declare the measurement complete.
+    /// What a decoded frame means. A live value becomes a reading only after
+    /// `R11MRingSession` sees the ring declare that measurement complete, and history records
+    /// only after their transfer's length and CRC check out.
     enum Message: Equatable, Sendable {
         case deviceInfo(payloadLength: Int)
         /// A reply to start/stop. `status == 0` is acceptance.
@@ -122,6 +130,13 @@ enum YCBTFrameCodec {
         /// only so diagnostics can count it.
         case liveHeartRate(bpm: Int)
         case liveSpO2(percent: Int)
+        /// Zero in either field is a placeholder, never a pressure.
+        case liveBloodPressure(systolic: Int, diastolic: Int)
+        /// The ring's reply to a history request. `announcedBytes` is nil when it holds none.
+        case historyHeader(YCBTHistory.Kind, announcedBytes: Int?)
+        /// Record bytes of one history type, to be concatenated before decoding.
+        case historyData(YCBTHistory.Kind, payload: [UInt8])
+        case historyBlockEnd(YCBTHistory.BlockEnd)
         /// A CRC-valid frame HeartSync does not interpret (battery, status, history\u{2026}).
         case other(Opcode)
         /// A CRC-valid frame whose payload is too short for its opcode.
@@ -145,7 +160,20 @@ enum YCBTFrameCodec {
         case .liveSpO2:
             guard let percent = payload.first else { return .truncated(frame.opcode) }
             return .liveSpO2(percent: Int(percent))
+        case .liveBloodPressure:
+            guard payload.count >= 2 else { return .truncated(frame.opcode) }
+            return .liveBloodPressure(systolic: Int(payload[0]), diastolic: Int(payload[1]))
+        case .historyBlockEnd:
+            guard let end = YCBTHistory.blockEnd(from: payload) else { return .truncated(frame.opcode) }
+            return .historyBlockEnd(end)
         default:
+            guard frame.group == YCBTHistory.group else { return .other(frame.opcode) }
+            if let kind = YCBTHistory.Kind(queryCommand: frame.command) {
+                return .historyHeader(kind, announcedBytes: YCBTHistory.announcedBytes(inHeader: payload))
+            }
+            if let kind = YCBTHistory.Kind(dataCommand: frame.command) {
+                return .historyData(kind, payload: payload)
+            }
             return .other(frame.opcode)
         }
     }

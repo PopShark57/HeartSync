@@ -18,6 +18,20 @@ nothing here connected to a ring, so the completion criterion in section 8 is no
 | 3. Readiness | `BluetoothDiscoveryState`, `PeripheralConnectionState.resolving`, `StreamCadence` | Done. Heart rate counts as one metric; HRV appears only from real R–R intervals. Vendor channels make a link ready without adding metrics. Observed metrics survive late callbacks. The watchdog follows cadence (30 s to 10 min) and says whether it saw silence, rejected packets, or a stopped stream. A ring's spot reading ages normally; no watchdog runs for it. |
 | 4. Reconnect | `BluetoothManager.reconnect`, `beginFreshSession` | Done. A connected link is cancelled, and one new connection starts from its disconnect callback, bypassing the backoff (10 s fallback if the callback never comes). Pause, forget, and radio-off cancel it. Delayed work checks a per-link session number. A foreground refresh no longer rediscovers a live link. |
 
+### Follow-up (2026-09-29): more vitals from the same ring
+
+At the owner's request, the session now also measures blood oxygen (`03 2F 01 02`, live
+`06 02`) and blood pressure (`03 2F 01 01`, live `06 03`) on demand, with the same completion
+rule as heart rate, and imports the ring's stored history (`YCBTHistory`: heart rate `05 06`,
+blood pressure `05 08`, combined `05 09`, SpO₂ `05 1A`, temperature `05 1E`). Both public
+references agree on the sensor codes and on the heart, blood-pressure, and combined record
+layouts. HeartSync's history request encodes to exactly the captured `05 06 06 00 83 20`. The
+references disagree on the ring clock's zone (UTC where their own app set it, local wall time
+in the vendor SDK); HeartSync reads local time because SmartHealth sets the clock, and skips
+records outside the last 30 days, in the future, or with a repeated timestamp. Blood pressure
+and temperature are stored as estimates. Vendor HRV, stress, and sleep are not imported. All
+of this remains unverified on hardware; see `RELEASE_CHECKLIST.md`.
+
 Where the framing came from: the frame layout (`group | command | length LE | payload | CRC
 LE`, CRC-16/CCITT-FALSE, total length including header and CRC) and the `04 0E` completion
 event are from independent public write-ups of R11M-reporting and YCBT rings

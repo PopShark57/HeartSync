@@ -154,6 +154,9 @@ final class BluetoothManager: NSObject {
 
     private weak var store: HealthStore?
     private var onReading: (@MainActor (Reading) -> Void)?
+    /// One transaction for a batch, used by a ring history import. Falls back to
+    /// `onReading` per value when not configured.
+    private var onReadings: (@MainActor ([Reading]) -> Void)?
 
     /// Device Information Service strings, accumulated as the individual characteristics
     /// arrive. They are read separately and in no guaranteed order, so the display string
@@ -177,9 +180,14 @@ final class BluetoothManager: NSObject {
 
     // MARK: Setup
 
-    func configure(store: HealthStore, onReading: @escaping @MainActor (Reading) -> Void) {
+    func configure(
+        store: HealthStore,
+        onReading: @escaping @MainActor (Reading) -> Void,
+        onReadings: (@MainActor ([Reading]) -> Void)? = nil
+    ) {
         self.store = store
         self.onReading = onReading
+        self.onReadings = onReadings
         guard central == nil else { return }
         central = CBCentralManager(
             delegate: self,
@@ -801,14 +809,27 @@ final class BluetoothManager: NSObject {
         return ringSessions[uuid]
     }
 
-    /// Starts one on-demand heart-rate measurement on an identified ring.
-    func measureHeartRate(sourceID: String) {
+    /// Starts one on-demand measurement on an identified ring.
+    func measure(_ measurement: R11MRingSession.Measurement, sourceID: String) {
+        updateRingSession(sourceID: sourceID) { $0.start(measurement) }
+    }
+
+    /// Reads the values the ring stored on its own schedule. Read-only; nothing on the ring
+    /// is changed or deleted.
+    func importRingHistory(sourceID: String) {
+        updateRingSession(sourceID: sourceID) { $0.importHistory() }
+    }
+
+    private func updateRingSession(
+        sourceID: String,
+        _ change: (inout R11MRingSession) -> [R11MRingSession.Action]
+    ) {
         guard let uuid = UUID(uuidString: sourceID),
               let peripheral = peripherals[uuid],
               peripheral.state == .connected,
               var session = ringSessions[uuid]
         else { return }
-        let actions = session.startHeartRate()
+        let actions = change(&session)
         ringSessions[uuid] = session
         performRingActions(actions, on: peripheral)
         applyDiscoveryResolution(for: uuid)
@@ -820,10 +841,11 @@ final class BluetoothManager: NSObject {
         applyDiscoveryResolution(for: uuid)
     }
 
-    /// Sends the stop command for a running measurement, when the link can still carry it.
+    /// Sends the stop command for a running measurement, or abandons a running history
+    /// import, when the link can still carry it.
     private func stopRingMeasurement(on peripheral: CBPeripheral) {
         let id = peripheral.identifier
-        guard var session = ringSessions[id], session.isMeasuring else { return }
+        guard var session = ringSessions[id], session.isBusy else { return }
         let actions = session.cancel()
         ringSessions[id] = session
         guard peripheral.state == .connected else { return }
@@ -852,8 +874,8 @@ final class BluetoothManager: NSObject {
                 guard var session = ringSessions[id] else { return }
                 let message = YCBTFrameCodec.message(for: frame)
                 switch message {
-                case .liveHeartRate where session.isMeasuring:
-                    diagnostics[id]?.reject(.provisional)
+                case .liveHeartRate, .liveSpO2, .liveBloodPressure:
+                    if session.isMeasuring { diagnostics[id]?.reject(.provisional) }
                 case .truncated:
                     diagnostics[id]?.reject(.malformed)
                 case .deviceInfo(let length):
@@ -907,21 +929,54 @@ final class BluetoothManager: NSObject {
                     self.applyDiscoveryResolution(for: id)
                 }
 
-            case .emitHeartRate(let bpm, let measuredAt):
+            case .emit(let value, let measuredAt):
                 // The same Bluetooth source, the same `emit` → `AppModel.ingest` →
                 // `HealthStore` path, and the same plausibility and admission rules as a
-                // standard heart-rate frame.
-                if emit(
-                    sourceID: id.uuidString,
-                    kind: .heartRate,
-                    value: Double(bpm),
-                    start: measuredAt,
-                    provenance: .measured,
-                    receivedAt: .now
-                ) {
-                    note(metric: .heartRate, for: id, at: measuredAt)
+                // standard frame. Blood pressure is two readings with one timestamp.
+                for metric in value.metrics {
+                    let accepted = emit(
+                        sourceID: id.uuidString,
+                        kind: metric.kind,
+                        value: metric.value,
+                        start: measuredAt,
+                        provenance: R11MRingSession.provenance(for: metric.kind),
+                        receivedAt: .now
+                    )
+                    if accepted { note(metric: metric.kind, for: id, at: measuredAt) }
                 }
+
+            case .emitHistory(let samples):
+                emitRingHistory(samples, from: id)
             }
+        }
+    }
+
+    /// Stores records from the ring's memory. They bypass the live-stream admission rule on
+    /// purpose: that rule bounds a notification burst by receipt time, and an import is one
+    /// user-started, CRC-checked batch whose values carry the ring's own timestamps. Stable
+    /// IDs make a repeated import a no-op, and `HealthStore` still validates every value.
+    private func emitRingHistory(_ samples: [YCBTHistory.Sample], from id: UUID) {
+        let sourceID = id.uuidString
+        let readings = samples.compactMap { sample -> Reading? in
+            guard sample.kind.plausibleRange.contains(sample.value) else {
+                diagnostics[id]?.reject(.outOfRange)
+                return nil
+            }
+            return Reading(
+                id: YCBTHistory.readingID(sourceID: sourceID, sample: sample),
+                sourceID: sourceID,
+                kind: sample.kind,
+                value: sample.value,
+                start: sample.recordedAt,
+                provenance: sample.provenance
+            )
+        }
+        guard !readings.isEmpty else { return }
+        diagnostics[id]?.adapterNote = "Forwarded \(readings.count) stored value\(readings.count == 1 ? "" : "s") from the ring's memory."
+        if let onReadings {
+            onReadings(readings)
+        } else {
+            readings.forEach { onReading?($0) }
         }
     }
 
