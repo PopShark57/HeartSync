@@ -70,6 +70,21 @@ final class HeartSyncCheckerUITests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    /// Presses a sparse chart until a window is selected.
+    ///
+    /// Daily points sit about one selection radius apart, and where they fall across the
+    /// plot moves with the time of day the test runs, so one fixed offset can land just
+    /// outside every point's reach. A press there correctly selects nothing; trying a few
+    /// offsets tests the selection rather than the clock.
+    private func pressUntilSelected(_ chart: XCUIElement, in application: XCUIApplication) -> Bool {
+        let clear = element("metric.clearSelection", in: application)
+        for offset in [0.6, 0.55, 0.65, 0.5, 0.7] {
+            chart.coordinate(withNormalizedOffset: CGVector(dx: offset, dy: 0.5)).press(forDuration: 1)
+            if clear.waitForExistence(timeout: 4) { return true }
+        }
+        return false
+    }
+
     private func waitForDisappearance(of candidate: XCUIElement, timeout: TimeInterval = 5) -> Bool {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == false"),
@@ -438,7 +453,9 @@ final class HeartSyncCheckerUITests: XCTestCase {
         XCTAssertTrue(clear.waitForExistence(timeout: 5), "A scrub keeps its selection after the finger lifts")
         attachScreenshot("Heart rate, selected window", of: application)
         clear.tap()
-        XCTAssertTrue(waitForDisappearance(of: clear))
+        // A dense chart makes each accessibility query slow on a CI simulator (several seconds
+        // each), so allow more than the default for the button to leave the tree.
+        XCTAssertTrue(waitForDisappearance(of: clear, timeout: 15))
 
         range.buttons["30D"].tap()
         XCTAssertTrue(chart.waitForExistence(timeout: 10))
@@ -488,8 +505,7 @@ final class HeartSyncCheckerUITests: XCTestCase {
         XCTAssertTrue(vo2.waitForExistence(timeout: 10))
         vo2.tap()
         let sparseChart = revealChart("metric.chart", in: application)
-        sparseChart.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5)).press(forDuration: 1)
-        XCTAssertTrue(element("metric.clearSelection", in: application).waitForExistence(timeout: 5))
+        XCTAssertTrue(pressUntilSelected(sparseChart, in: application))
         attachScreenshot("VO2 max, selected daily window", of: application)
     }
 
