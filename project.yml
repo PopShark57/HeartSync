@@ -121,6 +121,7 @@ targets:
     sources:
       - path: WatchApp/Sources
       - path: Shared
+      - path: Sources/Views/ChartLookup.swift
       - path: Sources/Model/MetricKind.swift
       - path: Sources/Model/DiscrepancySeverity.swift
       - path: Sources/Model/Provenance.swift

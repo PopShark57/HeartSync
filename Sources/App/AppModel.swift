@@ -89,6 +89,16 @@ final class AppModel {
         /// Cancels and awaits a running Oura sync, then removes its cache and readings.
         /// Reports whether the cache and credential changes were saved.
         var clearOura: @MainActor (_ keepingAuthorization: Bool) async -> Bool = { _ in true }
+        /// Whether the iPhone's Bluetooth radio is on, so a wrist sync can say why nothing
+        /// reconnected.
+        var isBluetoothPoweredOn: @MainActor () -> Bool = { false }
+        /// Starts Import stored on every connected, identified, idle ring, as the Devices
+        /// tab's button does for one, and returns how many started.
+        var importRingHistories: @MainActor () -> Int = { 0 }
+        /// How the Health sync that ended at or after `since` went, for a wrist sync.
+        var healthKitSyncOutcome: @MainActor (_ since: Date) -> WatchSyncReport.Outcome = { _ in .synced }
+        /// How the Oura cycle that ended at or after `since` went, for a wrist sync.
+        var ouraSyncOutcome: @MainActor (_ since: Date) -> WatchSyncReport.Outcome = { _ in .synced }
 
         static func live(
             bluetooth: BluetoothManager,
@@ -129,7 +139,21 @@ final class AppModel {
                 },
                 beginHealthKitReset: { await healthKit.beginDataReset() },
                 finishHealthKitReset: { await healthKit.finishDataReset(rereadingHistory: $0) },
-                clearOura: { await oura.clearCachedData(keepingAuthorization: $0) }
+                clearOura: { await oura.clearCachedData(keepingAuthorization: $0) },
+                isBluetoothPoweredOn: { bluetooth.isPoweredOn },
+                importRingHistories: { bluetooth.importStoredReadingsFromReadyRings() },
+                healthKitSyncOutcome: { since in
+                    WatchSyncOutcomes.healthKit(healthKit.syncSummary, since: since)
+                },
+                ouraSyncOutcome: { since in
+                    WatchSyncOutcomes.oura(
+                        committedAt: oura.lastSyncedAt,
+                        issueCount: oura.endpointIssues.count,
+                        rateLimitedUntil: oura.rateLimitedUntil,
+                        since: since,
+                        now: .now
+                    )
+                }
             )
         }
 
@@ -166,6 +190,8 @@ final class AppModel {
     private var derivedTask: Task<Void, Never>?
     private var maintenanceTask: Task<Void, Never>?
     private var ouraTimerTask: Task<Void, Never>?
+    /// When the last wrist sync-all started, which bounds how often one can run.
+    private var lastWatchSyncAll: Date?
     private var hasStarted = false
     /// True while `resetLocalData` runs; a second reset is refused.
     private(set) var isResettingData = false
@@ -265,16 +291,22 @@ final class AppModel {
         }
         #endif
 
-        watchCompanion.start(store: store) { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.watchCompanion.publishNow()
-                // Watch messages may arrive while protected history is still loading.
-                guard self.startupState == .ready else { return }
-                await self.refreshForWatch()
-                self.watchCompanion.publishNow()
+        watchCompanion.start(
+            store: store,
+            onRefresh: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.watchCompanion.publishNow()
+                    // Watch messages may arrive while protected history is still loading.
+                    guard self.startupState == .ready else { return }
+                    await self.refreshForWatch()
+                    self.watchCompanion.publishNow()
+                }
+            },
+            onSyncAll: { [weak self] in
+                await self?.syncAllFromWatch() ?? .unavailable()
             }
-        }
+        )
         await settings.loadIfNeeded()
         await sessions.loadIfNeeded()
         await store.loadIfNeeded()
@@ -399,6 +431,91 @@ final class AppModel {
         if transports.isHealthKitAuthorized() {
             await transports.syncHealthKit()
         }
+    }
+
+    /// A wrist "Sync all sources" request: what the Devices tab's buttons do one by one.
+    ///
+    /// Reconnects known Bluetooth devices (a healthy link is left alone), starts Import
+    /// stored on every identified, idle ring, re-reads Apple Health, and runs a full Oura
+    /// sync as a pull-to-refresh does, then recomputes estimates and republishes. It is the
+    /// user's own request, unlike `refreshForWatch`, so it asks every transport; runs are at
+    /// least `WatchSyncReport.minimumInterval` apart so repeated taps cannot repeat Oura's
+    /// request cycle.
+    ///
+    /// Returns when everything has finished or when `deadline` passes, whichever is first;
+    /// work still running then carries on and reaches the watch in a later snapshot.
+    func syncAllFromWatch(deadline: TimeInterval = WatchSyncReport.replyDeadline) async -> WatchSyncReport {
+        #if DEBUG
+        guard !Self.debugDataIsolationEnabled else { return .unavailable() }
+        #endif
+        // A request can wake the app and arrive while history is still loading.
+        for _ in 0..<50 where hasStarted && startupState == .loading {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard hasStarted, startupState == .ready, store.loadState == .loaded else { return .unavailable() }
+        let started = Date.now
+        if let lastWatchSyncAll, started.timeIntervalSince(lastWatchSyncAll) < WatchSyncReport.minimumInterval {
+            return .tooSoon(at: started)
+        }
+        lastWatchSyncAll = started
+
+        let progress = WatchSyncProgress(WatchSyncReport(
+            status: .stillRunning,
+            finishedAt: started,
+            health: .running,
+            oura: .running
+        ))
+        let work = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await BackgroundWork.perform(named: "HeartSync watch sync") {
+                await self.runSyncAll(since: started, progress: progress)
+            }
+        }
+        // Whichever ends first answers; the sync itself carries on past the deadline.
+        var timer: Task<Void, Never>?
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let answer = ResumeOnce(continuation)
+            Task { @MainActor in
+                await work.value
+                answer.resume()
+            }
+            timer = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(deadline))
+                answer.resume()
+            }
+        }
+        timer?.cancel()
+        var report = progress.report
+        report.finishedAt = .now
+        if report.health != .running, report.oura != .running, progress.isFinished {
+            report.status = .completed
+        }
+        return report
+    }
+
+    private func runSyncAll(since started: Date, progress: WatchSyncProgress) async {
+        let enabledBluetooth = store.sources.count { $0.transport == .bluetooth && $0.isEnabled }
+        progress.report.bluetoothDevices = min(enabledBluetooth, 64)
+        progress.report.bluetoothPoweredOn = transports.isBluetoothPoweredOn()
+        transports.reconnectBluetooth()
+        progress.report.ringImports = min(transports.importRingHistories(), progress.report.bluetoothDevices)
+
+        let healthAuthorized = transports.isHealthKitAuthorized()
+        let ouraAuthorized = transports.hasOuraAuthorization()
+        progress.report.health = healthAuthorized ? .running : .notConnected
+        progress.report.oura = ouraAuthorized ? .running : .notConnected
+        if healthAuthorized {
+            await transports.syncHealthKit()
+            progress.report.health = transports.healthKitSyncOutcome(started)
+        }
+        applyRetentionSettings()
+        if ouraAuthorized {
+            await transports.syncOura(true, 0)
+            progress.report.oura = transports.ouraSyncOutcome(started)
+        }
+        progress.isFinished = true
+        await recomputeDerivedMetrics()
+        watchCompanion.publishNow()
     }
 
     /// The least time between unattended Oura syncs: the scheduled interval, never under the

@@ -53,6 +53,15 @@ struct WatchDashboardView: View {
 
             Section {
                 Button {
+                    connection.requestSyncAll()
+                } label: {
+                    Label(connection.isSyncingAll ? "Syncing…" : "Sync all sources", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .watchGlassButton()
+                .listRowBackground(Color.clear)
+                .disabled(connection.isSyncingAll || !connection.isReachable)
+                .accessibilityHint("Asks iPhone to sync Apple Health and Oura, reconnect Bluetooth devices, and import readings stored on rings")
+                Button {
                     connection.requestRefresh()
                 } label: {
                     Label(connection.isRequesting ? "Requesting…" : "Refresh iPhone data", systemImage: "arrow.clockwise")
@@ -60,12 +69,51 @@ struct WatchDashboardView: View {
                 .watchGlassButton()
                 .listRowBackground(Color.clear)
                 .disabled(connection.isRequesting || !connection.isReachable)
+                .accessibilityHint("Sends the readings iPhone already has, after a quick Apple Health check")
                 Text(connection.status).font(.caption).foregroundStyle(.secondary)
                     .listRowBackground(Color.clear)
+                if let report = connection.lastSyncReport {
+                    WatchSyncReportView(report: report)
+                        .listRowBackground(Color.clear)
+                }
             }
         }
         .navigationTitle("HeartSync")
         .containerBackground(WatchTheme.backdrop, for: .navigation)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    connection.requestSyncAll()
+                } label: {
+                    if connection.isSyncingAll {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                }
+                .disabled(connection.isSyncingAll || !connection.isReachable)
+                .accessibilityLabel(connection.isSyncingAll ? "Syncing all sources" : "Sync all sources")
+                .accessibilityHint("Asks iPhone to sync Apple Health and Oura, reconnect Bluetooth devices, and import readings stored on rings")
+            }
+        }
+    }
+}
+
+/// What the iPhone reported for the last sync-all, one line per source, with the time it
+/// answered. The readings themselves arrive in the next snapshot.
+private struct WatchSyncReportView: View {
+    let report: WatchSyncReport
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(report.lines, id: \.self) { line in
+                Text(line)
+            }
+            Text("Last sync request \(report.finishedAt, style: .relative) ago")
+                .foregroundStyle(.secondary)
+        }
+        .font(.caption2)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -195,7 +243,7 @@ struct WatchMetricDetailView: View {
         } header: {
             Text(periodText)
         } footer: {
-            Text("Window medians. Gaps are missing data. Dashed lines are estimates.")
+            Text("Window medians. Tap or touch and hold the chart to see a window's values. Gaps are missing data. Dashed lines are estimates.")
         }
     }
 

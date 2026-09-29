@@ -39,8 +39,10 @@ struct WatchTrendChart: View {
     let kind: MetricKind
     let chart: WatchChart
     let lookback: TimeInterval
-    /// A row sparkline: no axes, no legend, a fixed small height.
+    /// A row sparkline: no axes, no legend, a fixed small height, and no selection.
     var compact = false
+    /// The middle of the selected window. Kept when the finger lifts.
+    @State private var selectedDate: Date?
 
     private struct Plotted: Identifiable {
         var series: WatchChartSeries
@@ -58,6 +60,8 @@ struct WatchTrendChart: View {
     }
 
     var body: some View {
+        let windows = compact ? [] : WatchChartProjection.windows(in: chart)
+        let selected = selectedDate.flatMap { date in windows.first { $0.date == date } }
         Chart {
             ForEach(plotted) { entry in
                 let item = entry.series
@@ -84,6 +88,28 @@ struct WatchTrendChart: View {
                     }
                 }
             }
+            if let selected {
+                // A neutral rule, never a device's hue, with the window's values above it.
+                RuleMark(x: .value("Selected", selected.date))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+                    .annotation(
+                        position: .top,
+                        spacing: 2,
+                        overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))
+                    ) {
+                        WatchWindowCallout(kind: kind, window: selected, range: chart.range)
+                    }
+                ForEach(selected.entries, id: \.seriesID) { entry in
+                    PointMark(
+                        x: .value("Time", selected.date),
+                        y: .value(kind.shortTitle, entry.value)
+                    )
+                    .symbol(entry.shape.chartSymbol)
+                    .symbolSize(70)
+                    .foregroundStyle(entry.color.color)
+                }
+            }
         }
         .chartXScale(domain: chart.start...chart.end)
         .chartYScale(domain: WatchChartProjection.valueDomain(kind: kind, chart: chart))
@@ -101,10 +127,108 @@ struct WatchTrendChart: View {
         .chartXAxis(compact ? .hidden : .visible)
         .chartYAxis(compact ? .hidden : .visible)
         .chartLegend(.hidden)
+        .modifier(WatchChartSelection(
+            isEnabled: !compact,
+            dates: windows.map(\.date),
+            domain: chart.start...chart.end,
+            selection: $selectedDate
+        ))
         .frame(height: compact ? 30 : 110)
         .privacySensitive()
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(WatchChartProjection.spokenSummary(kind: kind, chart: chart, lookback: lookback))
+        .accessibilityValue(selected.map { WatchChartProjection.selectionSummary(kind: kind, window: $0, range: chart.range) } ?? "")
+        .modifier(WatchChartSelectionAccessibility(isEnabled: !compact, dates: windows.map(\.date), selection: $selectedDate))
+        // A new period or snapshot draws different windows.
+        .onChange(of: chart.start) { selectedDate = nil }
+    }
+}
+
+/// The small popup for a selected window: when it was, and each source's median there.
+private struct WatchWindowCallout: View {
+    let kind: MetricKind
+    let window: WatchChartProjection.Window
+    let range: WatchChartRange?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(WatchChartProjection.windowText(start: window.start, end: window.end, range: range))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            ForEach(window.entries, id: \.seriesID) { entry in
+                HStack(spacing: 3) {
+                    Image(systemName: entry.shape.systemImage)
+                        .font(.system(size: 7))
+                        .foregroundStyle(entry.color.color)
+                    Text(kind.formatWithUnit(entry.value))
+                        .fontWeight(.semibold)
+                        .monospacedDigit()
+                    if entry.isEstimated {
+                        Text("est.").foregroundStyle(.orange)
+                    }
+                    Text(entry.sourceName)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .font(.system(size: 11))
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
+        .background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+    }
+}
+
+/// Tap a chart, or touch and hold and then slide, to pick the nearest plotted window. The
+/// selection stays when the finger lifts; a touch farther than the selection radius from
+/// every window clears it. Holding first lets a plain swipe still scroll the list.
+private struct WatchChartSelection: ViewModifier {
+    let isEnabled: Bool
+    /// Ascending.
+    let dates: [Date]
+    let domain: ClosedRange<Date>
+    @Binding var selection: Date?
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content
+                .chartOverlay { proxy in
+                    GeometryReader { geometry in
+                        Rectangle()
+                            .fill(.clear)
+                            .contentShape(Rectangle())
+                            .gesture(
+                                LongPressGesture(minimumDuration: 0.25)
+                                    .sequenced(before: DragGesture(minimumDistance: 0))
+                                    .onChanged { value in
+                                        guard case .second(true, let drag?) = value else { return }
+                                        select(at: drag.location, proxy: proxy, geometry: geometry)
+                                    }
+                            )
+                            .simultaneousGesture(
+                                SpatialTapGesture().onEnded { value in
+                                    select(at: value.location, proxy: proxy, geometry: geometry)
+                                }
+                            )
+                    }
+                }
+                .sensoryFeedback(.selection, trigger: selection)
+        } else {
+            content
+        }
+    }
+
+    private func select(at location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
+        guard let anchor = proxy.plotFrame else { return }
+        let frame = geometry[anchor]
+        guard let date: Date = proxy.value(atX: location.x - frame.minX) else { return }
+        let tolerance = ChartLookup.timeTolerance(
+            points: ChartLookup.selectionRadius,
+            plotWidth: frame.width,
+            domain: domain
+        )
+        selection = WatchChartProjection.nearestDate(to: date, in: dates, within: tolerance)
     }
 }
 
@@ -137,9 +261,11 @@ struct WatchDifferenceChart: View {
     let kind: MetricKind
     let chart: WatchChart
     let pair: WatchPairAgreement
+    @State private var selectedDate: Date?
 
     var body: some View {
         let points = WatchChartProjection.differencePoints(for: pair, in: chart, window: kind.comparisonWindow)
+        let selected = selectedDate.flatMap { date in points.first { $0.date == date } }
         Chart {
             RuleMark(y: .value("Zero", 0.0))
                 .foregroundStyle(.gray.opacity(0.6))
@@ -161,14 +287,57 @@ struct WatchDifferenceChart: View {
                 .symbolSize(14)
                 .foregroundStyle(.white)
             }
+            if let selected {
+                PointMark(
+                    x: .value("Time", selected.date),
+                    y: .value("Difference", selected.difference)
+                )
+                .symbolSize(60)
+                .foregroundStyle(.white)
+                .annotation(
+                    position: .top,
+                    spacing: 2,
+                    overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))
+                ) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(windowText(selected))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text(WatchChartProjection.signed(selected.difference, kind: kind))
+                            .fontWeight(.semibold)
+                            .monospacedDigit()
+                    }
+                    .font(.system(size: 11))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 3)
+                    .background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+                }
+            }
         }
         .chartXScale(domain: chart.start...chart.end)
         .chartYScale(domain: WatchChartProjection.differenceDomain(pair: pair))
         .chartXAxis(.hidden)
+        .modifier(WatchChartSelection(
+            isEnabled: true,
+            dates: points.map(\.date),
+            domain: chart.start...chart.end,
+            selection: $selectedDate
+        ))
         .frame(height: 80)
         .privacySensitive()
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(WatchChartProjection.pairSummary(kind: kind, pair: pair))
+        .accessibilityValue(selected.map {
+            WatchChartProjection.differenceSummary(kind: kind, pair: pair, point: $0, window: kind.comparisonWindow, range: chart.range)
+        } ?? "")
+        .modifier(WatchChartSelectionAccessibility(isEnabled: true, dates: points.map(\.date), selection: $selectedDate))
+        .onChange(of: chart.start) { selectedDate = nil }
+    }
+
+    private func windowText(_ point: WatchChartProjection.DifferencePoint) -> String {
+        let start = point.date.addingTimeInterval(-kind.comparisonWindow / 2)
+        return WatchChartProjection.windowText(start: start, end: start.addingTimeInterval(kind.comparisonWindow), range: chart.range)
     }
 }
 
@@ -325,3 +494,32 @@ private struct WatchCompareRow: View {
         .accessibilityElement(children: .combine)
     }
 }
+
+/// The selection without a gesture: VoiceOver's adjustable action steps through the
+/// windows, and a named action clears it. Applied to the chart's combined element.
+private struct WatchChartSelectionAccessibility: ViewModifier {
+    let isEnabled: Bool
+    /// Ascending.
+    let dates: [Date]
+    @Binding var selection: Date?
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content
+                .accessibilityAdjustableAction { direction in
+                    switch direction {
+                    case .increment:
+                        selection = WatchChartProjection.steppedDate(from: selection, in: dates, forward: true)
+                    case .decrement:
+                        selection = WatchChartProjection.steppedDate(from: selection, in: dates, forward: false)
+                    @unknown default:
+                        break
+                    }
+                }
+                .accessibilityAction(named: Text("Clear selection")) { selection = nil }
+        } else {
+            content
+        }
+    }
+}
+

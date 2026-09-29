@@ -92,12 +92,18 @@ in the Smart Stack.
   are dropped, longest period first, before the 60 KB cap would be exceeded. The x axis uses
   two or three round local times (or weekdays, or numeric dates) inside the plot edges. The watch draws
   them with `WatchTrendChart` and `WatchDifferenceChart` (neutral reference inks, lines broken
-  at gaps, estimates dashed) and hides them in Always On. The Compare page is the second
+  at gaps, estimates dashed) and hides them in Always On. A tap, or a touch-and-hold then
+  slide, selects the nearest window and shows its time and each source's median in a popup;
+  it stays until a touch in empty plot area. VoiceOver steps windows with swipe up and down. The Compare page is the second
   vertical page, after the dashboard. Incomplete pairs prevent an overall
   green agreement claim. The detail screen explicitly describes the result as **at sync**.
 - Ordinary phone changes coalesce to at most one queued snapshot every 30 seconds while the
   process runs; foreground refresh and connection activation can publish sooner. Delivery
   timing is controlled by watchOS/iOS. Offline refresh explains how to reconnect.
+- **Sync all sources** sends a reachable message the iPhone answers within 25 seconds with
+  what happened to Health, Oura, Bluetooth, and ring imports; anything still running
+  continues on iPhone and its readings arrive with a later snapshot. Requests less than a
+  minute apart start nothing.
 - Renames, disabled/removed sources, deletions, and local resets invalidate the projection.
   An empty context clears old watch rows when delivered. A disconnected watch can retain its
   previous snapshot until that update arrives. Newer contexts supersede late older ones;
@@ -133,7 +139,10 @@ runtime results must be reported separately.
 
 Before release, use a signed paired iPhone/watch to check:
 
-1. First launch, empty data, offline cached data, reachable refresh, source rename/hide/remove,
+1. First launch, empty data, offline cached data, reachable refresh, Sync all sources with the
+   iPhone locked, in the background, and in the foreground (Health, Oura, and a connected
+   ring's import), chart tap and touch-and-hold selection while the list still scrolls,
+   source rename/hide/remove,
    and reset propagation. Confirm dashboard changes also arrive while the watch app is closed.
 2. Small and large watch layouts, Dynamic Type, VoiceOver, metric details, and stale values.
    `--watch-demo` in a Debug build supplies deterministic dashboard data without connectivity.
