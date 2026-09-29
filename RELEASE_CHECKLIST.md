@@ -66,6 +66,14 @@ Record the ring's model, firmware, and the diagnostic report with each result.
   after Cancel, and after Reconnect.
 - [ ] Standard `2A37` notifications from the same ring are not stored while the vendor
   session owns heart rate (diagnostics count them as superseded).
+- [ ] Measure blood oxygen and Measure blood pressure: each shows provisional values and then
+  stores exactly one completed value (blood pressure as a systolic/diastolic pair labelled
+  Estimated). Compare with SmartHealth's figures taken at the same time.
+- [ ] Import stored readings with SmartHealth closed: every type either imports or is named
+  as not read. Values and times match SmartHealth's history (this checks the ring clock is
+  read in local time; record the phone's time zone). SmartHealth still shows its history
+  afterwards. A second import adds nothing. With the ring's clock never set, records are
+  skipped, not imported at a wrong time.
 - [ ] A chest strap and a standard pulse oximeter still work unchanged.
 
 ## Apple Health

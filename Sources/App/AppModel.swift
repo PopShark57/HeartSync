@@ -121,9 +121,16 @@ final class AppModel {
         HealthKitManager.removePersistedSelfSource(from: store)
         applyRetentionSettings()
 
-        bluetooth.configure(store: store) { [weak self] reading in
-            self?.ingest([reading])
-        }
+        bluetooth.configure(
+            store: store,
+            onReading: { [weak self] reading in
+                self?.ingest([reading])
+            },
+            // A ring history import commits as one idempotent batch.
+            onReadings: { [weak self] readings in
+                self?.ingest(readings)
+            }
+        )
         healthKit.configure(
             store: store,
             onReadings: { [weak self] readings, sources, deletedIDs in

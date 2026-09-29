@@ -2,6 +2,7 @@ import SwiftUI
 
 struct WatchDashboardView: View {
     let connection: CompanionSession
+    var openCompare: () -> Void
     var openWorkout: () -> Void
 
     var body: some View {
@@ -10,6 +11,10 @@ struct WatchDashboardView: View {
                 Label("Workout", systemImage: "figure.run")
             }
             .accessibilityHint("Open live heart-rate workout controls")
+            Button(action: openCompare) {
+                Label("Compare devices", systemImage: "square.split.2x1")
+            }
+            .accessibilityHint("Open comparison charts for metrics reported by two or more sources")
 
             if let snapshot = connection.snapshot {
                 Section {
@@ -91,6 +96,10 @@ private struct WatchMetricRow: View {
                     .font(.caption2)
                     .opacity(isLuminanceReduced ? 0.6 : 1)
                 }
+                // Always On hides the trend, as the workout screen does.
+                if !isLuminanceReduced, let chart = metric.chart {
+                    WatchTrendChart(kind: metric.kind, chart: chart, lookback: metric.comparison.lookback, compact: true)
+                }
             }
             .accessibilityElement(children: .combine)
         }
@@ -100,13 +109,17 @@ private struct WatchMetricRow: View {
 struct WatchMetricDetailView: View {
     let metric: WatchMetric
     let generatedAt: Date
+    @Environment(\.isLuminanceReduced) private var isLuminanceReduced
 
     var body: some View {
         List {
+            trendSection
+            comparisonSection
             ForEach(metric.readings) { reading in
                 Section(reading.sourceName) {
                     Text(metric.kind.formatWithUnit(reading.value))
                         .font(.title2.bold()).monospacedDigit()
+                        .privacySensitive()
                     Label(reading.provenance.title, systemImage: reading.provenance.systemImage)
                         .font(.caption)
                     Text(reading.timestamp, format: .dateTime.month().day().hour().minute())
@@ -124,29 +137,66 @@ struct WatchMetricDetailView: View {
                 Text("\(metric.omittedSourceCount) more sources on iPhone. Comparison includes all enabled sources.")
                     .font(.caption)
             }
-            Section("Comparison at sync") {
-                let comparison = metric.comparison
-                if comparison.outsideTolerancePairs > 0 {
-                    Label("\(comparison.outsideTolerancePairs) pairs outside tolerance", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                } else if comparison.allPairsAgree {
-                    Label("Within tolerance", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                } else {
-                    Label("Insufficient evidence", systemImage: "hourglass")
-                        .foregroundStyle(.secondary)
-                }
-                Text("\(comparison.readyPairs) ready · \(comparison.incompletePairs) incomplete")
-                    .font(.caption)
-                Text(comparison.lookback >= 86_400 ? "Past 7 days" : "Past hour")
-                    .font(.caption)
-                Text(generatedAt, format: .dateTime.month().day().hour().minute())
-                    .font(.caption)
-                Text("At least five paired windows are needed. Estimates are excluded. Agreement does not establish medical accuracy. Full analysis is on iPhone.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
         }
         .navigationTitle(metric.kind.shortTitle)
+    }
+
+    private var periodText: String {
+        WatchChartProjection.periodText(metric.comparison.lookback)
+    }
+
+    @ViewBuilder
+    private var trendSection: some View {
+        Section {
+            if let chart = metric.chart {
+                if isLuminanceReduced {
+                    Text("Trend hidden in Always On.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else {
+                    WatchTrendChart(kind: metric.kind, chart: chart, lookback: metric.comparison.lookback)
+                    WatchChartLegend(chart: chart)
+                }
+            } else {
+                Text("Update HeartSync on iPhone to see trends here.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        } header: {
+            Text(periodText)
+        } footer: {
+            Text("Window medians. Gaps are missing data. Dashed lines are estimates.")
+        }
+    }
+
+    @ViewBuilder
+    private var comparisonSection: some View {
+        Section("Comparison at sync") {
+            let comparison = metric.comparison
+            WatchVerdictLabel(comparison: comparison)
+            Text("\(comparison.readyPairs) ready \u{00B7} \(comparison.incompletePairs) incomplete")
+                .font(.caption)
+            if let chart = metric.chart, let pair = chart.pair {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(pair.sourceA) \u{2212} \(pair.sourceB)")
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(2)
+                    Text("Mean difference \(WatchChartProjection.signed(pair.meanBias, kind: metric.kind))")
+                    Text("95% between \(WatchChartProjection.signed(pair.lowerLimit, kind: metric.kind)) and \(WatchChartProjection.signed(pair.upperLimit, kind: metric.kind))")
+                    Text(pair.withinTolerance ? "Mean gap inside tolerance" : "Mean gap outside tolerance")
+                        .foregroundStyle(pair.withinTolerance ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
+                    Text("\(pair.pairedWindows) paired windows")
+                }
+                .font(.caption2).monospacedDigit()
+                .privacySensitive()
+                .accessibilityElement(children: .combine)
+                if !isLuminanceReduced {
+                    WatchDifferenceChart(kind: metric.kind, chart: chart, pair: pair)
+                }
+            }
+            Text("\(periodText) \u{00B7} sent \(generatedAt.formatted(date: .omitted, time: .shortened))")
+                .font(.caption)
+            Text("At least five paired windows are needed. Estimates are excluded. Agreement does not establish medical accuracy. Full analysis is on iPhone.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 }
 

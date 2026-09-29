@@ -293,32 +293,58 @@ struct DevicesView: View {
         } header: {
             Text("Bluetooth sensors")
         } footer: {
-            Text("Works with devices using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles, such as most chest straps and standards-compliant pulse oximeters. Some rings only measure on request through a vendor protocol. HeartSync has candidate support for one such protocol (YCBT) and offers Measure heart rate once the ring has identified itself. Use Run Bluetooth diagnostics from a device's menu to see what it sends.")
+            Text("Works with devices using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles, such as most chest straps and standards-compliant pulse oximeters. Some rings only measure on request through a vendor protocol. HeartSync has candidate support for one such protocol (YCBT): once the ring has identified itself, it offers heart-rate, blood-oxygen, and blood-pressure measurements, and can import the readings the ring stored on its own. Ring blood pressure and temperature are saved as estimates. Use Run Bluetooth diagnostics from a device's menu to see what it sends.")
         }
     }
 
-    /// On-demand measurement for a ring whose vendor protocol was identified. The ring does
-    /// not measure continuously, so nothing starts without this explicit action.
+    /// On-demand measurement and history import for a ring whose vendor protocol was
+    /// identified. The ring does not measure continuously, so nothing starts without one of
+    /// these explicit actions.
     @ViewBuilder
     private func ringControls(_ ring: R11MRingSession, source: DataSource) -> some View {
-        if ring.isMeasuring {
+        if ring.isBusy {
             Button {
                 model.bluetooth.cancelRingMeasurement(sourceID: source.id)
             } label: {
-                Label("Cancel measurement", systemImage: "stop.circle")
+                Label(ring.isImportingHistory ? "Stop reading ring memory" : "Cancel measurement", systemImage: "stop.circle")
                     .font(.caption.weight(.medium))
             }
             .buttonStyle(.borderless)
-            .accessibilityHint("Asks the ring to stop measuring. Nothing from this measurement is saved.")
+            .accessibilityHint(ring.isImportingHistory
+                ? "Stops reading the ring's memory. Values already read stay saved."
+                : "Asks the ring to stop measuring. Nothing from this measurement is saved.")
         } else if ring.canStartMeasurement {
-            Button {
-                model.bluetooth.measureHeartRate(sourceID: source.id)
-            } label: {
-                Label("Measure heart rate", systemImage: "heart.text.square")
-                    .font(.caption.weight(.medium))
+            FlowLayout(spacing: 8) {
+                ForEach(R11MRingSession.Measurement.allCases, id: \.self) { measurement in
+                    Button {
+                        model.bluetooth.measure(measurement, sourceID: source.id)
+                    } label: {
+                        Label("Measure \(measurement.title)", systemImage: measurement.systemImage)
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityHint(measurementHint(measurement))
+                }
+                Button {
+                    model.bluetooth.importRingHistory(sourceID: source.id)
+                } label: {
+                    Label("Import stored readings", systemImage: "arrow.down.circle")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.borderless)
+                .accessibilityHint("Reads the heart rate, blood oxygen, blood pressure, and temperature the ring recorded on its own. Nothing on the ring is changed or deleted.")
             }
-            .buttonStyle(.borderless)
-            .accessibilityHint("Asks the ring for one heart-rate measurement. Keep the ring on your finger and still for about a minute.")
+        }
+    }
+
+    private func measurementHint(_ measurement: R11MRingSession.Measurement) -> String {
+        switch measurement {
+        case .heartRate:
+            "Asks the ring for one heart-rate measurement. Keep the ring on your finger and still for about a minute."
+        case .bloodOxygen:
+            "Asks the ring for one blood-oxygen measurement. Keep your hand still for about a minute."
+        case .bloodPressure:
+            "Asks the ring for one blood-pressure value. A ring's value is a modelled estimate, not a cuff measurement."
         }
     }
 

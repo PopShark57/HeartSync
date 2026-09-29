@@ -180,10 +180,12 @@ Readiness and diagnostics (`RingFix.md`):
 Vendor ring candidate (`R11MRingSession`, `YCBTFrameCodec`):
 
 - It is selected only from GATT topology: the YCBT service with a writable, subscribable command characteristic and a subscribable event characteristic. Never select it from the advertised name.
-- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query. A measurement starts only after a CRC-valid identity reply, and only from the user's Measure heart rate action.
-- Live values are provisional. Only the ring's completion event emits a reading (the last live value, through `emit`). Zero, no-contact, rejection, and timeout store nothing. SpO₂ is recognized but not requested or stored.
+- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query. A measurement or history import starts only after a CRC-valid identity reply, and only from the user's Measure heart rate / blood oxygen / blood pressure or Import stored readings action.
+- Live values are provisional. Only the ring's completion event for the running sensor emits a reading (the last live value, through `emit`). Zero, no-contact, rejection, timeout, and another sensor's frames store nothing.
+- `YCBTHistory` reads stored heart-rate, blood-pressure, combined, SpO₂, and temperature records (`05` group). A type is decoded only when its concatenated bytes match the terminal block's length and CRC; the app then acknowledges (`05 80 00`, or `04` on failure). Nothing is ever deleted from the ring. Timestamps are the ring's local wall clock since 2000; records older than 30 days, in the future, or with a repeated timestamp are skipped. History IDs are `UUID(stableFrom:)` of source, metric, and timestamp, and a batch goes through `onReadings`, bypassing receipt-time admission only because it is one user-started, checked import.
+- Ring blood pressure and temperature are `.estimated` (`R11MRingSession.provenance(for:)`); heart rate, SpO₂, and respiratory rate are measured, as other vendor values are. The vendor HRV byte is not imported (RMSSD versus SDNN is undocumented); stress and sleep have no metric.
 - While the session owns heart rate, the same ring's `2A37` frames are counted as superseded, not ingested.
-- The framing is from public reverse-engineering and is unverified on hardware. Do not add commands (history, clock, settings, keepalive) without captured evidence and tests. Do not describe the path as verified.
+- The framing is from public reverse-engineering and is unverified on hardware. Do not add commands (clock, settings, delete, keepalive, periodic-monitoring schedules) without captured evidence and tests. Do not describe the path as verified.
 
 The restoration identifier is `com.heartsync.central`. `UIBackgroundModes = bluetooth-central` enables CoreBluetooth background/restoration behavior; it is not a generic background-execution entitlement.
 
@@ -218,7 +220,12 @@ snapshot from the paired iPhone and always labels measurement time separately fr
 
 - `WatchSnapshotBuilder` uses `HealthStore` indexed queries and `ComparisonEngine`. Only the
   four most recent sources per metric are displayed, but comparisons include every enabled
-  source. Comparison spans are one hour for fast metrics and seven days for daily metrics.
+  source. Comparison and chart spans are six hours for fast metrics and seven days for daily
+  metrics. `WatchMetric.chart` is optional (either app may be older) and carries each shown
+  source's window medians, its iPhone palette colour and shape, and one ready pair's
+  Bland–Altman figures; a pair below five paired windows is never sent. `fitted` drops charts
+  rather than exceed the 60 KB cap. Watch charts break at gaps, dash estimates, use neutral
+  reference inks, and are hidden in Always On. The watch never recomputes statistics.
 - `WatchCompanionPublisher` observes source changes, reading generations, and load state;
   it coalesces ordinary publications to at most once every 30 seconds while iOS is running.
   Foreground refresh and WatchConnectivity activation can publish immediately. This is not
@@ -558,6 +565,13 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   bounded Now read, which shows the same values and verdicts as the two-day read.
 - `Tests/ChartGapTests.swift`: 12 tests covering shared gap segmentation for the band,
   the pairwise timeline, and Oura heart rate, including isolated points and thinning.
+- `Tests/RingVitalsTests.swift`: 15 tests covering blood-oxygen and blood-pressure
+  measurement, sensor codes, the history request against a published capture, history
+  transfer (acknowledgement, empty types, bad CRC, silence, cancel, overflow), record
+  decoding, clock guards, local wall-clock conversion, estimate provenance, and stable IDs.
+- `Tests/Watch/WatchChartTests.swift`: 12 tests covering chart payload compatibility and
+  validation, periods and windows, palette colours and shapes, pair choice and threshold,
+  estimate marking, oversized-chart fallback, gap segmentation, domains, and spoken text.
 - `Tests/RingSessionTests.swift`: 25 tests covering the YCBT codec (CRC check value,
   framing, reassembly, bad CRC and length), topology selection, subscription gating,
   identification, warm-up and completion, no contact, rejection, timeouts, cancel and repeat,
@@ -595,7 +609,7 @@ and copy or symlink the real source files into it — `Sources/Store`, `Sources/
 `Oura/OuraMovementClass`, `Oura/OuraDailyTrend`), `Shared`, plus
 `Sources/Bluetooth/GATT.swift` for `BodySensorLocation` (which needs a `CBUUID` shim, and
 `R11MRingSession`), the Foundation-only Bluetooth files (`BluetoothDiagnostics`,
-`BluetoothDiscoveryState`, `YCBTFrameCodec`, `R11MRingSession`, `Measurements`,
+`BluetoothDiscoveryState`, `YCBTFrameCodec`, `YCBTHistory`, `R11MRingSession`, `Measurements`,
 `BinaryReader`, `BluetoothIngestionPolicy`), and `Sources/Debug`'s `DebugChartGallery`. The Oura timeline and trend
 projections also need the Foundation-only DTOs in `Sources/Oura/OuraClient.swift`. That closure builds for macOS and runs the store, analysis,
 export, presentation-projection and watch-lifecycle suites. It cannot compile the SwiftUI

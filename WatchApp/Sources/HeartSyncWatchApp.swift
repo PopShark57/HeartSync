@@ -3,11 +3,16 @@ import WatchKit
 import WidgetKit
 import OSLog
 
+/// The vertical pages, in order.
+enum WatchPage: Int {
+    case dashboard, compare, workout
+}
+
 @main
 struct HeartSyncWatchApp: App {
     @WKApplicationDelegateAdaptor(WatchAppDelegate.self) private var delegate
     private var connection: CompanionSession { delegate.connection }
-    @State private var selectedPage = 0
+    @State private var selectedPage = WatchPage.dashboard
     @State private var metricPath: [MetricKind] = []
     @Environment(\.scenePhase) private var scenePhase
 
@@ -15,7 +20,11 @@ struct HeartSyncWatchApp: App {
         WindowGroup {
             TabView(selection: $selectedPage) {
                 NavigationStack(path: $metricPath) {
-                    WatchDashboardView(connection: connection) { selectedPage = 1 }
+                    WatchDashboardView(
+                        connection: connection,
+                        openCompare: { selectedPage = .compare },
+                        openWorkout: { selectedPage = .workout }
+                    )
                         .navigationDestination(for: MetricKind.self) { kind in
                             if let snapshot = connection.snapshot,
                                let metric = snapshot.metrics.first(where: { $0.kind == kind }) {
@@ -26,11 +35,15 @@ struct HeartSyncWatchApp: App {
                             }
                         }
                 }
-                .tag(0)
+                .tag(WatchPage.dashboard)
+                NavigationStack {
+                    WatchCompareView(connection: connection)
+                }
+                .tag(WatchPage.compare)
                 NavigationStack {
                     WatchWorkoutView(workout: delegate.workout)
                 }
-                .tag(1)
+                .tag(WatchPage.workout)
             }
             .tabViewStyle(.verticalPage)
             .tint(.pink)
@@ -38,10 +51,10 @@ struct HeartSyncWatchApp: App {
                 guard let destination = WatchComplicationLink(url: url) else { return }
                 switch destination {
                 case .metric(let kind):
-                    selectedPage = 0
+                    selectedPage = .dashboard
                     metricPath = [kind]
                 case .workout:
-                    selectedPage = 1
+                    selectedPage = .workout
                 }
             }
             .task {
@@ -54,7 +67,7 @@ struct HeartSyncWatchApp: App {
                 connection.start()
             }
             .onChange(of: delegate.workout.phase) { _, phase in
-                if phase == .starting || phase == .running { selectedPage = 1 }
+                if phase == .starting || phase == .running { selectedPage = .workout }
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { connection.resume() }
