@@ -236,10 +236,15 @@ snapshot from the paired iPhone and always labels measurement time separately fr
   colour and the shape `MetricDetailSnapshot.symbols(for:)` gives it, and one ready pair's
   Bland–Altman figures; a pair below five paired windows is never sent. `WatchChartCache`
   (owned by the publisher) reuses 24H for 2 min, 7D for 15 min, and 30D for 60 min, and drops
-  an entry at once when shown or enabled sources change or `HealthStore.removalGeneration`
-  advances (deletions, source removal, retention, reset, reload; not estimate
-  reconciliation). `fitted` drops 30D, then 7D, then 1H, then 24H charts rather than exceed
-  the 60 KB cap. Watch charts label the x axis with round local times inside the plot edges
+  an entry at once when shown or enabled sources change or a removal reaches it: one that
+  removed a row ending at or after the period's current start (`HealthStore.recentRemovals`,
+  `HealthHistory.latestRemovedEnd`). Deletions inside the period, source removal, a shortened
+  retention, reset, and reload qualify; routine pruning of rows older than 30 days and
+  estimate reconciliation do not. The fingerprint and shapes use sources sorted by stable ID.
+  Periods that need building come from one read of the longest of them, sliced by midpoint.
+  `fittedPayload` drops 30D, then 7D, then 1H, then 24H charts rather than exceed the 60 KB
+  cap, and returns the encoding it ended on; the publisher hands those bytes to
+  `CompanionSession.publish(encoded:)`, so a snapshot is encoded once, off the main actor. Watch charts label the x axis with round local times inside the plot edges
   (`WatchChartProjection.axisTicks`/`axisFormat`), break at gaps, dash estimates, use neutral
   reference inks, and are hidden in Always On. The watch never recomputes statistics.
 - `WatchCompanionPublisher` observes source changes, reading generations, and load state;
@@ -340,7 +345,7 @@ The Oura snapshot is schema-versioned and token-free. Its `schemaVersion` is rec
 
 OAuth credentials are encoded as one Keychain generic-password value using `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. No Keychain access group is configured, so the item is not shared and does not migrate through iCloud. The Oura client ID is deliberately public configuration in `@AppStorage`; never put the bearer token there.
 
-HealthKit query anchors use `UserDefaults` keys prefixed with `hk.anchor.`. Pairwise exports and per-source removal exports use per-export temporary directories and remove them after the share sheet is dismissed.
+HealthKit query anchors use `UserDefaults` keys prefixed with `hk.anchor.`. Pairwise exports and per-source removal exports use per-export temporary directories (`ExportDirectory`, `HeartSync-Export-*` and `HeartSync-Pairwise-*`) and remove them after the share sheet is dismissed; launch sweeps any created before it, which a crash or kill while sharing left behind. Reading exports run off the main actor (`ReadingsExportJob`, `ReadingsExportPayload.prepare`, `HealthHistory.writeExportCSV`) on one pooled read connection, in keyset pages on `(end, rowid)` inside one read transaction, with progress and a Cancel that deletes the partial file. Never page an export with `OFFSET`.
 
 The version-1 whole-file reading/source archives are migration inputs only. Do not reintroduce a parallel reading persistence path beside SQLite. Compaction bounds old high-frequency history but still sacrifices individual samples, the full within-window distribution, and later corrections; preserve its explicit aggregation metadata and unknown legacy evidence.
 
@@ -593,11 +598,16 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   measurement, sensor codes, the history request against a published capture, history
   transfer (acknowledgement, empty types, bad CRC, silence, cancel, overflow), record
   decoding, clock guards, local wall-clock conversion, estimate provenance, and stable IDs.
-- `Tests/Watch/WatchChartTests.swift`: 18 tests covering chart payload compatibility and
+- `Tests/Watch/WatchChartTests.swift`: 23 tests covering chart payload compatibility and
   validation, the 1H/24H/7D/30D periods and their windows, per-period evidence, empty periods,
-  the long-period cache and its invalidation, palette colours and shared-slot shapes, pair
-  choice and threshold, estimate marking, the size drop order, axis ticks, gap segmentation,
-  domains, and spoken text.
+  the long-period cache and its invalidation (only by removals that reach a period, routine
+  pruning kept, the bounded removal record), one read sliced into every period, palette
+  colours and shared-slot shapes, pair choice and threshold, estimate marking, the size drop
+  order and its single encode, axis ticks, gap segmentation, domains, and spoken text.
+- `Tests/ExportStreamingTests.swift`: 8 tests covering keyset export pages (rows sharing an
+  end, one source), one snapshot across a mid-export deletion, the off-main writer against
+  the whole-string export, progress, Cancel and empty exports leaving no file, a not-loaded
+  store, the export job, the launch sweep, and pairwise files written together.
 - `Tests/RingSessionTests.swift`: 25 tests covering the YCBT codec (CRC check value,
   framing, reassembly, bad CRC and length), topology selection, subscription gating,
   identification, warm-up and completion, no contact, rejection, timeouts, cancel and repeat,
@@ -637,7 +647,7 @@ and copy or symlink the real source files into it — `Sources/Store`, `Sources/
 `Sources/Views/ComparisonEmptyReason.swift`, the other Foundation-only view projections
 (`DashboardSnapshot`, `PairwiseSnapshot`, `ChartSegmentation`, `LiveReloadPolicy`,
 `SourceRemovalConsequence`, `WindowLabel`, `ChartLookup`, `ChartViewport`,
-`MetricChartProjection`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
+`MetricChartProjection`, `ReadingsExportJob`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
 `Oura/OuraMovementClass`, `Oura/OuraDailyTrend`), `Shared`, plus
 `Sources/Bluetooth/GATT.swift` for `BodySensorLocation` (CoreBluetooth exists on macOS, so it needs no shim, and
 `R11MRingSession`), the Foundation-only Bluetooth files (`BluetoothDiagnostics`,

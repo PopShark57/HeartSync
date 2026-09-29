@@ -90,6 +90,21 @@ final class HealthStore {
     /// cache of a slow projection (the watch's 7- and 30-day charts) can survive ordinary
     /// appends yet never show deleted data. Estimate reconciliation does not advance it.
     private(set) var removalGeneration = 0
+    /// One record per advance of `removalGeneration`, newest last, so a cached period can ask
+    /// whether any removal since it was built reached it (`HealthHistory.latestRemovedEnd`).
+    /// Routine retention pruning removes only rows older than the longest watch period, so
+    /// it no longer discards every cached period. Bounded; a cache older than the oldest
+    /// record is treated as reached.
+    private(set) var recentRemovals: [RemovalRecord] = []
+    static let removalRecordLimit = 64
+
+    /// One removal: the generation it advanced to and how recent the rows it removed were.
+    struct RemovalRecord: Equatable, Sendable {
+        var generation: Int
+        /// No removed row ended later than this. `.distantFuture` for a removal with no
+        /// bound: a source, every reading, a reload.
+        var latestEnd: Date
+    }
     private var unavailableBuffer: [Reading] = []
     private var bufferedIDs: Set<UUID> = []
 
@@ -175,6 +190,7 @@ final class HealthStore {
             sources: sources,
             changeToken: dataGeneration,
             removalGeneration: removalGeneration,
+            recentRemovals: recentRemovals,
             loadState: loadState,
             readers: readers,
             pending: persistenceEnabled && loadState != .loaded ? unavailableBuffer : [],
@@ -301,8 +317,22 @@ final class HealthStore {
         unavailableBuffer.removeAll { $0.sourceID == sourceID }
         bufferedIDs = Set(unavailableBuffer.map(\.id))
         dataGeneration &+= 1
-        removalGeneration &+= 1
+        noteRemoval(latestEnd: .distantFuture)
         return .applied
+    }
+
+    /// Advances `removalGeneration` for a delete that removed anything.
+    private func noteRemoval(_ rows: HealthDatabase.DeletedRows) {
+        guard rows.count > 0 else { return }
+        noteRemoval(latestEnd: rows.latestEnd ?? .distantFuture)
+    }
+
+    private func noteRemoval(latestEnd: Date) {
+        removalGeneration &+= 1
+        recentRemovals.append(RemovalRecord(generation: removalGeneration, latestEnd: latestEnd))
+        if recentRemovals.count > Self.removalRecordLimit {
+            recentRemovals.removeFirst(recentRemovals.count - Self.removalRecordLimit)
+        }
     }
 
     /// Compatibility spelling: true only when something was removed.
@@ -319,7 +349,7 @@ final class HealthStore {
             let removed = try database?.removeReadings(sourceID: sourceID) ?? 0
             if removed > 0 {
                 dataGeneration &+= 1
-                removalGeneration &+= 1
+                noteRemoval(latestEnd: .distantFuture)
             }
             return removed
         } catch {
@@ -504,8 +534,8 @@ final class HealthStore {
                     removingReadingIDs: removingReadingIDs
                 )
                 rewindCompactionIfNeeded(for: changed)
-                dataGeneration &+= (!changed.isEmpty || sourcesChanged || removed > 0) ? 1 : 0
-                removalGeneration &+= removed > 0 ? 1 : 0
+                dataGeneration &+= (!changed.isEmpty || sourcesChanged || removed.count > 0) ? 1 : 0
+                noteRemoval(removed)
                 return BatchCommitResult(acceptedReadings: changed, committed: true)
             } catch {
                 sources = sourcesBeforeCommit
@@ -529,10 +559,10 @@ final class HealthStore {
             return before - unavailableBuffer.count
         }
         do {
-            let removed = try database?.removeReadingIDs(ids) ?? 0
-            dataGeneration &+= removed > 0 ? 1 : 0
-            removalGeneration &+= removed > 0 ? 1 : 0
-            return removed
+            let removed = try database?.removeReadingIDs(ids) ?? HealthDatabase.DeletedRows()
+            dataGeneration &+= removed.count > 0 ? 1 : 0
+            noteRemoval(removed)
+            return removed.count
         } catch {
             record(error)
             return 0
@@ -647,28 +677,6 @@ final class HealthStore {
             return unavailableBuffer.filter { range.contains($0.midpoint) }
         }
         return readingsOutcome(in: range, enabledOnly: enabledOnly).valueOrEmpty
-    }
-
-    func readingsPage(
-        kind: MetricKind? = nil,
-        in range: DateInterval? = nil,
-        limit: Int = 1_000,
-        offset: Int = 0
-    ) -> [Reading] {
-        readingsPageOutcome(kind: kind, in: range, limit: limit, offset: offset).valueOrEmpty
-    }
-
-    func readingsPageOutcome(
-        kind: MetricKind? = nil,
-        in range: DateInterval? = nil,
-        sourceID: String? = nil,
-        limit: Int = 1_000,
-        offset: Int = 0
-    ) -> HealthStoreQueryOutcome<[Reading]> {
-        _ = dataGeneration
-        return query {
-            try $0.readings(kind: kind, range: range, sourceID: sourceID, limit: limit, offset: offset)
-        }
     }
 
     /// What removing one source would delete, stated before anything is deleted.
@@ -841,8 +849,8 @@ final class HealthStore {
                 changedSources: clamped,
                 includingInvalidRows: includingInvalidRows
             )
-            dataGeneration &+= removed > 0 ? 1 : 0
-            removalGeneration &+= removed > 0 ? 1 : 0
+            dataGeneration &+= removed.count > 0 ? 1 : 0
+            noteRemoval(removed)
             return true
         } catch {
             sources = originalSources
@@ -1012,7 +1020,7 @@ final class HealthStore {
             lastPersistenceError = nil
             compactionCursor = nil
             dataGeneration &+= 1
-            removalGeneration &+= 1
+            noteRemoval(latestEnd: .distantFuture)
             // Aged history waits for `confirmRetention`; only impossible rows go now.
             prune(includingInvalidRows: true)
             logger.info("Loaded \(self.readingCount) readings across \(self.sources.count) sources")
@@ -1073,7 +1081,7 @@ final class HealthStore {
         do {
             try database?.deleteAllReadings(sources: sources)
             dataGeneration &+= 1
-            removalGeneration &+= 1
+            noteRemoval(latestEnd: .distantFuture)
             return true
         } catch {
             sources = originalSources
@@ -1091,7 +1099,7 @@ final class HealthStore {
     /// empty field meaning *unknown* rather than zero. `unit` and the transport/model
     /// columns come from the export-stable spellings so the bytes do not change with the
     /// device language.
-    static let exportColumns = [
+    nonisolated static let exportColumns = [
         "id",
         "source_id",
         "source_name",
@@ -1133,73 +1141,36 @@ final class HealthStore {
         return Self.exportCSV(readings: rows, sources: sources)
     }
 
-    /// Streams the whole-history export into `url` a page at a time.
+    /// Streams the whole-history export into `url` a page at a time, on the calling thread.
     ///
     /// Pages rather than materializing the archive plus one complete CSV string in memory:
-    /// a month of 1 Hz strap data is millions of rows, and the previous whole-string export
-    /// was built during view rendering. Rows are read in the database's total
-    /// `ORDER BY end, rowid`, so successive pages do not overlap or skip.
-    ///
-    /// If any page fails the partial file is deleted and the error is rethrown. A truncated
-    /// CSV is indistinguishable from a complete one once it has been shared, so a partial
-    /// export must not survive.
+    /// a month of 1 Hz strap data is millions of rows. The screens run the same writer off
+    /// the main actor through `ReadingsExportPayload.prepare`; this main-actor spelling is
+    /// for tests and the device workload. See `HealthHistory.writeExportCSV` for paging,
+    /// consistency, cancellation, and the partial-file rule.
     ///
     /// - Parameter sourceID: limits the file to one source's rows, for the export offered
     ///   before that source is removed. Nil exports the whole history.
-    /// - Parameter shouldContinue: consulted between pages; returning false cancels the
-    ///   export and removes the partial file.
     /// - Returns: the number of data rows written.
     @discardableResult
     func writeExportCSV(
         to url: URL,
         sourceID: String? = nil,
         pageSize: Int = 5_000,
-        shouldContinue: (Int) -> Bool = { _ in true }
+        progress: ExportProgress? = nil
     ) throws -> Int {
         guard loadState == .loaded || !persistenceEnabled else { throw HealthStoreQueryError.notLoaded }
-
-        let manager = FileManager.default
-        if manager.fileExists(atPath: url.path) { try manager.removeItem(at: url) }
-        guard manager.createFile(atPath: url.path, contents: nil) else {
-            throw HealthStoreQueryError.queryFailed("Could not create the export file.")
-        }
-        let handle = try FileHandle(forWritingTo: url)
-        var written = 0
-
-        func abort() { try? handle.close(); try? manager.removeItem(at: url) }
-
-        do {
-            try handle.write(contentsOf: Data((Self.exportColumns.joined(separator: ",") + "\r\n").utf8))
-            var offset = 0
-            while true {
-                guard shouldContinue(written) else {
-                    abort()
-                    throw CancellationError()
-                }
-                let page = try readingsPageOutcome(sourceID: sourceID, limit: pageSize, offset: offset).get()
-                if page.isEmpty { break }
-                let chunk = Self.exportRows(readings: page, sources: sources)
-                try handle.write(contentsOf: Data(chunk.utf8))
-                written += page.count
-                offset += page.count
-                if page.count < pageSize { break }
-            }
-            try handle.close()
-            return written
-        } catch {
-            abort()
-            throw error
-        }
+        return try history.writeExportCSV(to: url, sourceID: sourceID, pageSize: pageSize, progress: progress)
     }
 
     /// Pure projection so the schema is testable without a database.
-    static func exportCSV(readings: [Reading], sources: [DataSource]) -> String {
+    nonisolated static func exportCSV(readings: [Reading], sources: [DataSource]) -> String {
         exportColumns.joined(separator: ",") + "\r\n" + exportRows(readings: readings, sources: sources)
     }
 
     /// Data rows only, each terminated by CRLF, so the paged writer and the whole-string
     /// projection cannot drift into two different schemas.
-    static func exportRows(readings: [Reading], sources: [DataSource]) -> String {
+    nonisolated static func exportRows(readings: [Reading], sources: [DataSource]) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         let byID = Dictionary(sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -1241,23 +1212,23 @@ final class HealthStore {
     }
 
     /// Unknown optionals become an empty field, never a substituted zero or `false`.
-    private static func boolean(_ value: Bool?) -> String {
+    nonisolated private static func boolean(_ value: Bool?) -> String {
         guard let value else { return "" }
         return value ? "true" : "false"
     }
 
-    private static func integer(_ value: Int?) -> String {
+    nonisolated private static func integer(_ value: Int?) -> String {
         guard let value else { return "" }
         return String(value)
     }
 
-    private static func decimal(_ value: Double?) -> String {
+    nonisolated private static func decimal(_ value: Double?) -> String {
         guard let value else { return "" }
         return number(value)
     }
 
     /// Locale-independent numeric formatting, matching the pairwise export's contract.
-    private static func number(_ value: Double) -> String {
+    nonisolated private static func number(_ value: Double) -> String {
         String(format: "%.15g", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 

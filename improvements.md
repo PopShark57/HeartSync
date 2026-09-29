@@ -84,10 +84,9 @@ Suggested order:
 
 ### Implementation status (2026-09-29)
 
-**Implemented:** 42–48, 50–58, 60–72, in two passes (the second, for 46, 47, 50, 52, 53, 66, 69,
-and 72, is described under [Second pass](#second-pass-2026-09-29)). **Not implemented:** 49 (except
-the cache fingerprint that `WatchChartTests.cache()` needs; its off-main snapshot building came with
-50) and 59. Where an item was done in part, the part left is named.
+**Implemented:** 42–72, in three passes (the second, for 46, 47, 50, 52, 53, 66, 69, and 72, is
+described under [Second pass](#second-pass-2026-09-29); the third, for 49 and 59, under
+[Third pass](#third-pass-2026-09-29)). Where an item was done in part, the part left is named.
 
 How it was checked, and what was not:
 
@@ -155,6 +154,29 @@ How it was checked, and what was not:
 | 66 | The private per-peripheral dictionaries are one `PeripheralLink` per session and one `PeripheralRecord` per device, with ring plumbing in `RingLink`; session numbers are global. Forget removes both; a radio power-off ends links, and their HRV windows, like a disconnect. Published dictionaries are unchanged so views stay finely invalidated. | Nothing. |
 | 69 | A session across days prints the end's date. RMSSD and pNN50 use adjacent normal-to-normal pairs, never across a rejected beat or a stream gap. Bias and limit intervals use a t quantile on an AR(1) effective sample size, shown in the pair screen and stated in the export. The store accepts the five-minute future skew Bluetooth does. | Nothing. |
 | 72 | Opt-in on the watch's start screen. The watch mirrors the workout and sends a versioned payload per heart-rate update; iPhone sets the mirroring handler at launch and shows it on Now beside Bluetooth heart rate. Display only: never stored, compared, exported, or written to Health. | No Live Activity (it needs an iOS widget extension) or new background mode was added, so the card is reliable only while HeartSync is running. That capability decision is the user's. |
+
+#### Third pass (2026-09-29)
+
+Items 49 and 59, on branch `claude/audit-fixes-49-59`. Item 49's fingerprint fix and its
+off-main build had come with the earlier passes; what was left of it is below.
+
+How it was checked, and what was not:
+
+- `build-for-testing` of the `HeartSyncChecker` scheme for the generic iOS Simulator (app,
+  watch app, complications, unit and UI bundles). The simulator runtimes were still unusable
+  (Xcode-beta 27.2), so **no hosted test, UI test, or app launch was run**, and the export
+  progress row, Cancel, and the pairwise spinner were compiled, not seen.
+- The scratch macOS harness ran 653 tests, all passing, including the 13 added here. Two
+  mutations were caught: removing the export's read transaction fails the mid-export deletion
+  test, and the oversized-snapshot test was confirmed to take the new size-estimate path
+  rather than the exact fallback.
+- No device trace, so the "no main-thread stall from publication" half of 49's done-when is
+  argued from where the work runs, not measured.
+
+| Item | Done | Left |
+| --- | --- | --- |
+| 49 | Every removal is logged with the latest `end` it removed (`HealthStore.recentRemovals`, 64 records; deletes use `RETURNING end`, and aged rows report the prune cutoff). A cached period is dropped only when a removal since it was built reached a row ending at or after the period's current start (`HealthHistory.latestRemovedEnd`), so routine 30-day pruning keeps 30D, while a deletion, a source removal, a shortened retention, reset, or reload still drop what they reach. A cache older than the log counts as reached. The periods a publication must build come from one read of the longest, sliced by midpoint. `fittedPayload` encodes a fitting snapshot once; an oversized one re-encodes only the metric each drop changes, then confirms with one encode (the exact search remains as fallback). The publisher sends those bytes (`CompanionSession.publish(encoded:)`), so nothing is encoded on the main actor. | Device trace of publication. One `latest` query per enabled source per metric remains. |
+| 59 | Reading exports run detached on one pooled read connection (`ReadingsExportJob` → `ReadingsExportPayload.prepare` → `HealthHistory.writeExportCSV`), reading keyset pages on `(end, rowid)` inside one read transaction, so a prune or deletion mid-export cannot skip or repeat a row and page cost does not grow. Settings and Devices show rows written of the total and a Cancel that deletes the partial file; closing the retention sheet cancels too. The pairwise export is built and written off the main actor. Launch sweeps `HeartSync-Export-*` and `HeartSync-Pairwise-*` directories created before it; the live `HeartSync-ephemeral` database is not touched. The unused `OFFSET` paging was removed. | Not run in the app or on a device. |
 
 ### 42. Apply the saved retention before any prune; never prune on defaulted settings
 

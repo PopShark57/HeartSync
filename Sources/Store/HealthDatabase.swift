@@ -370,8 +370,7 @@ final class HealthDatabase {
         range: DateInterval? = nil,
         sourceID: String? = nil,
         sourceIDs: Set<String>? = nil,
-        limit: Int? = nil,
-        offset: Int = 0
+        limit: Int? = nil
     ) throws -> [Reading] {
         if let sourceIDs, sourceIDs.isEmpty {
             try checkInjectedQueryFailure("decode rows")
@@ -404,11 +403,62 @@ final class HealthDatabase {
         if !clauses.isEmpty { sql += " WHERE " + clauses.joined(separator: " AND ") }
         sql += " ORDER BY end, rowid"
         if let limit {
-            sql += " LIMIT ? OFFSET ?"
+            sql += " LIMIT ?"
             bindings.append(.int(max(0, limit)))
-            bindings.append(.int(max(0, offset)))
         }
         return try readingRows(sql, bindings: bindings)
+    }
+
+    /// Every stored row, or one source's, in the total order `(end, rowid)`, handed to `page`
+    /// a page at a time until it returns false. `onTotal` first receives how many rows the
+    /// pages will hold.
+    ///
+    /// All of it runs in one read transaction, so every page reads the same committed
+    /// snapshot: a prune or a HealthKit deletion that commits mid-export can neither skip nor
+    /// repeat a row. Pages are keyset pages: each starts after the last `(end, rowid)` of the
+    /// one before, found through the `end` index (which ends in `rowid`), so the thousandth
+    /// page costs what the first does. The `LIMIT … OFFSET` pages this replaces re-read every
+    /// earlier row for each page, which is quadratic over millions of rows.
+    func forEachExportPage(
+        sourceID: String?,
+        pageSize: Int,
+        onTotal: (Int) throws -> Void = { _ in },
+        _ page: ([Reading]) throws -> Bool
+    ) throws {
+        let size = max(1, pageSize)
+        try readTransaction {
+            if let sourceID {
+                try onTotal(count("SELECT COUNT(*) FROM readings WHERE source_id = ?", [.text(sourceID)]))
+            } else {
+                try onTotal(count("SELECT COUNT(*) FROM readings", []))
+            }
+            var after: (end: Double, rowid: Int64)?
+            while true {
+                var clauses: [String] = []
+                var bindings: [Binding] = []
+                if let sourceID {
+                    // `+source_id` keeps the scan on the `end` index; the source index would
+                    // have to re-sort the source's remaining rows for every page.
+                    clauses.append("+source_id = ?")
+                    bindings.append(.text(sourceID))
+                }
+                if let after {
+                    clauses.append("(end, rowid) > (?, ?)")
+                    bindings.append(.double(after.end))
+                    bindings.append(.int(Int(after.rowid)))
+                }
+                var sql = "SELECT \(Self.readingColumns), rowid FROM readings"
+                if !clauses.isEmpty { sql += " WHERE " + clauses.joined(separator: " AND ") }
+                sql += " ORDER BY end, rowid LIMIT ?"
+                bindings.append(.int(size))
+                var last: (end: Double, rowid: Int64)?
+                let rows = try readingRows(sql, bindings: bindings) { statement in
+                    last = (sqlite3_column_double(statement, 4), sqlite3_column_int64(statement, 9))
+                }
+                guard !rows.isEmpty, try page(rows), rows.count == size, let last else { return }
+                after = last
+            }
+        }
     }
 
     /// Readings that end at or after `end`, of every metric, whose midpoint lies in `range`.
@@ -532,13 +582,27 @@ final class HealthDatabase {
         }
     }
 
+    /// What a delete removed: how many rows, and the latest `end` among them, so a cache
+    /// of a recent period can tell whether the removal reached it (`HealthStore.RemovalRecord`).
+    struct DeletedRows: Equatable, Sendable {
+        var count = 0
+        /// Nil when nothing was removed. May be later than any removed row (a bound), never
+        /// earlier.
+        var latestEnd: Date?
+
+        mutating func add(_ other: DeletedRows) {
+            count += other.count
+            latestEnd = [latestEnd, other.latestEnd].compactMap { $0 }.max()
+        }
+    }
+
     @discardableResult
     func commit(
         readings: [Reading],
         mode: WriteMode,
         sources: [DataSource],
         removingReadingIDs: Set<UUID> = []
-    ) throws -> Int {
+    ) throws -> DeletedRows {
         try transaction {
             for source in sources { try write(source) }
             for reading in readings { try write(reading, mode: mode) }
@@ -546,10 +610,9 @@ final class HealthDatabase {
             // added and deleted between two anchors; the committed generation must end with
             // that sample absent. Oura withdrawal ids never overlap its fetched ids, so the
             // same ordering is correct there too.
-            var removed = 0
+            var removed = DeletedRows()
             for id in removingReadingIDs {
-                try execute("DELETE FROM readings WHERE id = ?", bindings: [.text(id.uuidString)])
-                removed += Int(sqlite3_changes(handle))
+                removed.add(try delete("DELETE FROM readings WHERE id = ? RETURNING end", bindings: [.text(id.uuidString)]))
             }
             return removed
         }
@@ -586,15 +649,14 @@ final class HealthDatabase {
     }
 
     @discardableResult
-    func removeReadingIDs(_ ids: Set<UUID>) throws -> Int {
-        guard !ids.isEmpty else { return 0 }
+    func removeReadingIDs(_ ids: Set<UUID>) throws -> DeletedRows {
+        guard !ids.isEmpty else { return DeletedRows() }
         return try transaction {
-            var count = 0
+            var removed = DeletedRows()
             for id in ids {
-                try execute("DELETE FROM readings WHERE id = ?", bindings: [.text(id.uuidString)])
-                count += Int(sqlite3_changes(handle))
+                removed.add(try delete("DELETE FROM readings WHERE id = ? RETURNING end", bindings: [.text(id.uuidString)]))
             }
-            return count
+            return removed
         }
     }
 
@@ -648,7 +710,7 @@ final class HealthDatabase {
                 guard let marker = reading.metadata?.modelledBy else { return true }
                 return marker == ReadingMetadata.heartSyncModel
             }
-        return try removeReadingIDs(Set(candidates.map(\.id)))
+        return try removeReadingIDs(Set(candidates.map(\.id))).count
     }
 
     /// Deletes every stored reading of one source and leaves the source row itself.
@@ -668,24 +730,26 @@ final class HealthDatabase {
     /// ends after it, so the future check reads only the newest rows. The `start > end` check
     /// cannot use an index, and joining it to the others with `OR` turned every prune into a
     /// table scan, so callers ask for it once, at load.
+    ///
+    /// The aged rows report `cutoff` as their latest end rather than returning each row: a
+    /// first prune after the retention is shortened can remove millions.
     @discardableResult
     func prune(
         cutoff: Date,
         now: Date,
         changedSources: [DataSource],
         includingInvalidRows: Bool = false
-    ) throws -> Int {
+    ) throws -> DeletedRows {
         try transaction {
             try execute("DELETE FROM readings WHERE end < ?", bindings: [.double(cutoff.timeIntervalSince1970)])
-            var removed = Int(sqlite3_changes(handle))
-            try execute(
-                "DELETE FROM readings WHERE end > ? AND start > ?",
+            let aged = Int(sqlite3_changes(handle))
+            var removed = DeletedRows(count: aged, latestEnd: aged > 0 ? cutoff : nil)
+            removed.add(try delete(
+                "DELETE FROM readings WHERE end > ? AND start > ? RETURNING end",
                 bindings: [.double(now.timeIntervalSince1970), .double(now.timeIntervalSince1970)]
-            )
-            removed += Int(sqlite3_changes(handle))
+            ))
             if includingInvalidRows {
-                try execute("DELETE FROM readings WHERE start > end")
-                removed += Int(sqlite3_changes(handle))
+                removed.add(try delete("DELETE FROM readings WHERE start > end RETURNING end"))
             }
             for source in changedSources { try write(source) }
             return removed
@@ -871,7 +935,14 @@ final class HealthDatabase {
     /// The column times are the full-precision `Double`s the indexes use; the payload keeps
     /// milliseconds. The two differ below a millisecond, never at a window boundary a
     /// payload date could land on the other side of.
-    private func readingRows(_ sql: String, bindings: [Binding] = []) throws -> [Reading] {
+    ///
+    /// `eachRow` sees every row's statement, for a caller that selected extra columns after
+    /// `readingColumns`.
+    private func readingRows(
+        _ sql: String,
+        bindings: [Binding] = [],
+        eachRow: (OpaquePointer?) -> Void = { _ in }
+    ) throws -> [Reading] {
         try checkInjectedQueryFailure("decode rows")
         let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
@@ -880,6 +951,7 @@ final class HealthDatabase {
         while true {
             switch sqlite3_step(statement) {
             case SQLITE_ROW:
+                eachRow(statement)
                 if let reading = columnReading(statement) {
                     result.append(reading)
                     continue
@@ -1034,6 +1106,38 @@ final class HealthDatabase {
                 return
             default:
                 throw error("execute SQL")
+            }
+        }
+    }
+
+    /// Runs `body` in one read transaction, so every statement in it sees the same snapshot.
+    /// Unlike `transaction`, it takes no write lock and counts no commit.
+    private func readTransaction<T>(_ body: () throws -> T) throws -> T {
+        try execute("BEGIN DEFERRED")
+        do {
+            let result = try body()
+            try execute("COMMIT")
+            return result
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    /// Runs a `DELETE … RETURNING end` and reports the rows it removed.
+    private func delete(_ sql: String, bindings: [Binding] = []) throws -> DeletedRows {
+        let statement = try prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        try bind(bindings, to: statement)
+        var removed = DeletedRows()
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                removed.add(DeletedRows(count: 1, latestEnd: Date(timeIntervalSince1970: sqlite3_column_double(statement, 0))))
+            case SQLITE_DONE:
+                return removed
+            default:
+                throw error("delete readings")
             }
         }
     }

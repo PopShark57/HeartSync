@@ -23,14 +23,28 @@ enum WatchSnapshotBuilder {
         return window * max(1, multiple)
     }
 
+    /// A snapshot and its encoding, made once: `fitted` has already had to encode it to know
+    /// it fits, and the publisher hands WatchConnectivity these bytes rather than encoding
+    /// the same snapshot again on the main actor.
+    struct Payload: Sendable {
+        var snapshot: WatchSnapshot
+        /// Nil only when even the chart-free snapshot fails validation; nothing is sent then.
+        var data: Data?
+    }
+
     @MainActor
     static func make(store: HealthStore, now: Date = .now, cache: WatchChartCache? = nil) -> WatchSnapshot {
         make(history: store.history, now: now, cache: cache)
     }
 
     static func make(history store: HealthHistory, now: Date = .now, cache: WatchChartCache? = nil) -> WatchSnapshot {
+        makePayload(history: store, now: now, cache: cache).snapshot
+    }
+
+    static func makePayload(history store: HealthHistory, now: Date = .now, cache: WatchChartCache? = nil) -> Payload {
         guard store.loadState == .loaded else {
-            return WatchSnapshot(generatedAt: now, availability: .unavailable, metrics: [])
+            let snapshot = WatchSnapshot(generatedAt: now, availability: .unavailable, metrics: [])
+            return Payload(snapshot: snapshot, data: try? snapshot.encoded())
         }
         let sources = store.enabledSources
         let enabledIDs = sources.map(\.id).sorted().joined(separator: ",")
@@ -66,15 +80,37 @@ enum WatchSnapshotBuilder {
 
             let ranges = WatchChartRange.available(for: kind)
             var results: [WatchChartRange: PeriodResult] = [:]
+            var stale: [WatchChartRange] = []
             for range in ranges {
                 let key = WatchChartCache.Key(kind: kind, range: range)
-                if let cached = cache?.result(for: key, now: now, fingerprint: fingerprint, removals: store.removalGeneration) {
+                if let cached = cache?.result(for: key, now: now, fingerprint: fingerprint, history: store) {
                     results[range] = cached
-                    continue
+                } else {
+                    stale.append(range)
                 }
-                let result = period(kind: kind, range: range, now: now, shown: shownSources, store: store)
-                cache?.store(result, for: key, at: now, fingerprint: fingerprint, removals: store.removalGeneration)
-                results[range] = result
+            }
+            // One read for every period that needs building: the longest, sliced for the
+            // others. The periods all end now, so each shorter one is a suffix of it.
+            if let longest = stale.max(by: { $0.duration < $1.duration }) {
+                let all = store.readings(kind: kind, in: interval(for: longest, now: now))
+                for range in stale {
+                    let result = period(
+                        kind: kind,
+                        range: range,
+                        now: now,
+                        shown: shownSources,
+                        readings: range == longest ? all : slice(all, to: interval(for: range, now: now)),
+                        store: store
+                    )
+                    cache?.store(
+                        result,
+                        for: WatchChartCache.Key(kind: kind, range: range),
+                        at: now,
+                        fingerprint: fingerprint,
+                        removals: store.removalGeneration
+                    )
+                    results[range] = result
+                }
             }
             let standard = standardRange(for: kind)
             let primary = results[standard]
@@ -90,7 +126,7 @@ enum WatchSnapshotBuilder {
                 availableRanges: ranges
             )
         }
-        return fitted(WatchSnapshot(generatedAt: now, metrics: metrics))
+        return fittedPayload(WatchSnapshot(generatedAt: now, metrics: metrics))
     }
 
     // MARK: Periods
@@ -102,6 +138,19 @@ enum WatchSnapshotBuilder {
         var chart: WatchChart?
     }
 
+    static func interval(for range: WatchChartRange, now: Date) -> DateInterval {
+        DateInterval(start: now.addingTimeInterval(-range.duration), end: now)
+    }
+
+    /// The rows of a longer read that a read of `interval` would return: the store selects
+    /// by midpoint, both ends inclusive, and keeps its order. A row whose payload carries
+    /// metadata comes back with millisecond times, so its recomputed midpoint can differ from
+    /// the indexed one by less than a millisecond; only a row that close to the boundary
+    /// could fall differently.
+    static func slice(_ readings: [Reading], to interval: DateInterval) -> [Reading] {
+        readings.filter { interval.contains($0.midpoint) }
+    }
+
     static func period(
         kind: MetricKind,
         range: WatchChartRange,
@@ -109,8 +158,25 @@ enum WatchSnapshotBuilder {
         shown: [DataSource],
         store: HealthHistory
     ) -> PeriodResult {
-        let interval = DateInterval(start: now.addingTimeInterval(-range.duration), end: now)
-        let readings = store.readings(kind: kind, in: interval)
+        period(
+            kind: kind,
+            range: range,
+            now: now,
+            shown: shown,
+            readings: store.readings(kind: kind, in: interval(for: range, now: now)),
+            store: store
+        )
+    }
+
+    static func period(
+        kind: MetricKind,
+        range: WatchChartRange,
+        now: Date,
+        shown: [DataSource],
+        readings: [Reading],
+        store: HealthHistory
+    ) -> PeriodResult {
+        let interval = Self.interval(for: range, now: now)
         let analyses = ComparisonEngine.allPairwiseAnalyses(from: readings, kind: kind, range: interval)
         let overview = PairwiseEvidenceOverview(analyses: analyses)
         let comparison = WatchComparison(
@@ -238,15 +304,43 @@ enum WatchSnapshotBuilder {
     static let dropOrder: [WatchChartRange] = [.month, .week, .hour, .day]
 
     static func fitted(_ snapshot: WatchSnapshot) -> WatchSnapshot {
+        fittedPayload(snapshot).snapshot
+    }
+
+    /// `fitted`, with the encoding it ends on.
+    ///
+    /// A snapshot that fits is encoded once. One that does not used to be re-encoded whole
+    /// after every dropped chart; now each drop re-encodes only the metric it changed and
+    /// adjusts the total, since the snapshot's bytes are its metrics' bytes plus a fixed
+    /// frame. The result is encoded once more to confirm; if that disagrees (or the snapshot
+    /// was invalid rather than large) the exact whole-snapshot search runs as before.
+    static func fittedPayload(_ snapshot: WatchSnapshot) -> Payload {
+        if let data = try? snapshot.encoded() { return Payload(snapshot: snapshot, data: data) }
+        let encoder = JSONEncoder()
+        if var size = try? encoder.encode(snapshot).count, size > WatchSnapshot.maximumBytes {
+            var trimmed = snapshot
+            search: for range in dropOrder {
+                for index in trimmed.metrics.indices.reversed() {
+                    guard trimmed.metrics[index].periodChart(range) != nil
+                            || (range == .day && trimmed.metrics[index].chart != nil),
+                          let before = try? encoder.encode(trimmed.metrics[index]).count
+                    else { continue }
+                    remove(range, from: &trimmed.metrics[index])
+                    guard let after = try? encoder.encode(trimmed.metrics[index]).count else { break search }
+                    size -= before - after
+                    if size <= WatchSnapshot.maximumBytes { break search }
+                }
+            }
+            if let data = try? trimmed.encoded() { return Payload(snapshot: trimmed, data: data) }
+        }
         var snapshot = snapshot
-        guard (try? snapshot.encoded()) == nil else { return snapshot }
         for range in dropOrder {
             for index in snapshot.metrics.indices.reversed() {
                 guard snapshot.metrics[index].periodChart(range) != nil
                         || (range == .day && snapshot.metrics[index].chart != nil)
                 else { continue }
                 remove(range, from: &snapshot.metrics[index])
-                if (try? snapshot.encoded()) != nil { return snapshot }
+                if let data = try? snapshot.encoded() { return Payload(snapshot: snapshot, data: data) }
             }
         }
         // Still invalid: drop every chart, including any the rules above did not reach.
@@ -255,10 +349,10 @@ enum WatchSnapshotBuilder {
             snapshot.metrics[index].rangeCharts = nil
             snapshot.metrics[index].availableRanges = nil
         }
-        return snapshot
+        return Payload(snapshot: snapshot, data: try? snapshot.encoded())
     }
 
-    private static func remove(_ range: WatchChartRange, from metric: inout WatchMetric) {
+    static func remove(_ range: WatchChartRange, from metric: inout WatchMetric) {
         if metric.chart?.range == range || (range == .day && metric.chart?.range == nil) {
             metric.chart = nil
         }
@@ -291,12 +385,15 @@ enum WatchSnapshotBuilder {
 }
 
 /// Keeps the slower periods between publications. The watch payload is rebuilt at most every
-/// 30 seconds; re-reading 30 days of a 1 Hz sensor that often would stall the main actor.
+/// 30 seconds; re-reading 30 days of a 1 Hz sensor that often would be wasted work.
 ///
 /// A period is reused until its refresh interval passes, the shown or enabled sources change
-/// (rename, hide, colour), or the store removes anything (`removalGeneration`: deletions,
-/// source removal, retention, reset, reload). New readings alone wait for the interval; each
-/// chart's `end` tells the wrist how current it is.
+/// (rename, hide, colour), or the store removes a row the period would still show: one that
+/// ended at or after the period's start as of now (`HealthHistory.latestRemovedEnd`).
+/// Deletions inside it, source removal, a shortened retention, reset, and reload all
+/// qualify. Routine retention pruning removes only rows older than the longest period, which
+/// a rebuild would leave out anyway, so it keeps the cache. New readings alone wait for the
+/// interval; each chart's `end` tells the wrist how current it is.
 ///
 /// Locked rather than main-actor isolated, because the builder runs off the main actor.
 /// Every access to `entries` holds `lock`.
@@ -325,14 +422,29 @@ final class WatchChartCache: @unchecked Sendable {
         }
     }
 
-    func result(for key: Key, now: Date, fingerprint: String, removals: Int) -> WatchSnapshotBuilder.PeriodResult? {
-        guard let entry = lock.withLock({ entries[key] }),
-              entry.fingerprint == fingerprint,
-              entry.removals == removals,
-              now >= entry.builtAt,
-              now.timeIntervalSince(entry.builtAt) < Self.refreshInterval(for: key.range)
-        else { return nil }
-        return entry.result
+    func result(
+        for key: Key,
+        now: Date,
+        fingerprint: String,
+        history: HealthHistory
+    ) -> WatchSnapshotBuilder.PeriodResult? {
+        lock.withLock {
+            guard let entry = entries[key],
+                  entry.fingerprint == fingerprint,
+                  now >= entry.builtAt,
+                  now.timeIntervalSince(entry.builtAt) < Self.refreshInterval(for: key.range)
+            else { return nil }
+            if let removedEnd = history.latestRemovedEnd(since: entry.removals) {
+                guard removedEnd < now.addingTimeInterval(-key.range.duration) else {
+                    entries[key] = nil
+                    return nil
+                }
+                // Those removals are behind this period and only fall further behind, so
+                // the entry need not keep an old generation on the bounded log.
+                entries[key]?.removals = history.removalGeneration
+            }
+            return entry.result
+        }
     }
 
     func store(_ result: WatchSnapshotBuilder.PeriodResult, for key: Key, at now: Date, fingerprint: String, removals: Int) {

@@ -88,7 +88,8 @@ in the Smart Stack.
   and shape (a second source on a shared colour slot gets a free shape, as on iPhone), and the Bland–Altman figures of one ready pair (outside tolerance first) with a
   thinned difference series. The standard period stays in `WatchMetric.chart`, so either app
   can be older; the other periods are in `rangeCharts`. `WatchChartCache` keeps 24H, 7D, and
-  30D between publications and discards them on source changes or any store removal. Charts
+  30D between publications and discards them on source changes or a store removal that
+  reaches the period (routine pruning of rows older than 30 days does not). Charts
   are dropped, longest period first, before the 60 KB cap would be exceeded. The x axis uses
   two or three round local times (or weekdays, or numeric dates) inside the plot edges. The watch draws
   them with `WatchTrendChart` and `WatchDifferenceChart` (neutral reference inks, lines broken

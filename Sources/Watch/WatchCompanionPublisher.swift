@@ -25,8 +25,8 @@ final class WatchCompanionPublisher {
         connection.start()
     }
 
-    /// Starts a publication now. The snapshot is read and built off the main actor; only
-    /// handing it to WatchConnectivity happens here.
+    /// Starts a publication now. The snapshot is read, built, and encoded off the main actor;
+    /// only handing the bytes to WatchConnectivity happens here.
     func publishNow() {
         pending?.cancel()
         pending = nil
@@ -37,11 +37,12 @@ final class WatchCompanionPublisher {
         let sequence = buildSequence
         lastPublished = .now
         building = Task { [weak self] in
-            let snapshot = await HealthHistory.offMain(priority: .utility) {
-                WatchSnapshotBuilder.make(history: history, cache: cache)
+            // Built and encoded off the main actor; only the finished bytes come back.
+            let payload = await HealthHistory.offMain(priority: .utility) {
+                WatchSnapshotBuilder.makePayload(history: history, cache: cache)
             }
-            guard let self, sequence == self.buildSequence else { return }
-            self.connection.publish(snapshot)
+            guard let self, sequence == self.buildSequence, let data = payload.data else { return }
+            self.connection.publish(encoded: data)
         }
     }
 

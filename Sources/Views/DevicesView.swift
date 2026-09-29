@@ -14,7 +14,7 @@ struct DevicesView: View {
     /// the temporary export is still known when the time comes to delete it.
     @State private var exportDirectory: URL?
     @State private var exportError: String?
-    @State private var isExporting = false
+    @State private var export = ReadingsExportJob()
     @State private var diagnosticsExport: DiagnosticsExportRequest?
     /// Why a removal, pause, or rename did not happen, so the list never claims a change
     /// that the database refused and that would revert at the next launch.
@@ -101,10 +101,12 @@ struct DevicesView: View {
                 Text(exportError ?? "The export could not be prepared.")
             }
             .overlay {
-                if isExporting {
-                    ProgressView("Preparing export\u{2026}")
+                if export.isRunning {
+                    ExportProgressRow(job: export)
+                        .frame(maxWidth: 320)
                         .padding()
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: HeartSyncTheme.compactCornerRadius))
+                        .padding()
                 }
             }
         }
@@ -174,24 +176,19 @@ struct DevicesView: View {
 
     /// Writes this source's rows to a temporary CSV and opens the share sheet. The removal
     /// is not performed; the user comes back to Remove once the file is safe.
+    ///
+    /// Written off the main actor (`ReadingsExportJob`), with progress and Cancel.
     private func exportBeforeRemoval(_ source: DataSource) {
         removal = nil
-        isExporting = true
-        Task { @MainActor in
-            defer { isExporting = false }
-            do {
-                let filename = "HeartSync-\(Self.fileSafe(source.displayName))-readings.csv"
-                guard let payload = try ReadingsExportPayload.prepare(
-                    store: model.store,
-                    sourceID: source.id,
-                    filename: filename
-                ) else {
-                    exportError = "There are no stored readings from \(source.displayName) to export."
-                    return
-                }
+        let filename = "HeartSync-\(Self.fileSafe(source.displayName))-readings.csv"
+        export.start(history: model.store.history, sourceID: source.id, filename: filename) { result in
+            switch result {
+            case .success(let payload?):
                 exportDirectory = payload.directory
                 exportPayload = payload
-            } catch {
+            case .success(nil):
+                exportError = "There are no stored readings from \(source.displayName) to export."
+            case .failure(let error):
                 exportError = "HeartSync could not export the readings. \(error.localizedDescription) Nothing was deleted or changed."
             }
         }
