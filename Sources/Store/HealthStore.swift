@@ -453,8 +453,11 @@ final class HealthStore {
             sources = sourcesBeforeCommit
             return BatchCommitResult(acceptedReadings: [], committed: false)
         }
+        // An interval average is never folded into a window (see `compact`), so a compacted
+        // window at its midpoint says nothing about it, and Oura may still revise it.
         valid.removeAll { reading in
-            (try? database.contains(readingID: compactedReadingID(for: reading))) == true
+            !reading.isIntervalAverage
+                && (try? database.contains(readingID: compactedReadingID(for: reading))) == true
                 && reading.id != compactedReadingID(for: reading)
         }
         do {
@@ -810,9 +813,11 @@ final class HealthStore {
                 sources[index].lastSeenAt = now
                 clamped.append(sources[index])
             }
+            // A row may begin up to the accepted clock skew ahead; only one beyond it is
+            // impossible and goes.
             let removed = try database.prune(
                 cutoff: cutoff,
-                now: now,
+                now: now.addingTimeInterval(Self.maximumFutureSkew),
                 changedSources: clamped,
                 includingInvalidRows: includingInvalidRows
             )
@@ -861,7 +866,9 @@ final class HealthStore {
         var supersededIDs: Set<UUID> = []
         for (kind, group) in Dictionary(grouping: aged, by: \.kind) {
             var members: [CompactionBucket: [Reading]] = [:]
-            for reading in group where reading.isPlausible {
+            // An interval average stays a row of its own. Folded into the window at its
+            // midpoint, a night's mean would lose its span and be paired as one minute.
+            for reading in group where reading.isPlausible && !reading.isIntervalAverage {
                 let start = ComparisonEngine.floorToWindow(reading.midpoint, size: kind.comparisonWindow)
                 members[CompactionBucket(start: start, sourceID: reading.sourceID), default: []].append(reading)
             }
@@ -1286,13 +1293,22 @@ final class HealthStore {
         return min(date, now)
     }
 
+    /// How far ahead of this phone's clock a device's timestamp may be and still be kept.
+    ///
+    /// The same allowance Bluetooth admission already gives
+    /// (`BluetoothIngestionPolicy.maximumFutureSkew`). A HealthKit sample written by a watch
+    /// whose clock runs a few seconds ahead used to be dropped here while its anchor moved
+    /// past it, so it was never imported at all.
+    nonisolated static let maximumFutureSkew: TimeInterval = 5 * 60
+
     private func isTemporallyValid(_ reading: Reading, now: Date) -> Bool {
+        let latestAcceptable = now.addingTimeInterval(Self.maximumFutureSkew)
         guard reading.start.timeIntervalSinceReferenceDate.isFinite,
               reading.end.timeIntervalSinceReferenceDate.isFinite,
               reading.start <= reading.end,
-              reading.start <= now
+              reading.start <= latestAcceptable
         else { return false }
-        guard reading.end > now else { return true }
+        guard reading.end > latestAcceptable else { return true }
         let aggregate = reading.provenance == .estimated || reading.sourceID == DataSource.ouraSourceID
         return aggregate && reading.end.timeIntervalSince(now) <= 86_400
     }

@@ -32,12 +32,18 @@ enum ComparisonEngine {
     ///   - includeEstimated: whether modelled values participate. Off by default, because
     ///     comparing an estimate against a measurement tells you about the model, not the
     ///     devices.
+    ///   - includeIntervalAverages: whether averages over more than the metric's comparison
+    ///     window (`Reading.isIntervalAverage`) participate. Off by default, for the same
+    ///     reason: a night's mean heart rate placed in the minute around 03:00 and paired
+    ///     with a strap's median for that minute measures the averaging, not the devices.
+    ///     When included, the value is marked and its pairs never support a conclusion.
     static func windows(
         from readings: [Reading],
         kind: MetricKind,
         windowSize: TimeInterval? = nil,
         range: DateInterval? = nil,
-        includeEstimated: Bool = false
+        includeEstimated: Bool = false,
+        includeIntervalAverages: Bool = false
     ) -> [ComparisonWindow] {
         let size = windowSize ?? kind.comparisonWindow
         guard size > 0 else { return [] }
@@ -45,6 +51,7 @@ enum ComparisonEngine {
         let relevant = readings.filter { reading in
             guard reading.kind == kind, reading.isPlausible else { return false }
             if !includeEstimated, reading.provenance == .estimated { return false }
+            if !includeIntervalAverages, reading.isIntervalAverage { return false }
             if let range, !range.contains(reading.midpoint) { return false }
             return true
         }
@@ -142,7 +149,8 @@ enum ComparisonEngine {
             isCompacted: !compacted.isEmpty,
             qualityCaveatCount: qualityCaveatCount,
             observedInterval: observedInterval,
-            representativeTime: representativeTime
+            representativeTime: representativeTime,
+            includesIntervalAverage: samples.contains(where: \.isIntervalAverage)
         )
     }
 
@@ -155,6 +163,9 @@ enum ComparisonEngine {
         sourceB: SourceValue,
         kind: MetricKind
     ) -> PairTimingQuality {
+        // Checked first: an interval average's midpoint can sit right next to the other
+        // source's readings and look simultaneous while describing a whole night.
+        if sourceA.includesIntervalAverage || sourceB.includesIntervalAverage { return .intervalAverage }
         guard let tolerance = kind.timingTolerance else { return .notApplicable }
         guard let a = sourceA.representativeTime, let b = sourceB.representativeTime else { return .unknown }
         return abs(a.timeIntervalSince(b)) <= tolerance ? .simultaneous : .separated
@@ -168,6 +179,8 @@ enum ComparisonEngine {
     /// difference is stable. Candidate windows are the union of windows reported by either
     /// selected source; paired observations are their intersection. Estimated values remain
     /// excluded because this API deliberately uses the default measurement-only windowing.
+    /// Interval averages are excluded too unless `includeIntervalAverages` asks for them,
+    /// and then their pairs are listed but never counted toward a conclusion.
     static func pairwiseAnalysis(
         from readings: [Reading],
         kind: MetricKind,
@@ -175,7 +188,8 @@ enum ComparisonEngine {
         sourceB: String,
         range: DateInterval,
         windowSize: TimeInterval? = nil,
-        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows
+        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows,
+        includeIntervalAverages: Bool = false
     ) -> PairwiseAnalysis {
         let size = windowSize ?? kind.comparisonWindow
         let pair = canonicalPair(sourceA, sourceB)
@@ -183,7 +197,8 @@ enum ComparisonEngine {
             from: readings,
             kind: kind,
             windowSize: size,
-            range: range
+            range: range,
+            includeIntervalAverages: includeIntervalAverages
         )
         return pairwiseAnalysis(
             fromWindows: comparisonWindows,
@@ -204,14 +219,16 @@ enum ComparisonEngine {
         kind: MetricKind,
         range: DateInterval,
         windowSize: TimeInterval? = nil,
-        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows
+        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows,
+        includeIntervalAverages: Bool = false
     ) -> [PairwiseAnalysis] {
         let size = windowSize ?? kind.comparisonWindow
         let comparisonWindows = windows(
             from: readings,
             kind: kind,
             windowSize: size,
-            range: range
+            range: range,
+            includeIntervalAverages: includeIntervalAverages
         )
         let sourceIDs = Set(comparisonWindows.flatMap { $0.values.map(\.sourceID) }).sorted()
         guard sourceIDs.count >= 2 else { return [] }
@@ -318,6 +335,9 @@ enum ComparisonEngine {
         }
 
         let pairedWindowCount = observations.count
+        // An interval-average pair is listed, and exported with its timing, but it is not
+        // evidence about the devices: the threshold and the statistics use the rest only.
+        let conclusive = observations.filter { $0.timing != .intervalAverage }
         let candidateWindowCount = candidates.count
         let overlapPercentage = candidateWindowCount > 0
             ? min(100, max(0, Double(pairedWindowCount) / Double(candidateWindowCount) * 100))
@@ -329,8 +349,8 @@ enum ComparisonEngine {
             nil
         }
         let requiredWindowCount = max(1, minimumPairedWindows)
-        let statistics = pairedWindowCount >= requiredWindowCount
-            ? summaryStatistics(from: observations, kind: kind)
+        let statistics = conclusive.count >= requiredWindowCount
+            ? summaryStatistics(from: conclusive, kind: kind)
             : nil
         let state: PairwiseAnalysisState
         if pairedWindowCount == 0 {
@@ -339,7 +359,7 @@ enum ComparisonEngine {
             state = .ready(statistics)
         } else {
             state = .collecting(
-                pairedWindowCount: pairedWindowCount,
+                pairedWindowCount: conclusive.count,
                 requiredWindowCount: requiredWindowCount
             )
         }
@@ -348,7 +368,7 @@ enum ComparisonEngine {
         let rawSampleCountB = knownSampleTotal(observations.map(\.sourceB))
         let assessment = evidenceAssessment(
             observations: observations,
-            pairedWindowCount: pairedWindowCount,
+            pairedWindowCount: conclusive.count,
             overlapPercentage: overlapPercentage,
             analyzedSpan: analyzedSpan,
             windowSize: windowSize,
@@ -397,7 +417,13 @@ enum ComparisonEngine {
             classification = .measurementNoise
         }
 
-        let confidence = confidenceIntervals(meanBias: meanBias, sd: differenceSD, count: differences.count)
+        let effectiveCount = effectiveSampleSize(of: observations)
+        let confidence = confidenceIntervals(
+            meanBias: meanBias,
+            sd: differenceSD,
+            count: differences.count,
+            effectiveCount: effectiveCount
+        )
         return PairwiseSummaryStatistics(
             meanBias: meanBias,
             meanAbsoluteDifference: meanAbsoluteDifference,
@@ -407,9 +433,69 @@ enum ComparisonEngine {
             classification: classification,
             meanBiasConfidenceInterval: confidence?.mean,
             lowerLimitConfidenceInterval: confidence?.lowerLimit,
-            upperLimitConfidenceInterval: confidence?.upperLimit
+            upperLimitConfidenceInterval: confidence?.upperLimit,
+            effectiveSampleSize: confidence == nil ? nil : effectiveCount
         )
     }
+
+    /// How many independent differences `observations` are worth.
+    ///
+    /// Consecutive windows from one walk or one night are not independent: a device that
+    /// reads 4 bpm high at 10:00 usually still does at 10:01. Treating thirty adjacent
+    /// minutes as thirty independent draws makes the bias interval too narrow. This uses the
+    /// usual AR(1) adjustment, `n (1 - r) / (1 + r)`, where `r` is the lag-one
+    /// autocorrelation of the differences measured only across windows that touch. A
+    /// negative `r` is treated as zero, so the adjustment never claims more than `n`, and
+    /// the result is never below two.
+    static func effectiveSampleSize(of observations: [PairwiseObservation]) -> Double {
+        let n = Double(observations.count)
+        guard observations.count >= 3 else { return n }
+        let differences = observations.map(\.signedDifference)
+        let mean = differences.reduce(0, +) / n
+        let variance = differences.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / n
+        guard variance > 0 else { return n }
+        var lagProducts = 0.0
+        var lagPairs = 0
+        for index in 1..<observations.count
+        where abs(observations[index].start.timeIntervalSince(observations[index - 1].end)) < 0.5 {
+            lagProducts += (differences[index] - mean) * (differences[index - 1] - mean)
+            lagPairs += 1
+        }
+        guard lagPairs > 0 else { return n }
+        let r = min(0.99, max(0, lagProducts / Double(lagPairs) / variance))
+        return max(2, min(n, n * (1 - r) / (1 + r)))
+    }
+
+    /// Two-sided 95% quantile of Student's t with `degreesOfFreedom` degrees of freedom.
+    ///
+    /// Tabulated to 30 and interpolated linearly in `1 / df` between entries (the usual
+    /// rule for fractional degrees of freedom); beyond 30, the Cornish–Fisher expansion
+    /// about the normal quantile (Abramowitz and Stegun 26.7.5), accurate to three decimals.
+    static func tQuantile975(degreesOfFreedom df: Double) -> Double {
+        guard df.isFinite, df > 0 else { return .infinity }
+        if df <= 1 { return tTable975[0] }
+        if df <= Double(tTable975.count) {
+            let lower = Int(df.rounded(.down))
+            let upper = min(lower + 1, tTable975.count)
+            guard lower != upper else { return tTable975[lower - 1] }
+            let fraction = (1 / Double(lower) - 1 / df) / (1 / Double(lower) - 1 / Double(upper))
+            return tTable975[lower - 1] + fraction * (tTable975[upper - 1] - tTable975[lower - 1])
+        }
+        let z = 1.959963984540054
+        let z3 = z * z * z, z5 = z3 * z * z, z7 = z5 * z * z, z9 = z7 * z * z
+        return z
+            + (z3 + z) / (4 * df)
+            + (5 * z5 + 16 * z3 + 3 * z) / (96 * df * df)
+            + (3 * z7 + 19 * z5 + 17 * z3 - 15 * z) / (384 * df * df * df)
+            + (79 * z9 + 776 * z7 + 1482 * z5 - 1920 * z3 - 945 * z) / (92_160 * df * df * df * df)
+    }
+
+    /// t(0.975) for 1 through 30 degrees of freedom.
+    private static let tTable975: [Double] = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+        2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+        2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+    ]
 
     private static func knownSampleTotal(_ values: [SourceValue]) -> Int? {
         var total = 0
@@ -455,6 +541,7 @@ enum ComparisonEngine {
         // things: one is a measured failure to coincide, the other is an absence of evidence.
         let separated = observations.count { $0.timing == .separated }
         let unknownTiming = observations.count { $0.timing == .unknown }
+        let intervalAverages = observations.count { $0.timing == .intervalAverage }
         let separations = observations.compactMap(\.timingSeparation)
         let medianSeparation = separations.isEmpty ? nil : median(separations)
         // How much of the analyzed span the paired windows actually occupy. Below 1 the
@@ -467,8 +554,8 @@ enum ComparisonEngine {
         // however many windows it accumulated, so timing gates the top grades. The paired
         // set itself is NOT filtered: statistics still use every paired window, as
         // documented, and this marks the evidence rather than quietly discarding data.
-        let timingSupportsStrong = separated == 0 && unknownTiming == 0
-        let timingSupportsModerate = pairedWindowCount > 0
+        let timingSupportsStrong = separated == 0 && unknownTiming == 0 && intervalAverages == 0
+        let timingSupportsModerate = pairedWindowCount > 0 && intervalAverages == 0
             && Double(separated + unknownTiming) / Double(pairedWindowCount) <= 0.25
 
         let grade: PairwiseEvidenceGrade
@@ -515,6 +602,13 @@ enum ComparisonEngine {
                 comment: "Why a device comparison has a low evidence grade. The argument is how many paired windows have no timing information."
             ))
         }
+        if intervalAverages > 0 {
+            reasons.append(String(
+                localized: "evidence.reason.intervalAverages",
+                defaultValue: "\(intervalAverages) paired windows compare an average over a longer interval with one window",
+                comment: "Why a device comparison has a low evidence grade. The argument is how many paired windows use a night or day average from one device."
+            ))
+        }
         if let coverageFraction, coverageFraction < 0.5 {
             reasons.append(String(localized: "evidence.reason.partialCoverage", defaultValue: "Paired windows cover only part of the analysed span", comment: "Why a device comparison has a low evidence grade"))
         }
@@ -538,18 +632,25 @@ enum ComparisonEngine {
     /// Approximate 95% confidence intervals are exposed only from ten pairs onward. The
     /// limits use Bland-Altman's standard error approximation; below ten, an interval would
     /// look more authoritative than the evidence warrants.
+    ///
+    /// Both use the effective sample size rather than the window count, and a t quantile
+    /// on `effectiveCount - 1` degrees of freedom rather than 1.96. The limits themselves
+    /// stay at 1.96 standard deviations: they describe the spread of the differences, not
+    /// the uncertainty of an estimate.
     private static func confidenceIntervals(
         meanBias: Double,
         sd: Double,
-        count: Int
+        count: Int,
+        effectiveCount: Double
     ) -> (mean: ClosedRange<Double>, lowerLimit: ClosedRange<Double>, upperLimit: ClosedRange<Double>)? {
         guard count >= 10, sd.isFinite else { return nil }
-        let n = Double(count)
-        let critical = 1.96
+        let n = min(Double(count), max(2, effectiveCount))
+        let spread = 1.96
+        let critical = tQuantile975(degreesOfFreedom: n - 1)
         let meanMargin = critical * sd / n.squareRoot()
-        let lower = meanBias - critical * sd
-        let upper = meanBias + critical * sd
-        let limitSE = sd * (1 / n + critical * critical / (2 * (n - 1))).squareRoot()
+        let lower = meanBias - spread * sd
+        let upper = meanBias + spread * sd
+        let limitSE = sd * (1 / n + spread * spread / (2 * (n - 1))).squareRoot()
         let limitMargin = critical * limitSE
         return (
             (meanBias - meanMargin)...(meanBias + meanMargin),

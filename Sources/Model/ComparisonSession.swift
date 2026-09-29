@@ -29,11 +29,21 @@ enum ComparisonPeriod: Hashable, Sendable {
         switch self {
         case .rolling(let range): range.title
         case .fixed(let interval):
-            String(
-                localized: "comparisonPeriod.fixed",
-                defaultValue: "\(interval.start.formatted(date: .abbreviated, time: .shortened)) to \(interval.end.formatted(date: .omitted, time: .shortened))",
-                comment: "A saved comparison's exact span. The first argument is the start date and time, the second the end time."
-            )
+            // The end's date is omitted only when it is the start's day. A two-day session
+            // used to read "3 Sep 07:00 to 08:00", which describes one hour.
+            if Calendar.current.isDate(interval.start, inSameDayAs: interval.end) {
+                String(
+                    localized: "comparisonPeriod.fixed",
+                    defaultValue: "\(interval.start.formatted(date: .abbreviated, time: .shortened)) to \(interval.end.formatted(date: .omitted, time: .shortened))",
+                    comment: "A saved comparison's exact span within one day. The first argument is the start date and time, the second the end time."
+                )
+            } else {
+                String(
+                    localized: "comparisonPeriod.fixedAcrossDays",
+                    defaultValue: "\(interval.start.formatted(date: .abbreviated, time: .shortened)) to \(interval.end.formatted(date: .abbreviated, time: .shortened))",
+                    comment: "A saved comparison's exact span across more than one day. Both arguments are a date and time."
+                )
+            }
         }
     }
 

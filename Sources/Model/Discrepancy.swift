@@ -24,6 +24,10 @@ struct SourceValue: Identifiable, Hashable, Sendable {
     /// source in this window, used to measure how far apart two sources actually were.
     /// Nil for the same reason as `observedInterval`.
     var representativeTime: Date? = nil
+    /// True when a contributing reading is an average over more than the comparison window
+    /// (`Reading.isIntervalAverage`). Such a value describes a night or a day, not this
+    /// window, and only appears when a caller asks `windows` to include interval averages.
+    var includesIntervalAverage: Bool = false
 
     var id: String { sourceID }
 }
@@ -45,6 +49,10 @@ enum PairTimingQuality: String, Hashable, Sendable, CaseIterable {
     /// The metric summarises a long interval (a daily resting rate, a VO2 max estimate),
     /// so a sub-window separation figure would be meaningless rather than merely unknown.
     case notApplicable
+    /// One side is an average over an interval longer than the comparison window, such as
+    /// a whole night's mean heart rate. The pair measures that average against one window,
+    /// not one device against another, so it never supports a conclusion.
+    case intervalAverage
 
     /// Whether this observation should count toward a supported agreement conclusion.
     /// Only an affirmative timing check does; unknown does not qualify by default.
@@ -62,6 +70,8 @@ enum PairTimingQuality: String, Hashable, Sendable, CaseIterable {
             String(localized: "pairTiming.unknown", defaultValue: "Timing unknown", comment: "Pair timing: a timestamp needed to judge the separation is no longer available")
         case .notApplicable:
             String(localized: "pairTiming.notApplicable", defaultValue: "Interval summary", comment: "Pair timing: the metric summarises a long interval, so a separation figure would be meaningless")
+        case .intervalAverage:
+            String(localized: "pairTiming.intervalAverage", defaultValue: "Interval average", comment: "Pair timing: one device's value is an average over a much longer interval, such as a night, so it cannot be compared with one window")
         }
     }
 }
@@ -161,6 +171,9 @@ struct PairwiseSummaryStatistics: Hashable, Sendable {
     var meanBiasConfidenceInterval: ClosedRange<Double>? = nil
     var lowerLimitConfidenceInterval: ClosedRange<Double>? = nil
     var upperLimitConfidenceInterval: ClosedRange<Double>? = nil
+    /// Independent differences the intervals above are based on: the window count reduced
+    /// for autocorrelation between adjacent windows. Nil when no interval is given.
+    var effectiveSampleSize: Double? = nil
 }
 
 enum PairwiseEvidenceGrade: String, Hashable, Sendable {

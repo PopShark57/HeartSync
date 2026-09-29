@@ -458,17 +458,19 @@ struct HealthStoreRemovalTests {
         expectSelfConsistent(store, after: "prune at the boundary")
     }
 
-    @Test("Pruning removes future rows and clamps future source status")
+    @Test("Pruning removes future rows beyond the clock-skew allowance and clamps future source status")
     func pruneFutureRows() throws {
         let store = makeStore(sources: ["alpha"])
         store.append(contentsOf: [
             sample("alpha", 70, at: at(0)),
+            // A device clock a minute ahead is inside the five-minute allowance ingest gives.
             sample("alpha", 71, at: at(60)),
+            sample("alpha", 72, at: at(HealthStore.maximumFutureSkew + 60)),
         ])
 
         store.prune(now: anchor)
 
-        #expect(store.readings.map(\.value) == [70])
+        #expect(store.readings.map(\.value) == [70, 71])
         #expect(try #require(store.source(id: "alpha")).lastSeenAt == anchor)
     }
 

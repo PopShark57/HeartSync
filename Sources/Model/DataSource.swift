@@ -293,6 +293,18 @@ struct Reading: Identifiable, Codable, Hashable, Sendable {
         Date(timeIntervalSince1970: (start.timeIntervalSince1970 + end.timeIntervalSince1970) / 2)
     }
 
+    /// An average over an interval longer than its metric's comparison window: Oura's
+    /// whole-night heart rate, breathing rate, and HRV, or its daily SpO\u{2082}.
+    ///
+    /// Such a value belongs to its whole interval, not to the window around its midpoint.
+    /// Pairing it there would compare a night's mean with one minute of another device, so
+    /// `ComparisonEngine.windows` leaves it out by default, compaction never folds it into a
+    /// window median, and charts draw it as a span. A compacted median spans exactly one
+    /// window and is not one of these.
+    var isIntervalAverage: Bool {
+        end.timeIntervalSince(start) > kind.comparisonWindow
+    }
+
     /// Rejects values outside the metric's plausible range so obviously broken sensor
     /// frames never reach the comparison engine.
     var isPlausible: Bool { kind.plausibleRange.contains(value) }
