@@ -9,6 +9,8 @@ final class WatchCompanionPublisher {
     private weak var store: HealthStore?
     private var pending: Task<Void, Never>?
     private var lastPublished = Date.distantPast
+    /// Keeps the 24-hour, 7-day, and 30-day periods between publications.
+    private let chartCache = WatchChartCache()
 
     func start(store: HealthStore, onRefresh: @escaping @MainActor () -> Void) {
         guard self.store == nil else { return }
@@ -23,7 +25,7 @@ final class WatchCompanionPublisher {
         pending?.cancel()
         pending = nil
         guard connection.isInstalled, let store else { return }
-        connection.publish(WatchSnapshotBuilder.make(store: store))
+        connection.publish(WatchSnapshotBuilder.make(store: store, cache: chartCache))
         lastPublished = .now
     }
 

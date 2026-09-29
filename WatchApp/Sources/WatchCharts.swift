@@ -50,6 +50,11 @@ struct WatchTrendChart: View {
         chart.series.map { Plotted(series: $0, points: WatchChartProjection.points(for: $0, in: chart)) }
     }
 
+    /// The period the axis labels describe; an older iPhone sends none, so infer it.
+    private var axisRange: WatchChartRange {
+        chart.range ?? WatchChartRange.allCases.first { $0.duration >= chart.span - chart.bucket } ?? .month
+    }
+
     var body: some View {
         Chart {
             ForEach(plotted) { entry in
@@ -80,8 +85,19 @@ struct WatchTrendChart: View {
         }
         .chartXScale(domain: chart.start...chart.end)
         .chartYScale(domain: WatchChartProjection.valueDomain(kind: kind, chart: chart))
-        .chartXAxis(compact ? .hidden : .automatic)
-        .chartYAxis(compact ? .hidden : .automatic)
+        // Round local times, short labels, and none at the edges: a date and a time together
+        // cannot fit under a watch plot.
+        .chartXAxis {
+            AxisMarks(values: WatchChartProjection.axisTicks(range: axisRange, start: chart.start, end: chart.end)) { _ in
+                AxisGridLine()
+                AxisValueLabel(format: WatchChartProjection.axisFormat(for: axisRange))
+            }
+        }
+        .chartYAxis {
+            AxisMarks(position: .trailing, values: .automatic(desiredCount: 3))
+        }
+        .chartXAxis(compact ? .hidden : .visible)
+        .chartYAxis(compact ? .hidden : .visible)
         .chartLegend(.hidden)
         .frame(height: compact ? 30 : 110)
         .privacySensitive()
@@ -173,18 +189,55 @@ struct WatchVerdictLabel: View {
     }
 }
 
+/// Chooses the comparison period, like iPhone's 1H/24H/7D/30D control. Periods the iPhone
+/// did not send for this metric (a daily metric has no 1H) are shown but disabled.
+struct WatchRangePicker: View {
+    @Binding var selection: WatchChartRange
+    let available: [WatchChartRange]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(WatchChartRange.allCases) { range in
+                let isSelected = range == selection
+                let isAvailable = available.contains(range)
+                Button {
+                    selection = range
+                } label: {
+                    Text(range.rawValue)
+                        .font(.caption2.weight(isSelected ? .bold : .regular))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .background(
+                            Capsule().fill(isSelected ? Color.pink.opacity(0.45) : Color.gray.opacity(0.22))
+                        )
+                }
+                .buttonStyle(.borderless)
+                .disabled(!isAvailable)
+                .opacity(isAvailable ? 1 : 0.35)
+                .accessibilityLabel(range.spokenTitle)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+            }
+        }
+    }
+}
+
+/// The period the watch shows everywhere, remembered between launches.
+enum WatchRangeSelection {
+    static let storageKey = "watch.chart.range"
+}
+
 /// The wrist counterpart of iPhone's Compare tab: every metric with two or more sources,
-/// its verdict, and the leading pair's mean difference.
+/// its verdict for the chosen period, and the leading pair's mean difference.
 struct WatchCompareView: View {
     let connection: CompanionSession
+    @AppStorage(WatchRangeSelection.storageKey) private var selectedRange: WatchChartRange = .standard
 
     var body: some View {
         List {
             if let snapshot = connection.snapshot, snapshot.availability == .ready {
-                let compared = snapshot.metrics.filter {
-                    $0.readings.count + $0.omittedSourceCount >= 2
-                        || $0.comparison.readyPairs + $0.comparison.incompletePairs > 0
-                }
+                let compared = snapshot.metrics.filter(Self.isCompared)
                 if compared.isEmpty {
                     Section {
                         Label("Nothing to compare yet", systemImage: "square.split.2x1")
@@ -193,11 +246,13 @@ struct WatchCompareView: View {
                     }
                 } else {
                     Section {
+                        WatchRangePicker(selection: $selectedRange, available: WatchChartRange.allCases)
+                            .listRowBackground(Color.clear)
                         ForEach(compared) { metric in
                             NavigationLink {
                                 WatchMetricDetailView(metric: metric, generatedAt: snapshot.generatedAt)
                             } label: {
-                                WatchCompareRow(metric: metric)
+                                WatchCompareRow(metric: metric, selection: selectedRange)
                             }
                         }
                     } footer: {
@@ -214,27 +269,50 @@ struct WatchCompareView: View {
         }
         .navigationTitle("Compare")
     }
+
+    /// Two or more sources now, or pairs in any period.
+    private static func isCompared(_ metric: WatchMetric) -> Bool {
+        if metric.readings.count + metric.omittedSourceCount >= 2 { return true }
+        let comparisons = [metric.comparison] + metric.allCharts.compactMap(\.comparison)
+        return comparisons.contains { $0.readyPairs + $0.incompletePairs > 0 }
+    }
 }
 
 private struct WatchCompareRow: View {
     let metric: WatchMetric
+    let selection: WatchChartRange
     @Environment(\.isLuminanceReduced) private var isLuminanceReduced
+
+    /// The chosen period, or the nearest one this metric has (a daily metric has no 1H).
+    private var range: WatchChartRange? {
+        WatchChartRange.resolved(selection, among: metric.availableRanges ?? [])
+    }
+
+    private var chart: WatchChart? {
+        range.flatMap(metric.periodChart) ?? (metric.availableRanges == nil ? metric.chart : nil)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label(metric.kind.title, systemImage: metric.kind.systemImage)
-                .font(.caption)
-                .foregroundStyle(isLuminanceReduced ? AnyShapeStyle(.secondary) : AnyShapeStyle(metric.kind.tint))
-            WatchVerdictLabel(comparison: metric.comparison)
+            HStack {
+                Label(metric.kind.title, systemImage: metric.kind.systemImage)
+                    .foregroundStyle(isLuminanceReduced ? AnyShapeStyle(.secondary) : AnyShapeStyle(metric.kind.tint))
+                if let range, range != selection {
+                    Spacer(minLength: 2)
+                    Text(range.rawValue).foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption)
+            WatchVerdictLabel(comparison: range.map(metric.periodComparison) ?? metric.comparison)
                 .font(.caption2)
-            if let pair = metric.chart?.pair {
+            if let pair = chart?.pair {
                 Text("\(pair.sourceA) \u{2212} \(pair.sourceB): \(WatchChartProjection.signed(pair.meanBias, kind: metric.kind))")
                     .font(.caption2).monospacedDigit()
                     .lineLimit(2)
                     .privacySensitive()
             }
-            if !isLuminanceReduced, let chart = metric.chart {
-                WatchTrendChart(kind: metric.kind, chart: chart, lookback: metric.comparison.lookback, compact: true)
+            if !isLuminanceReduced, let chart, !chart.series.isEmpty {
+                WatchTrendChart(kind: metric.kind, chart: chart, lookback: chart.comparison?.lookback ?? metric.comparison.lookback, compact: true)
             }
         }
         .accessibilityElement(children: .combine)

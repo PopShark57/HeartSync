@@ -220,11 +220,20 @@ snapshot from the paired iPhone and always labels measurement time separately fr
 
 - `WatchSnapshotBuilder` uses `HealthStore` indexed queries and `ComparisonEngine`. Only the
   four most recent sources per metric are displayed, but comparisons include every enabled
-  source. Comparison and chart spans are six hours for fast metrics and seven days for daily
-  metrics. `WatchMetric.chart` is optional (either app may be older) and carries each shown
-  source's window medians, its iPhone palette colour and shape, and one ready pair's
-  Bland–Altman figures; a pair below five paired windows is never sent. `fitted` drops charts
-  rather than exceed the 60 KB cap. Watch charts break at gaps, dash estimates, use neutral
+  source. The watch offers iPhone's 1H/24H/7D/30D periods (`WatchChartRange`; a daily metric
+  only 7D and 30D). `WatchMetric.chart` and `comparison` carry the standard period (24H, or 7D
+  for daily metrics) so an older watch still works; `rangeCharts` carry the others and
+  `availableRanges` lists what was computed, so a listed period without a chart means no
+  readings, never agreement. Each chart holds its own `comparison`, each shown source's window
+  medians (about 30 per period, whole multiples of the comparison window), its iPhone palette
+  colour and the shape `MetricDetailSnapshot.symbols(for:)` gives it, and one ready pair's
+  Bland–Altman figures; a pair below five paired windows is never sent. `WatchChartCache`
+  (owned by the publisher) reuses 24H for 2 min, 7D for 15 min, and 30D for 60 min, and drops
+  an entry at once when shown or enabled sources change or `HealthStore.removalGeneration`
+  advances (deletions, source removal, retention, reset, reload; not estimate
+  reconciliation). `fitted` drops 30D, then 7D, then 1H, then 24H charts rather than exceed
+  the 60 KB cap. Watch charts label the x axis with round local times inside the plot edges
+  (`WatchChartProjection.axisTicks`/`axisFormat`), break at gaps, dash estimates, use neutral
   reference inks, and are hidden in Always On. The watch never recomputes statistics.
 - `WatchCompanionPublisher` observes source changes, reading generations, and load state;
   it coalesces ordinary publications to at most once every 30 seconds while iOS is running.
@@ -569,9 +578,11 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   measurement, sensor codes, the history request against a published capture, history
   transfer (acknowledgement, empty types, bad CRC, silence, cancel, overflow), record
   decoding, clock guards, local wall-clock conversion, estimate provenance, and stable IDs.
-- `Tests/Watch/WatchChartTests.swift`: 12 tests covering chart payload compatibility and
-  validation, periods and windows, palette colours and shapes, pair choice and threshold,
-  estimate marking, oversized-chart fallback, gap segmentation, domains, and spoken text.
+- `Tests/Watch/WatchChartTests.swift`: 18 tests covering chart payload compatibility and
+  validation, the 1H/24H/7D/30D periods and their windows, per-period evidence, empty periods,
+  the long-period cache and its invalidation, palette colours and shared-slot shapes, pair
+  choice and threshold, estimate marking, the size drop order, axis ticks, gap segmentation,
+  domains, and spoken text.
 - `Tests/RingSessionTests.swift`: 25 tests covering the YCBT codec (CRC check value,
   framing, reassembly, bad CRC and length), topology selection, subscription gating,
   identification, warm-up and completion, no contact, rejection, timeouts, cancel and repeat,

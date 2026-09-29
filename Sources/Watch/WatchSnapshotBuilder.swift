@@ -4,29 +4,29 @@ import Foundation
 /// engine. A row limit bounds transport size, never the inputs to comparison statistics.
 @MainActor
 enum WatchSnapshotBuilder {
-    /// The period the wrist compares and charts: the past six hours for fast metrics, and at
-    /// least seven windows for daily ones. Six hours keeps a 1 Hz source's read bounded on
-    /// the 30-second publication cadence while still showing a morning's spot readings.
-    static func lookback(for kind: MetricKind) -> TimeInterval {
-        kind.comparisonWindow >= 86_400 ? 7 * 86_400 : 6 * 3_600
-    }
+    /// About this many chart windows per source and period.
+    static let targetChartPoints = 30
 
-    /// About this many chart windows per source.
-    static let targetChartPoints = 48
+    /// The period of `WatchMetric.chart` and `WatchMetric.comparison`: 24 hours for fast
+    /// metrics, seven days for daily ones.
+    static func standardRange(for kind: MetricKind) -> WatchChartRange {
+        WatchChartRange.resolved(.standard, among: WatchChartRange.available(for: kind)) ?? .month
+    }
 
     /// The chart window: a whole multiple of the comparison window, so every paired window
     /// falls inside exactly one chart window and no difference plots before the chart starts.
-    static func chartBucket(for kind: MetricKind) -> TimeInterval {
+    static func chartBucket(for kind: MetricKind, range: WatchChartRange) -> TimeInterval {
         let window = kind.comparisonWindow
-        let multiple = (lookback(for: kind) / Double(targetChartPoints) / window).rounded(.up)
+        let multiple = (range.duration / Double(targetChartPoints) / window).rounded(.up)
         return window * max(1, multiple)
     }
 
-    static func make(store: HealthStore, now: Date = .now) -> WatchSnapshot {
+    static func make(store: HealthStore, now: Date = .now, cache: WatchChartCache? = nil) -> WatchSnapshot {
         guard store.loadState == .loaded else {
             return WatchSnapshot(generatedAt: now, availability: .unavailable, metrics: [])
         }
         let sources = store.enabledSources
+        let enabledIDs = sources.map(\.id).sorted().joined(separator: ",")
         let metrics = MetricKind.allCases.compactMap { kind -> WatchMetric? in
             let latest = sources.compactMap { source -> (source: DataSource, reading: WatchSourceReading)? in
                 guard let reading = store.latest(kind: kind, sourceID: source.id),
@@ -45,33 +45,79 @@ enum WatchSnapshotBuilder {
                 return $0.reading.id < $1.reading.id
             }
             guard !latest.isEmpty else { return nil }
-            let period = Self.lookback(for: kind)
-            let range = DateInterval(start: now.addingTimeInterval(-period), end: now)
-            let readings = store.readings(kind: kind, in: range)
-            let analyses = ComparisonEngine.allPairwiseAnalyses(from: readings, kind: kind, range: range)
-            let overview = PairwiseEvidenceOverview(analyses: analyses)
             let shown = Array(latest.prefix(WatchSnapshot.maximumSourcesPerMetric))
+            let shownSources = shown.map(\.source)
+            // Anything that changes what a cached period would draw or compare.
+            let fingerprint = enabledIDs + "|" + shownSources
+                .map { "\($0.id)\u{001F}\($0.displayName)\u{001F}\($0.colorIndex)" }
+                .joined(separator: "\u{001E}")
+
+            let ranges = WatchChartRange.available(for: kind)
+            var results: [WatchChartRange: PeriodResult] = [:]
+            for range in ranges {
+                let key = WatchChartCache.Key(kind: kind, range: range)
+                if let cached = cache?.result(for: key, now: now, fingerprint: fingerprint, removals: store.removalGeneration) {
+                    results[range] = cached
+                    continue
+                }
+                let result = period(kind: kind, range: range, now: now, shown: shownSources, store: store)
+                cache?.store(result, for: key, at: now, fingerprint: fingerprint, removals: store.removalGeneration)
+                results[range] = result
+            }
+            let standard = standardRange(for: kind)
+            let primary = results[standard]
             return WatchMetric(
                 kind: kind,
                 readings: shown.map(\.reading),
                 omittedSourceCount: max(0, latest.count - WatchSnapshot.maximumSourcesPerMetric),
-                comparison: WatchComparison(
-                    readyPairs: overview.readyCount,
-                    incompletePairs: overview.incompleteCount,
-                    outsideTolerancePairs: overview.outsideToleranceCount,
-                    lookback: period
+                comparison: primary?.comparison ?? WatchComparison(
+                    readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: standard.duration
                 ),
-                chart: chart(
-                    kind: kind,
-                    readings: readings,
-                    range: range,
-                    analyses: analyses,
-                    shown: shown.map(\.source),
-                    store: store
-                )
+                chart: primary?.chart,
+                rangeCharts: ranges.filter { $0 != standard }.compactMap { results[$0]?.chart },
+                availableRanges: ranges
             )
         }
         return fitted(WatchSnapshot(generatedAt: now, metrics: metrics))
+    }
+
+    // MARK: Periods
+
+    /// One period's evidence and chart. The chart is nil only when neither a shown source
+    /// nor any pair has data in the period.
+    struct PeriodResult: Equatable, Sendable {
+        var comparison: WatchComparison
+        var chart: WatchChart?
+    }
+
+    static func period(
+        kind: MetricKind,
+        range: WatchChartRange,
+        now: Date,
+        shown: [DataSource],
+        store: HealthStore
+    ) -> PeriodResult {
+        let interval = DateInterval(start: now.addingTimeInterval(-range.duration), end: now)
+        let readings = store.readings(kind: kind, in: interval)
+        let analyses = ComparisonEngine.allPairwiseAnalyses(from: readings, kind: kind, range: interval)
+        let overview = PairwiseEvidenceOverview(analyses: analyses)
+        let comparison = WatchComparison(
+            readyPairs: overview.readyCount,
+            incompletePairs: overview.incompleteCount,
+            outsideTolerancePairs: overview.outsideToleranceCount,
+            lookback: range.duration
+        )
+        var chart = self.chart(
+            kind: kind,
+            range: range,
+            readings: readings,
+            interval: interval,
+            analyses: analyses,
+            shown: shown,
+            store: store
+        )
+        chart?.comparison = comparison
+        return PeriodResult(comparison: comparison, chart: chart)
     }
 
     // MARK: Charts
@@ -80,23 +126,27 @@ enum WatchSnapshotBuilder {
     /// agreement of the most informative ready pair.
     static func chart(
         kind: MetricKind,
+        range: WatchChartRange,
         readings: [Reading],
-        range: DateInterval,
+        interval: DateInterval,
         analyses: [PairwiseAnalysis],
         shown: [DataSource],
         store: HealthStore
     ) -> WatchChart? {
-        let bucket = chartBucket(for: kind)
-        let start = Date(timeIntervalSince1970: (range.start.timeIntervalSince1970 / bucket).rounded(.down) * bucket)
-        guard start < range.end else { return nil }
+        let bucket = chartBucket(for: kind, range: range)
+        let start = Date(timeIntervalSince1970: (interval.start.timeIntervalSince1970 / bucket).rounded(.down) * bucket)
+        guard start < interval.end else { return nil }
         let windows = ComparisonEngine.windows(
             from: readings,
             kind: kind,
             windowSize: bucket,
-            range: range,
+            range: interval,
             includeEstimated: true
         )
-        let series = shown.compactMap { source -> WatchChartSeries? in
+        // The iPhone's rule: past six devices two sources can share a colour, and then the
+        // later one takes a free shape, so they never look identical.
+        let symbols = MetricDetailSnapshot.symbols(for: shown)
+        let series = zip(shown, symbols).compactMap { source, symbol -> WatchChartSeries? in
             var offsets: [Int] = []
             var values: [Double] = []
             var estimated = false
@@ -109,27 +159,26 @@ enum WatchSnapshotBuilder {
                 estimated = estimated || value.provenance == .estimated
             }
             guard !values.isEmpty else { return nil }
-            let slot = DataSource.paletteSlots[
-                ((source.colorIndex % DataSource.paletteSlots.count) + DataSource.paletteSlots.count)
-                    % DataSource.paletteSlots.count
-            ]
+            let count = DataSource.paletteSlots.count
+            let slot = DataSource.paletteSlots[((source.colorIndex % count) + count) % count]
             return WatchChartSeries(
                 id: watchID(for: source),
                 sourceName: displayName(source),
                 color: WatchColor(red: slot.dark.red, green: slot.dark.green, blue: slot.dark.blue),
-                symbol: SourceSymbol.forColorIndex(source.colorIndex).rawValue,
+                symbol: symbol.rawValue,
                 isEstimated: estimated,
                 offsets: offsets,
                 values: values
             )
         }
-        guard !series.isEmpty else { return nil }
+        guard !series.isEmpty || !analyses.isEmpty else { return nil }
         return WatchChart(
             start: start,
-            end: range.end,
+            end: interval.end,
             bucket: bucket,
             series: series,
-            pair: pairAgreement(analyses: analyses, chartStart: start, store: store)
+            pair: pairAgreement(analyses: analyses, chartStart: start, store: store),
+            range: range
         )
     }
 
@@ -156,7 +205,7 @@ enum WatchSnapshotBuilder {
         }
         guard let chosen, chosen.0.pairedWindowCount >= WatchPairAgreement.minimumPairedWindows else { return nil }
         let (analysis, statistics) = chosen
-        let plotted = analysis.plotSample(limit: 36, extremes: 4)
+        let plotted = analysis.plotSample(limit: 32, extremes: 4)
             .suffix(WatchChart.maximumDifferencePoints)
         return WatchPairAgreement(
             sourceA: String(store.displayName(forSource: analysis.sourceA).prefix(100)),
@@ -171,15 +220,42 @@ enum WatchSnapshotBuilder {
         )
     }
 
-    /// Keeps the payload under its cap. Charts are the only optional part, so they are
-    /// dropped from the last metrics first; readings and verdicts always travel.
+    /// Longest periods are dropped first, from the last metric backwards, so the payload
+    /// stays under its cap. Readings, the default comparison, and the period list always
+    /// travel; a dropped period shows "open HeartSync on iPhone" rather than a false empty.
+    static let dropOrder: [WatchChartRange] = [.month, .week, .hour, .day]
+
     static func fitted(_ snapshot: WatchSnapshot) -> WatchSnapshot {
         var snapshot = snapshot
-        while (try? snapshot.encoded()) == nil,
-              let index = snapshot.metrics.lastIndex(where: { $0.chart != nil }) {
+        guard (try? snapshot.encoded()) == nil else { return snapshot }
+        for range in dropOrder {
+            for index in snapshot.metrics.indices.reversed() {
+                guard snapshot.metrics[index].periodChart(range) != nil
+                        || (range == .day && snapshot.metrics[index].chart != nil)
+                else { continue }
+                remove(range, from: &snapshot.metrics[index])
+                if (try? snapshot.encoded()) != nil { return snapshot }
+            }
+        }
+        // Still invalid: drop every chart, including any the rules above did not reach.
+        for index in snapshot.metrics.indices {
             snapshot.metrics[index].chart = nil
+            snapshot.metrics[index].rangeCharts = nil
+            snapshot.metrics[index].availableRanges = nil
         }
         return snapshot
+    }
+
+    private static func remove(_ range: WatchChartRange, from metric: inout WatchMetric) {
+        if metric.chart?.range == range || (range == .day && metric.chart?.range == nil) {
+            metric.chart = nil
+        }
+        metric.rangeCharts?.removeAll { $0.range == range }
+        // The period is no longer described, so it must not read as "no readings".
+        let stillDrawn = metric.periodChart(range) != nil
+        if !stillDrawn {
+            metric.availableRanges?.removeAll { $0 == range }
+        }
     }
 
     // MARK: Helpers
@@ -199,5 +275,56 @@ enum WatchSnapshotBuilder {
 
     private static func roundedTenth(_ value: Double) -> Double {
         (value * 10).rounded() / 10
+    }
+}
+
+/// Keeps the slower periods between publications. The watch payload is rebuilt at most every
+/// 30 seconds; re-reading 30 days of a 1 Hz sensor that often would stall the main actor.
+///
+/// A period is reused until its refresh interval passes, the shown or enabled sources change
+/// (rename, hide, colour), or the store removes anything (`removalGeneration`: deletions,
+/// source removal, retention, reset, reload). New readings alone wait for the interval; each
+/// chart's `end` tells the wrist how current it is.
+@MainActor
+final class WatchChartCache {
+    struct Key: Hashable, Sendable {
+        var kind: MetricKind
+        var range: WatchChartRange
+    }
+
+    private struct Entry {
+        var result: WatchSnapshotBuilder.PeriodResult
+        var builtAt: Date
+        var fingerprint: String
+        var removals: Int
+    }
+
+    private var entries: [Key: Entry] = [:]
+
+    static func refreshInterval(for range: WatchChartRange) -> TimeInterval {
+        switch range {
+        case .hour:  0
+        case .day:   2 * 60
+        case .week:  15 * 60
+        case .month: 60 * 60
+        }
+    }
+
+    func result(for key: Key, now: Date, fingerprint: String, removals: Int) -> WatchSnapshotBuilder.PeriodResult? {
+        guard let entry = entries[key],
+              entry.fingerprint == fingerprint,
+              entry.removals == removals,
+              now >= entry.builtAt,
+              now.timeIntervalSince(entry.builtAt) < Self.refreshInterval(for: key.range)
+        else { return nil }
+        return entry.result
+    }
+
+    func store(_ result: WatchSnapshotBuilder.PeriodResult, for key: Key, at now: Date, fingerprint: String, removals: Int) {
+        entries[key] = Entry(result: result, builtAt: now, fingerprint: fingerprint, removals: removals)
+    }
+
+    func removeAll() {
+        entries.removeAll()
     }
 }

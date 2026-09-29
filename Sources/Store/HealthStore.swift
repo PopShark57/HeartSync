@@ -86,6 +86,10 @@ final class HealthStore {
     private var dataGeneration = 0
     /// Observed invalidation token for bounded external display projections.
     var changeToken: Int { dataGeneration }
+    /// Advances only when readings or a source are removed, or history is reloaded, so a
+    /// cache of a slow projection (the watch's 7- and 30-day charts) can survive ordinary
+    /// appends yet never show deleted data. Estimate reconciliation does not advance it.
+    private(set) var removalGeneration = 0
     private var unavailableBuffer: [Reading] = []
     private var bufferedIDs: Set<UUID> = []
 
@@ -234,6 +238,7 @@ final class HealthStore {
             catch { record(error) }
         }
         dataGeneration &+= 1
+        removalGeneration &+= 1
         return true
     }
 
@@ -391,6 +396,7 @@ final class HealthStore {
                 )
                 rewindCompactionIfNeeded(for: changed)
                 dataGeneration &+= (!changed.isEmpty || sourcesChanged || removed > 0) ? 1 : 0
+                removalGeneration &+= removed > 0 ? 1 : 0
                 return BatchCommitResult(acceptedReadings: changed, committed: true)
             } catch {
                 sources = sourcesBeforeCommit
@@ -416,6 +422,7 @@ final class HealthStore {
         do {
             let removed = try database?.removeReadingIDs(ids) ?? 0
             dataGeneration &+= removed > 0 ? 1 : 0
+            removalGeneration &+= removed > 0 ? 1 : 0
             return removed
         } catch {
             record(error)
@@ -628,6 +635,7 @@ final class HealthStore {
             }
             let removed = try database.prune(cutoff: cutoff, now: now, sources: sources)
             dataGeneration &+= removed > 0 ? 1 : 0
+            removalGeneration &+= removed > 0 ? 1 : 0
             return true
         } catch {
             sources = originalSources
@@ -790,6 +798,7 @@ final class HealthStore {
             lastPersistenceError = nil
             compactionCursor = nil
             dataGeneration &+= 1
+            removalGeneration &+= 1
             prune()
             logger.info("Loaded \(self.readingCount) readings across \(self.sources.count) sources")
         } catch {
@@ -832,6 +841,7 @@ final class HealthStore {
         do {
             try database?.deleteAllReadings(sources: sources)
             dataGeneration &+= 1
+            removalGeneration &+= 1
             return true
         } catch {
             sources = originalSources

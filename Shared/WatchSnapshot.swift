@@ -56,9 +56,11 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
                       reading.timestamp <= generatedAt.addingTimeInterval(60)
                 else { throw PayloadError.invalid }
             }
-            if let chart = metric.chart {
-                guard chart.isValid(for: metric.kind, generatedAt: generatedAt) else { throw PayloadError.invalid }
-            }
+            let charts = metric.allCharts
+            guard charts.count <= WatchChartRange.allCases.count,
+                  Set(charts.compactMap(\.range)).count == charts.compactMap(\.range).count,
+                  charts.allSatisfy({ $0.isValid(for: metric.kind, generatedAt: generatedAt) })
+            else { throw PayloadError.invalid }
         }
     }
 
@@ -88,7 +90,74 @@ struct WatchMetric: Codable, Equatable, Identifiable, Sendable {
     /// directions stay compatible: an older iPhone build sends none (the watch says so), and
     /// an older watch build ignores the key.
     var chart: WatchChart? = nil
+    /// The other periods' charts (1H, 7D, 30D beside the 24H `chart`; 30D beside 7D for daily
+    /// metrics). Nil from an iPhone build without period choice.
+    var rangeCharts: [WatchChart]? = nil
+    /// The periods the iPhone computed. A listed period without a chart had no readings.
+    /// Nil from an iPhone build without period choice.
+    var availableRanges: [WatchChartRange]? = nil
     var id: MetricKind { kind }
+
+    var allCharts: [WatchChart] { (chart.map { [$0] } ?? []) + (rangeCharts ?? []) }
+
+    func periodChart(_ range: WatchChartRange) -> WatchChart? {
+        allCharts.first { $0.range == range }
+    }
+
+    /// The comparison counts for a period: the chart's own, else the snapshot's default
+    /// counts when that period is the default, else an explicit "no evidence".
+    func periodComparison(_ range: WatchChartRange) -> WatchComparison {
+        if let own = periodChart(range)?.comparison { return own }
+        if comparison.lookback == range.duration { return comparison }
+        return WatchComparison(readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: range.duration)
+    }
+}
+
+/// The periods the watch can compare over, matching iPhone's 1H, 24H, 7D, and 30D presets.
+enum WatchChartRange: String, Codable, CaseIterable, Identifiable, Sendable {
+    case hour = "1H"
+    case day = "24H"
+    case week = "7D"
+    case month = "30D"
+
+    /// Shown first, and the period of `WatchMetric.chart` for fast metrics.
+    static let standard = WatchChartRange.day
+
+    var id: String { rawValue }
+
+    var duration: TimeInterval {
+        switch self {
+        case .hour:  3_600
+        case .day:   86_400
+        case .week:  604_800
+        case .month: 2_592_000
+        }
+    }
+
+    var spokenTitle: String {
+        switch self {
+        case .hour:  "Past hour"
+        case .day:   "Past 24 hours"
+        case .week:  "Past 7 days"
+        case .month: "Past 30 days"
+        }
+    }
+
+    /// A period must hold at least two of the metric's comparison windows; a daily metric
+    /// therefore offers only 7D and 30D.
+    func isAvailable(for kind: MetricKind) -> Bool {
+        duration >= 2 * kind.comparisonWindow
+    }
+
+    static func available(for kind: MetricKind) -> [WatchChartRange] {
+        allCases.filter { $0.isAvailable(for: kind) }
+    }
+
+    /// `selection` when offered, else the next longer offered period, else the longest.
+    static func resolved(_ selection: WatchChartRange, among available: [WatchChartRange]) -> WatchChartRange? {
+        if available.contains(selection) { return selection }
+        return available.first { $0.duration >= selection.duration } ?? available.last
+    }
 }
 
 struct WatchSourceReading: Codable, Equatable, Identifiable, Sendable {
@@ -126,6 +195,11 @@ struct WatchChart: Codable, Equatable, Sendable {
     var series: [WatchChartSeries]
     /// Nil until some pair has at least five paired windows. Never implies agreement.
     var pair: WatchPairAgreement?
+    /// Nil from an iPhone build without period choice.
+    var range: WatchChartRange? = nil
+    /// Evidence for exactly this period. `end` is when it was computed, which can trail the
+    /// snapshot for the longer periods.
+    var comparison: WatchComparison? = nil
 
     var span: TimeInterval { end.timeIntervalSince(start) }
 
@@ -136,6 +210,16 @@ struct WatchChart: Codable, Equatable, Sendable {
               series.count <= WatchSnapshot.maximumSourcesPerMetric,
               Set(series.map(\.id)).count == series.count
         else { return false }
+        if let range {
+            guard span <= range.duration + bucket + 1 else { return false }
+        }
+        if let comparison {
+            guard comparison.readyPairs >= 0, comparison.incompletePairs >= 0,
+                  comparison.outsideTolerancePairs >= 0,
+                  comparison.outsideTolerancePairs <= comparison.readyPairs,
+                  comparison.lookback.isFinite, comparison.lookback > 0
+            else { return false }
+        }
         let maximumOffset = Int(span.rounded(.up))
         for item in series {
             guard !item.id.isEmpty, item.id.count <= 160,
