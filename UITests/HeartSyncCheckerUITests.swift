@@ -61,10 +61,11 @@ final class HeartSyncCheckerUITests: XCTestCase {
         return chart
     }
 
-    override func tearDown() {
-        // A test that rotated the device must not leave the next one in landscape.
-        XCUIDevice.shared.orientation = .portrait
-        super.tearDown()
+    override func tearDown() async throws {
+        // A test that rotated the device must not leave the next one in landscape. The device
+        // object is main-actor isolated, and the synchronous tearDown is not.
+        await MainActor.run { XCUIDevice.shared.orientation = .portrait }
+        try await super.tearDown()
     }
 
     private func waitForDisappearance(of candidate: XCUIElement, timeout: TimeInterval = 5) -> Bool {
@@ -152,6 +153,19 @@ final class HeartSyncCheckerUITests: XCTestCase {
         XCTAssertFalse(row.waitForExistence(timeout: 1))
     }
 
+    /// Dismisses a confirmation dialog without choosing an action. iOS 18 shows a Cancel button
+    /// in an iPhone dialog; later releases show none and dismiss on a tap outside it, so the
+    /// button is used when it exists and a tap on the dimmed background when it does not.
+    private func dismissConfirmationDialog(in application: XCUIApplication, confirm action: XCUIElement) {
+        let cancel = application.buttons["Cancel"]
+        if cancel.waitForExistence(timeout: 1) {
+            cancel.tap()
+        } else {
+            application.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)).tap()
+        }
+        XCTAssertTrue(waitForDisappearance(of: action, timeout: 3), "The dialog did not dismiss")
+    }
+
     /// Reads a combined element's spoken text, whichever of label and value carries it.
     private func spokenText(_ candidate: XCUIElement) -> String {
         "\(candidate.label) \((candidate.value as? String) ?? "")"
@@ -186,7 +200,8 @@ final class HeartSyncCheckerUITests: XCTestCase {
         )).firstMatch.exists)
 
         // Cancel leaves the device and every stored reading in place.
-        application.buttons["Cancel"].tap()
+        dismissConfirmationDialog(in: application, confirm: confirm)
+        XCTAssertFalse(confirm.exists)
         XCTAssertTrue(strap.waitForExistence(timeout: 2))
         application.buttons["Settings"].tap()
         XCTAssertTrue(scrollToElement(stored, in: application))

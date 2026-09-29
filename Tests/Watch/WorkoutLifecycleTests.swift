@@ -84,7 +84,7 @@ struct WorkoutLifecycleTests {
         #expect(result10)
         #expect(lifecycle.phase == .paused)
 
-        var (review, _) = reviewing()
+        let (review, _) = reviewing()
         #expect(review.pauseAction() == .ignore)
     }
 
@@ -130,6 +130,45 @@ struct WorkoutLifecycleTests {
         // The new session still works.
         let result19 = lifecycle.applyPaused(new)
         #expect(result19)
+        #expect(lifecycle.phase == .paused)
+    }
+
+    @Test("Events delivered out of order cannot move a reviewed workout back")
+    func outOfOrderEventsAreRefused() {
+        // WatchWorkoutManager applies delegate events one at a time, in the order HealthKit
+        // called them. If one still arrived late, the lifecycle refuses to be dragged back.
+        var (lifecycle, token) = collecting()
+        let paused = lifecycle.applyPaused(token)
+        let stopped = lifecycle.beginStop()
+        let reviewing = lifecycle.beginReview(token, at: .now, elapsed: 60)
+        #expect(paused)
+        #expect(stopped)
+        #expect(reviewing)
+        lifecycle.completeReview(elapsed: 60, failure: nil)
+        #expect(lifecycle.phase == .review)
+
+        // A resume that HealthKit sent before the stop, applied after it.
+        let lateResume = lifecycle.applyRunning(token)
+        // A pause that arrives after the workout ended.
+        let latePause = lifecycle.applyPaused(token)
+        // A second "ended" for the same workout.
+        let secondEnd = lifecycle.beginReview(token, at: .now, elapsed: 9_999)
+        #expect(!lateResume)
+        #expect(!latePause)
+        #expect(!secondEnd)
+        #expect(lifecycle.phase == .review)
+        #expect(lifecycle.finalDuration == 60)
+    }
+
+    @Test("A resume applied before its pause changes nothing, and the pause still lands")
+    func resumeBeforePauseIsHarmless() {
+        var (lifecycle, token) = collecting()
+        // Delivered as resume, then pause: the resume has nothing to resume.
+        let earlyResume = lifecycle.applyRunning(token)
+        #expect(!earlyResume)
+        #expect(lifecycle.phase == .running)
+        let pause = lifecycle.applyPaused(token)
+        #expect(pause)
         #expect(lifecycle.phase == .paused)
     }
 

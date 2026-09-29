@@ -38,11 +38,16 @@ enum TimeRange: String, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .hour:     "Last hour"
-        case .sixHours: "Last 6 hours"
-        case .day:      "Last 24 hours"
-        case .week:     "Last 7 days"
-        case .month:    "Last 30 days"
+        case .hour:
+            String(localized: "timeRange.title.hour", defaultValue: "Last hour", comment: "Comparison period: the past hour")
+        case .sixHours:
+            String(localized: "timeRange.title.sixHours", defaultValue: "Last 6 hours", comment: "Comparison period: the past six hours")
+        case .day:
+            String(localized: "timeRange.title.day", defaultValue: "Last 24 hours", comment: "Comparison period: the past day")
+        case .week:
+            String(localized: "timeRange.title.week", defaultValue: "Last 7 days", comment: "Comparison period: the past week")
+        case .month:
+            String(localized: "timeRange.title.month", defaultValue: "Last 30 days", comment: "Comparison period: the past 30 days")
         }
     }
 

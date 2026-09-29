@@ -136,10 +136,14 @@ enum WatchChartRange: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var spokenTitle: String {
         switch self {
-        case .hour:  "Past hour"
-        case .day:   "Past 24 hours"
-        case .week:  "Past 7 days"
-        case .month: "Past 30 days"
+        case .hour:
+            String(localized: "watch.spoken.pastHour", defaultValue: "Past hour", comment: "Spoken name of the 1H wrist chart period")
+        case .day:
+            String(localized: "watch.spoken.pastDay", defaultValue: "Past 24 hours", comment: "Spoken name of the 24H wrist chart period")
+        case .week:
+            String(localized: "watch.spoken.pastWeek", defaultValue: "Past 7 days", comment: "Spoken name of the 7D wrist chart period")
+        case .month:
+            String(localized: "watch.spoken.pastMonth", defaultValue: "Past 30 days", comment: "Spoken name of the 30D wrist chart period")
         }
     }
 

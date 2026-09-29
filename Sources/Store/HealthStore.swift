@@ -93,12 +93,26 @@ final class HealthStore {
     private var unavailableBuffer: [Reading] = []
     private var bufferedIDs: Set<UUID> = []
 
+    /// How long readings are kept. Setting it does not by itself permit deletion: pruning
+    /// waits for `confirmRetention`, so the default that a store starts with, or one read
+    /// from settings that could not be trusted, can never delete history.
     var retention: TimeInterval = 30 * 86_400
+    /// Whether `retention` came from a source that may delete data. A store that persists
+    /// starts unconfirmed; one that does not has no history worth protecting.
+    private(set) var retentionIsConfirmed: Bool
+    /// The retention, in days, that an untrusted source asked for while a longer one was on
+    /// record. Pruning stays paused until the user confirms a period in Settings.
+    private(set) var retentionHeldBackDays: Int?
+    static let retentionMetadataKey = "retention_days"
+    /// `lastSeenAt` moves in steps of at least this long. It is shown as "seen N seconds ago"
+    /// on the Devices list, and only a change a person can see is worth a re-render.
+    static let lastSeenResolution: TimeInterval = 15
     static let minimumCompactionAge: TimeInterval = 14 * 86_400
-    static let compactionSpanPerPass: TimeInterval = max(
-        3 * 86_400,
-        MetricKind.allCases.map(\.comparisonWindow).max() ?? 0
-    )
+    static let longestComparisonWindow: TimeInterval = MetricKind.allCases.map(\.comparisonWindow).max() ?? 0
+    static let compactionSpanPerPass: TimeInterval = max(3 * 86_400, longestComparisonWindow)
+    /// Passes one maintenance run may take, so a backlog clears in a few runs without one
+    /// run holding the main actor for a month of history.
+    static let maximumCompactionPassesPerMaintenance = 5
     private var compactionAgeStorage: TimeInterval = minimumCompactionAge
     var compactionAge: TimeInterval {
         get { compactionAgeStorage }
@@ -111,7 +125,7 @@ final class HealthStore {
     private(set) var recoveredCorruptCollections: [String] = []
     private(set) var lastPersistenceError: String?
 
-    private let persistenceEnabled: Bool
+    let persistenceEnabled: Bool
     private let archive: ReadingArchive
     private let configuredDatabaseURL: URL?
     private var database: HealthDatabase?
@@ -127,6 +141,7 @@ final class HealthStore {
         archive: ReadingArchive = .shared
     ) {
         self.persistenceEnabled = persistenceEnabled
+        self.retentionIsConfirmed = !persistenceEnabled
         self.archive = archive
         self.configuredDatabaseURL = databaseURL
         do {
@@ -174,12 +189,35 @@ final class HealthStore {
     func displayName(forSource id: String) -> String { source(id: id)?.displayName ?? "Unknown device" }
     var enabledSources: [DataSource] { sources.filter(\.isEnabled) }
 
+    /// The outcome of a change to the source list.
+    ///
+    /// A change is written first and published second, so a failed write leaves the list
+    /// exactly as it was and says so. The caller can then tell the user, instead of showing a
+    /// removal, rename, or pause that reverts at the next launch.
+    enum SourceMutationResult: Equatable, Sendable {
+        case applied
+        /// Nothing to change: the source is unknown or already in the requested state.
+        case unchanged
+        case failed(String)
+
+        var isFailure: Bool {
+            if case .failed = self { return true }
+            return false
+        }
+    }
+
+    private static let notLoadedDetail = "The health history has not finished loading."
+
     @discardableResult
     func upsert(_ source: DataSource) -> DataSource {
         let before = sources
         let stored = merge(source)
         guard sources != before else { return stored }
-        persistSourcesIfReady([stored])
+        if let detail = persistSourcesIfReady([stored]) {
+            sources = before
+            logger.error("Source update rolled back: \(detail, privacy: .public)")
+            return stored
+        }
         dataGeneration &+= 1
         return stored
     }
@@ -191,7 +229,7 @@ final class HealthStore {
         if let index = sources.firstIndex(where: { $0.id == source.id }) {
             var existing = sources[index]
             let now = Date.now
-            existing.displayName = source.displayName
+            if existing.displayNameIsUserChosen != true { existing.displayName = source.displayName }
             existing.model = source.model ?? existing.model
             existing.lastSeenAt = [existing.lastSeenAt, source.lastSeenAt]
                 .compactMap { boundedLastSeen($0, now: now) }
@@ -224,30 +262,64 @@ final class HealthStore {
         return stored
     }
 
-    @discardableResult
-    func remove(sourceID: String) -> Bool {
-        let sourceCount = sources.count
+    /// Deletes a source and all of its readings, database first.
+    ///
+    /// The list and the buffer change only after the delete has committed. Before startup has
+    /// finished the removal is refused: it would change memory alone, and the source and its
+    /// readings would return when the database loads.
+    func removeSourceResult(id sourceID: String) -> SourceMutationResult {
+        if persistenceEnabled, loadState != .loaded { return .failed(Self.notLoadedDetail) }
+        let inMemory = sources.contains { $0.id == sourceID }
+        let buffered = unavailableBuffer.contains { $0.sourceID == sourceID }
+        let storedRows = ((try? database?.sourceHistory(sourceID: sourceID))?.count ?? 0) > 0
+        guard inMemory || buffered || storedRows else { return .unchanged }
+        do { try database?.removeSource(id: sourceID) }
+        catch {
+            record(error)
+            return .failed(error.localizedDescription)
+        }
         sources.removeAll { $0.id == sourceID }
-        let bufferedCount = unavailableBuffer.count
         unavailableBuffer.removeAll { $0.sourceID == sourceID }
         bufferedIDs = Set(unavailableBuffer.map(\.id))
-        let existedInDatabase = ((try? database?.readings(sourceID: sourceID, limit: 1)) ?? []).isEmpty == false
-        guard sourceCount != sources.count || bufferedCount != unavailableBuffer.count || existedInDatabase else { return false }
-        if isReadyToPersist {
-            do { try database?.removeSource(id: sourceID) }
-            catch { record(error) }
-        }
         dataGeneration &+= 1
         removalGeneration &+= 1
-        return true
+        return .applied
     }
 
-    func setEnabled(_ enabled: Bool, forSource id: String) {
+    /// Compatibility spelling: true only when something was removed.
+    @discardableResult
+    func remove(sourceID: String) -> Bool {
+        removeSourceResult(id: sourceID) == .applied
+    }
+
+    /// Deletes every stored reading of one source and keeps the source itself.
+    @discardableResult
+    func removeReadings(forSource sourceID: String) -> Int {
+        guard isReadyToPersist else { return 0 }
+        do {
+            let removed = try database?.removeReadings(sourceID: sourceID) ?? 0
+            if removed > 0 {
+                dataGeneration &+= 1
+                removalGeneration &+= 1
+            }
+            return removed
+        } catch {
+            record(error)
+            return 0
+        }
+    }
+
+    @discardableResult
+    func setEnabled(_ enabled: Bool, forSource id: String) -> SourceMutationResult {
         mutateSource(id) { $0.isEnabled = enabled }
     }
 
-    func rename(sourceID: String, to name: String) {
-        mutateSource(sourceID) { $0.displayName = name }
+    @discardableResult
+    func rename(sourceID: String, to name: String) -> SourceMutationResult {
+        mutateSource(sourceID) {
+            $0.displayName = name
+            $0.displayNameIsUserChosen = true
+        }
     }
 
     func updateBattery(_ percent: Int, forSource id: String) {
@@ -266,13 +338,17 @@ final class HealthStore {
         mutateSource(sourceID) { $0.lastSeenAt = date }
     }
 
-    private func mutateSource(_ id: String, mutation: (inout DataSource) -> Void) {
-        guard let index = sources.firstIndex(where: { $0.id == id }) else { return }
-        let before = sources[index]
-        mutation(&sources[index])
-        guard sources[index] != before else { return }
-        persistSourcesIfReady([sources[index]])
+    @discardableResult
+    private func mutateSource(_ id: String, mutation: (inout DataSource) -> Void) -> SourceMutationResult {
+        guard let index = sources.firstIndex(where: { $0.id == id }) else { return .unchanged }
+        var updated = sources[index]
+        mutation(&updated)
+        guard updated != sources[index] else { return .unchanged }
+        if persistenceEnabled, loadState != .loaded { return .failed(Self.notLoadedDetail) }
+        if let detail = persistSourcesIfReady([updated]) { return .failed(detail) }
+        sources[index] = updated
         dataGeneration &+= 1
+        return .applied
     }
 
     private func nextColorIndex() -> Int {
@@ -430,18 +506,25 @@ final class HealthStore {
         }
     }
 
+    /// Removes HeartSync's own estimates that are no longer current.
+    ///
+    /// - Parameter sourceID: limits the sweep to the source that owns the estimates. Without
+    ///   it every estimated row of `kinds` is a candidate, which is only right for a metric
+    ///   no transport reports as an estimate.
     @discardableResult
     func reconcileEstimates(
         kinds: Set<MetricKind>,
         keeping validIDs: Set<UUID>,
-        currentSince: Date? = nil
+        currentSince: Date? = nil,
+        sourceID: String? = nil
     ) -> Int {
         guard isReadyToPersist || !persistenceEnabled else { return 0 }
         do {
             let removed = try database?.removeEstimates(
                 kinds: kinds,
                 keeping: validIDs,
-                currentSince: currentSince
+                currentSince: currentSince,
+                sourceID: sourceID
             ) ?? 0
             dataGeneration &+= removed > 0 ? 1 : 0
             return removed
@@ -576,6 +659,35 @@ final class HealthStore {
         }
     }
 
+    /// How many readings a fixed period holds for some sources, and which ones.
+    struct PeriodReadingSummary: Equatable, Sendable {
+        var count: Int
+        /// Identity summary of the rows counted; see `HealthDatabase.readingSummary`.
+        var fingerprint: Int64
+    }
+
+    /// Counts a session's own readings (its sources and metric) from the index, without
+    /// decoding them. A failure is returned, never a zero: a revisit notice that said
+    /// "unchanged" because the count could not be read would be false.
+    func periodSummaryOutcome(
+        interval: DateInterval,
+        sourceIDs: Set<String>?,
+        kind: MetricKind?
+    ) -> HealthStoreQueryOutcome<PeriodReadingSummary> {
+        _ = dataGeneration
+        guard loadState == .loaded || !persistenceEnabled else { return .failure(.notLoaded) }
+        return query { database in
+            var count = 0
+            var fingerprint: Int64 = 0
+            for metric in kind.map({ [$0] }) ?? MetricKind.allCases {
+                let part = try database.readingSummary(kind: metric, sourceIDs: sourceIDs, range: interval)
+                count += part.count
+                fingerprint &+= part.fingerprint
+            }
+            return PeriodReadingSummary(count: count, fingerprint: fingerprint)
+        }
+    }
+
     /// Whole-history read for the explicit export. Throws rather than returning an empty
     /// array so a failed query cannot be shared as an empty history.
     func allReadingsForExport() throws -> [Reading] {
@@ -611,29 +723,99 @@ final class HealthStore {
         var readingsEligibleForCompaction: Int
     }
 
+    /// What a retention of `days` would delete and what compaction would still fold, counted
+    /// in SQL on the `end` index rather than by decoding the history.
     func retentionImpact(days: Int, now: Date = .now) -> RetentionImpact {
         let cutoff = now.addingTimeInterval(-TimeInterval(days) * 86_400)
-        let all = readings
+        guard loadState == .loaded || !persistenceEnabled else {
+            return RetentionImpact(cutoff: cutoff, readingsDeleted: 0, readingsEligibleForCompaction: 0)
+        }
+        let counts = query { database in
+            (
+                try database.readingCount(endingBefore: cutoff),
+                try database.rawReadingCount(endingFrom: cutoff, before: now.addingTimeInterval(-compactionAge))
+            )
+        }.value
         return RetentionImpact(
             cutoff: cutoff,
-            readingsDeleted: all.count { $0.end < cutoff },
-            readingsEligibleForCompaction: all.count {
-                $0.end >= cutoff && $0.end < now.addingTimeInterval(-compactionAge)
-                    && $0.metadata?.aggregation == nil
-            }
+            readingsDeleted: counts?.0 ?? 0,
+            readingsEligibleForCompaction: counts?.1 ?? 0
         )
     }
 
+    // MARK: - Retention confirmation
+
+    /// Installs a retention that may delete data, and remembers it in the database.
+    ///
+    /// `retention` starts at 30 days and is also what an unreadable, reset, or newer-schema
+    /// settings file falls back to. Pruning with that value would delete months of history
+    /// on the strength of a default the user never chose, so a persisting store prunes only
+    /// once a caller that trusts its source has confirmed a period.
+    ///
+    /// The last confirmed period is recorded in the `metadata` table. A settings file lost
+    /// and recreated with the default therefore cannot shorten it: a period shorter than the
+    /// one on record holds pruning until the user chooses one (`userInitiated`).
     @discardableResult
-    func prune(now: Date = .now) -> Bool {
+    func confirmRetention(days: Int, userInitiated: Bool = false) -> Bool {
+        retention = TimeInterval(days) * 86_400
+        guard persistenceEnabled else {
+            retentionIsConfirmed = true
+            return true
+        }
+        guard loadState == .loaded, let database else {
+            retentionIsConfirmed = false
+            return false
+        }
+        let recorded = (try? database.metadataValue(Self.retentionMetadataKey)).flatMap { $0 }.flatMap(Int.init)
+        if !userInitiated, let recorded, days < recorded {
+            retentionIsConfirmed = false
+            retentionHeldBackDays = recorded
+            return false
+        }
+        if recorded != days {
+            do { try database.setMetadata(String(days), forKey: Self.retentionMetadataKey) }
+            catch {
+                // Without a record the guard above cannot protect a later launch, so treat
+                // the period as unconfirmed rather than deleting on an unrecorded choice.
+                record(error)
+                retentionIsConfirmed = false
+                return false
+            }
+        }
+        retentionIsConfirmed = true
+        retentionHeldBackDays = nil
+        return true
+    }
+
+    /// Stops pruning until a retention is confirmed again, for a source that cannot be
+    /// trusted right now (settings that failed to load or were reset).
+    func suspendRetention() {
+        guard persistenceEnabled else { return }
+        retentionIsConfirmed = false
+    }
+
+    /// Deletes readings older than the confirmed retention, and rows with impossible clocks
+    /// when `includingInvalidRows` is set (once, at load: they need a scan).
+    ///
+    /// Returns false only for a failure. While the retention is unconfirmed it deletes no
+    /// aged history, which is a deliberate no-op rather than an error.
+    @discardableResult
+    func prune(now: Date = .now, includingInvalidRows: Bool = false) -> Bool {
         guard loadState == .loaded, let database else { return false }
-        let cutoff = now.addingTimeInterval(-retention)
+        let cutoff = retentionIsConfirmed ? now.addingTimeInterval(-retention) : Date.distantPast
         let originalSources = sources
+        var clamped: [DataSource] = []
         do {
             for index in sources.indices where (sources[index].lastSeenAt ?? .distantPast) > now {
                 sources[index].lastSeenAt = now
+                clamped.append(sources[index])
             }
-            let removed = try database.prune(cutoff: cutoff, now: now, sources: sources)
+            let removed = try database.prune(
+                cutoff: cutoff,
+                now: now,
+                changedSources: clamped,
+                includingInvalidRows: includingInvalidRows
+            )
             dataGeneration &+= removed > 0 ? 1 : 0
             removalGeneration &+= removed > 0 ? 1 : 0
             return true
@@ -661,7 +843,11 @@ final class HealthStore {
         let cutoff = min(ageCutoff, passStart.addingTimeInterval(Self.compactionSpanPerPass))
         let aged: [Reading]
         do {
-            aged = try database.readings(range: DateInterval(start: .distantPast, end: cutoff))
+            // Only this pass's span, plus one comparison window behind it: a window that
+            // straddled the previous pass's cutoff was left whole then, and needs its earlier
+            // rows now. Rows already folded there are single aggregates and are skipped below.
+            let readStart = passStart.addingTimeInterval(-Self.longestComparisonWindow)
+            aged = try database.readings(range: DateInterval(start: readStart, end: cutoff))
         } catch {
             record(error)
             return false
@@ -799,7 +985,8 @@ final class HealthStore {
             compactionCursor = nil
             dataGeneration &+= 1
             removalGeneration &+= 1
-            prune()
+            // Aged history waits for `confirmRetention`; only impossible rows go now.
+            prune(includingInvalidRows: true)
             logger.info("Loaded \(self.readingCount) readings across \(self.sources.count) sources")
         } catch {
             loadState = .failed
@@ -807,10 +994,23 @@ final class HealthStore {
         }
     }
 
+    /// Maintenance: prune, compact a bounded backlog, checkpoint the write-ahead log.
+    ///
+    /// Not a durability step. A committed transaction is already on disk (`synchronous =
+    /// FULL`), so ingest paths, the HealthKit anchor among them, do not wait for this. Run it
+    /// on a timer and at background transitions.
     @discardableResult
     func saveNow() async -> Bool {
         guard persistenceEnabled, loadState == .loaded, let database else { return false }
-        guard prune(), compact() else { return false }
+        guard prune() else { return false }
+        for _ in 0..<Self.maximumCompactionPassesPerMaintenance {
+            guard compact() else { return false }
+            // No cursor means the database holds nothing to compact; otherwise stop once the
+            // cursor has reached the age cutoff.
+            guard let cursor = compactionCursor,
+                  cursor < Date.now.addingTimeInterval(-compactionAge)
+            else { break }
+        }
         do {
             try database.checkpoint()
             return true
@@ -983,9 +1183,9 @@ final class HealthStore {
             var fields: [String] = []
             fields.append(reading.id.uuidString)
             fields.append(reading.sourceID)
-            fields.append(source?.displayName ?? "")
+            fields.append(CSV.spreadsheetSafe(source?.displayName ?? ""))
             fields.append(source?.transport.exportTitle ?? "")
-            fields.append(source?.model ?? "")
+            fields.append(CSV.spreadsheetSafe(source?.model ?? ""))
             fields.append(Self.boolean(source?.identifiesHealthKitWriter))
             fields.append(source?.upstreamDeviceRelationshipID ?? "")
             fields.append(reading.kind.rawValue)
@@ -1003,7 +1203,7 @@ final class HealthStore {
             fields.append(Self.integer(metadata?.acceptedBeatCount))
             fields.append(Self.decimal(metadata?.artefactFraction))
 
-            rows.append(fields.map(csvEscape).joined(separator: ","))
+            rows.append(fields.map(CSV.escape).joined(separator: ","))
         }
         return rows.isEmpty ? "" : rows.joined(separator: "\r\n") + "\r\n"
     }
@@ -1043,10 +1243,17 @@ final class HealthStore {
 
     private var isReadyToPersist: Bool { !persistenceEnabled || loadState == .loaded }
 
-    private func persistSourcesIfReady(_ changed: [DataSource]) {
-        guard isReadyToPersist else { return }
-        do { try database?.saveSources(changed) }
-        catch { record(error) }
+    /// Writes changed source rows and returns the failure, if any. Nil also when persistence
+    /// is not ready yet, which leaves the change in memory only, as ingestion always did.
+    private func persistSourcesIfReady(_ changed: [DataSource]) -> String? {
+        guard isReadyToPersist else { return nil }
+        do {
+            try database?.saveSources(changed)
+            return nil
+        } catch {
+            record(error)
+            return error.localizedDescription
+        }
     }
 
     private func noteObserved(_ stored: [Reading]) {
@@ -1060,8 +1267,17 @@ final class HealthStore {
         }
         for (sourceID, entry) in perSource {
             guard let index = sources.firstIndex(where: { $0.id == sourceID }) else { continue }
-            sources[index].observedMetrics.formUnion(entry.metrics)
-            sources[index].lastSeenAt = max(sources[index].lastSeenAt ?? .distantPast, entry.latest)
+            // Assigning into `sources` wakes every view that reads it, so touch it only for
+            // a change a reader could see: a metric seen for the first time, or a last-seen
+            // time that moved by more than the resolution anything displays. A strap that
+            // reports every second used to rewrite this array once per reading.
+            if !entry.metrics.isSubset(of: sources[index].observedMetrics) {
+                sources[index].observedMetrics.formUnion(entry.metrics)
+            }
+            let known = sources[index].lastSeenAt ?? .distantPast
+            if entry.latest.timeIntervalSince(known) >= Self.lastSeenResolution {
+                sources[index].lastSeenAt = entry.latest
+            }
         }
     }
 
@@ -1125,10 +1341,5 @@ final class HealthStore {
     private func record(_ error: any Error) {
         lastPersistenceError = error.localizedDescription
         logger.error("Persistence failed: \(error.localizedDescription, privacy: .public)")
-    }
-
-    private static func csvEscape(_ field: String) -> String {
-        guard field.contains(",") || field.contains("\"") || field.contains("\r") || field.contains("\n") else { return field }
-        return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 }

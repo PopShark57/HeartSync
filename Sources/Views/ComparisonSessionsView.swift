@@ -102,7 +102,11 @@ struct ComparisonSessionBanner: View {
             let missing = session.missingSourceIDs(in: model.store.sources)
             if !missing.isEmpty {
                 Label(
-                    "\(missing.count) saved \(missing.count == 1 ? "device is" : "devices are") no longer set up, so this is not the comparison that was saved.",
+                    String(
+                        localized: "sessions.banner.missingDevices",
+                        defaultValue: "\(missing.count) saved devices are no longer set up, so this is not the comparison that was saved.",
+                        comment: "Banner on a reopened saved comparison. The argument is how many of its devices no longer exist."
+                    ),
                     systemImage: "exclamationmark.triangle"
                 )
                 .font(.caption)
@@ -138,13 +142,21 @@ private struct SessionRow: View {
                 ForEach(session.sourceIDs, id: \.self) { id in
                     SourceDot(color: model.store.source(id: id)?.color ?? .gray, size: 7)
                 }
-                Text("\(session.sourceIDs.count) \(session.sourceIDs.count == 1 ? "device" : "devices")")
+                Text(String(
+                    localized: "sessions.row.deviceCount",
+                    defaultValue: "\(session.sourceIDs.count) devices",
+                    comment: "Saved comparison row. The argument is how many devices it compares."
+                ))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
             if !missing.isEmpty {
                 Label(
-                    "\(missing.count) of these \(missing.count == 1 ? "devices is" : "devices are") no longer set up. The comparison will not be the one you saved.",
+                    String(
+                        localized: "sessions.row.missingDevices",
+                        defaultValue: "\(missing.count) of these devices are no longer set up. The comparison will not be the one you saved.",
+                        comment: "Warning on a saved comparison row. The argument is how many of its devices no longer exist."
+                    ),
                     systemImage: "exclamationmark.triangle"
                 )
                 .font(.caption2)

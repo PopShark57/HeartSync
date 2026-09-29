@@ -276,7 +276,9 @@ struct BluetoothReadinessDiagnosticsTests {
         state.finishSubscription(id: "2A37")
         #expect(state.resolution == .ready(metrics: [.heartRate], warnings: []))
         let resolved = PeripheralConnectionState.resolving(state.resolution, current: .enablingNotifications([.heartRate]), observed: [])
-        #expect(resolved.state.title == "Ready for 1 metric; waiting for data\u{2026}")
+        // The plural form ("metric") comes from the string catalog, so only the count is pinned.
+        #expect(resolved.state.title.hasPrefix("Ready for 1 metric"))
+        #expect(resolved.state.title.hasSuffix("; waiting for data\u{2026}"))
         #expect(resolved.armsWatchdog)
     }
 

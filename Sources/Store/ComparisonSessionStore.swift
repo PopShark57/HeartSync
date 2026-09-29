@@ -87,9 +87,10 @@ final class ComparisonSessionStore {
 
     /// Records that a session was opened, so the next revisit can disclose what changed.
     @discardableResult
-    func noteViewed(id: UUID, readingCount: Int, at date: Date = .now) async -> Bool {
+    func noteViewed(id: UUID, readingCount: Int, fingerprint: Int64? = nil, at date: Date = .now) async -> Bool {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return false }
         sessions[index].lastViewedReadingCount = readingCount
+        sessions[index].lastViewedFingerprint = fingerprint
         sessions[index].lastViewedAt = date
         return await persist()
     }

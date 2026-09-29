@@ -9,6 +9,17 @@ enum WatchWorkoutActivity: String, CaseIterable, Identifiable {
     case cycling = "Cycling"
 
     var id: String { rawValue }
+
+    /// What is shown. The raw value stays the stable identity.
+    var title: String {
+        switch self {
+        case .other: String(localized: "workout.activity.other", defaultValue: "Other workout", comment: "Watch workout type")
+        case .walking: String(localized: "workout.activity.walking", defaultValue: "Walking", comment: "Watch workout type")
+        case .running: String(localized: "workout.activity.running", defaultValue: "Running", comment: "Watch workout type")
+        case .cycling: String(localized: "workout.activity.cycling", defaultValue: "Cycling", comment: "Watch workout type")
+        }
+    }
+
     var healthKitType: HKWorkoutActivityType {
         switch self {
         case .other: .other
@@ -33,7 +44,7 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
     /// The last five minutes of heart rate for the workout screen's trend. In memory only.
     private(set) var heartRateTrend = WorkoutHeartRateTrend()
     private(set) var averageHeartRate: Double?
-    private(set) var activityTitle = "Workout"
+    private(set) var activityTitle = String(localized: "workout.activity.default", defaultValue: "Workout", comment: "Watch workout type before one is chosen")
 
     var phase: WorkoutPhase { lifecycle.phase }
     var message: String? { lifecycle.message }
@@ -46,6 +57,42 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
     /// Token of the session currently attached, matched against every delegate callback
     /// alongside the object-identity check.
     @ObservationIgnored private var token: WorkoutSessionToken?
+
+    /// What HealthKit reported, reduced to values that can cross out of its callback queue.
+    private enum SessionEvent: Sendable {
+        case stateChanged(session: ObjectIdentifier, to: HKWorkoutSessionState, date: Date)
+        case failed(session: ObjectIdentifier, detail: String)
+        case collected(builder: ObjectIdentifier, sample: StatisticsSnapshot)
+    }
+
+    /// Every delegate and builder callback is yielded here, in the order HealthKit called it,
+    /// and one main-actor task applies them one at a time.
+    ///
+    /// Each callback used to start its own unstructured `Task`, and separate tasks carry no
+    /// ordering guarantee, so running, paused, and stopped could apply out of order. The token
+    /// check rejects events from an old session, not reordered events of the current one. The
+    /// consumer also finishes handling one event, including an `await` such as ending
+    /// collection, before it looks at the next.
+    @ObservationIgnored private let events: AsyncStream<SessionEvent>.Continuation
+    @ObservationIgnored private var eventTask: Task<Void, Never>?
+
+    override init() {
+        var continuation: AsyncStream<SessionEvent>.Continuation!
+        let stream = AsyncStream<SessionEvent>(bufferingPolicy: .unbounded) { continuation = $0 }
+        events = continuation
+        super.init()
+        eventTask = Task { @MainActor [weak self] in
+            for await event in stream {
+                guard let self else { return }
+                await self.handle(event)
+            }
+        }
+    }
+
+    deinit {
+        events.finish()
+        eventTask?.cancel()
+    }
 
     func start(activity: WatchWorkoutActivity, indoors: Bool) async {
         // A second Start tap while one is in flight returns nil here, so no second
@@ -77,7 +124,7 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
             configuration.locationType = activity == .other ? .unknown : (indoors ? .indoor : .outdoor)
             let session = try HKWorkoutSession(healthStore: healthStore, configuration: configuration)
             attach(session)
-            activityTitle = activity.rawValue
+            activityTitle = activity.title
             lifecycle.markStarting(operation)
             let date = Date.now
             session.startActivity(with: date)
@@ -152,7 +199,7 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
             attach(recovered)
             activityTitle = WatchWorkoutActivity.allCases.first {
                 $0.healthKitType == recovered.workoutConfiguration.activityType
-            }?.rawValue ?? "Recovered workout"
+            }?.title ?? String(localized: "workout.activity.recovered", defaultValue: "Recovered workout", comment: "Watch workout type shown for a workout the system restarted the app into")
             readStatistics()
             switch recovered.state {
             case .running:
@@ -255,72 +302,73 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
         )
     }
 
-    nonisolated func workoutSession(
-        _ workoutSession: HKWorkoutSession,
-        didChangeTo toState: HKWorkoutSessionState,
-        from fromState: HKWorkoutSessionState,
-        date: Date
-    ) {
-        let id = ObjectIdentifier(workoutSession)
-        Task { @MainActor [weak self] in
-            guard let self, self.session.map(ObjectIdentifier.init) == id else { return }
+    private func handle(_ event: SessionEvent) async {
+        switch event {
+        case let .stateChanged(id, toState, date):
+            guard session.map(ObjectIdentifier.init) == id else { return }
             // Both guards matter: object identity catches a callback from a different
             // HealthKit object, and the token catches one from a session this manager has
             // already discarded or replaced.
-            guard let operation = self.token, self.lifecycle.accepts(operation) else { return }
+            guard let operation = token, lifecycle.accepts(operation) else { return }
             switch toState {
             case .running:
-                self.lifecycle.applyRunning(operation)
+                lifecycle.applyRunning(operation)
             case .paused:
-                self.lifecycle.applyPaused(operation)
+                lifecycle.applyPaused(operation)
             case .stopped, .ended:
-                await self.prepareReview(operation, at: date)
+                await prepareReview(operation, at: date)
             default: break
             }
-        }
-    }
 
-    nonisolated func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: any Error) {
-        let id = ObjectIdentifier(workoutSession)
-        let detail = error.localizedDescription
-        Task { @MainActor [weak self] in
-            guard let self, self.session.map(ObjectIdentifier.init) == id else { return }
-            guard let operation = self.token, self.lifecycle.accepts(operation) else { return }
-            if self.builder?.startDate != nil, let builder = self.builder {
+        case let .failed(id, detail):
+            guard session.map(ObjectIdentifier.init) == id else { return }
+            guard let operation = token, lifecycle.accepts(operation) else { return }
+            if builder?.startDate != nil, let builder {
                 let now = Date.now
                 // Collected data survives an interruption, so this becomes a reviewable
                 // workout rather than a failed start the user can never save.
-                if self.lifecycle.interrupt(
+                if lifecycle.interrupt(
                     operation,
                     detail: detail,
                     at: now,
                     elapsed: builder.elapsedTime(at: now)
                 ) {
                     var failure: String?
-                    if !self.lifecycle.collectionEnded {
+                    if !lifecycle.collectionEnded {
                         do { try await builder.endCollection(at: now) }
                         catch { failure = error.localizedDescription }
                     }
-                    self.lifecycle.completeReview(
+                    lifecycle.completeReview(
                         elapsed: failure == nil ? builder.elapsedTime : nil,
                         failure: failure
                     )
                 }
             } else {
-                self.failStart(operation, "Workout failed: \(detail)")
+                failStart(operation, "Workout failed: \(detail)")
             }
+
+        case let .collected(id, sample):
+            guard builder.map(ObjectIdentifier.init) == id else { return }
+            apply(sample)
         }
+    }
+
+    nonisolated func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didChangeTo toState: HKWorkoutSessionState,
+        from fromState: HKWorkoutSessionState,
+        date: Date
+    ) {
+        events.yield(.stateChanged(session: ObjectIdentifier(workoutSession), to: toState, date: date))
+    }
+
+    nonisolated func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: any Error) {
+        events.yield(.failed(session: ObjectIdentifier(workoutSession), detail: error.localizedDescription))
     }
 
     nonisolated func workoutBuilderDidCollectEvent(_ workoutBuilder: HKLiveWorkoutBuilder) {}
 
     nonisolated func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder, didCollectDataOf collectedTypes: Set<HKSampleType>) {
-        let id = ObjectIdentifier(workoutBuilder)
-        let sample = Self.statistics(from: workoutBuilder)
-        Task { @MainActor [weak self] in
-            guard let self, self.builder.map(ObjectIdentifier.init) == id else { return }
-            self.apply(sample)
-        }
+        events.yield(.collected(builder: ObjectIdentifier(workoutBuilder), sample: Self.statistics(from: workoutBuilder)))
     }
-
 }

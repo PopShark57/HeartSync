@@ -49,6 +49,29 @@ struct BinaryReader {
         offset = min(offset + count, bytes.count)
     }
 
+    /// Consumes a declared SFLOAT pair whose values are not needed. Returns false when the
+    /// four bytes are not all there, which is the only thing a caller skipping the pair can
+    /// still learn from it; a reserved special value is present data and returns true.
+    mutating func skipSFloatPair() -> Bool {
+        guard remaining >= 4 else { return false }
+        skip(4)
+        return true
+    }
+
+    /// Reads a declared SFLOAT and separates "the bytes were missing" (nil) from "the bytes
+    /// were a reserved special value" (a present field whose `value` is nil).
+    mutating func presentSFloat() -> SFloatField? {
+        guard let raw = uint16() else { return nil }
+        return SFloatField(value: Self.decodeSFloat(raw))
+    }
+
+    /// A declared SFLOAT that was physically present in the frame.
+    struct SFloatField: Equatable {
+        /// Nil for a reserved special value (NaN, NRes, infinity), which is data the device
+        /// chose to send, not a missing field.
+        var value: Double?
+    }
+
     /// IEEE-11073 16-bit SFLOAT: signed 4-bit exponent in the top nibble, signed 12-bit
     /// mantissa below. Used by every value in the Pulse Oximeter Service.
     ///

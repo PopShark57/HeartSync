@@ -1,0 +1,136 @@
+name: iOS validation
+
+# The automated gate for the hosted unit bundle, the UI bundle, and the watch build.
+# It runs on the oldest and the newest simulator runtime a hosted runner offers, because the
+# deployment target is iOS 18.0 and the two ends differ in ways that break tests (for
+# example, an iPhone confirmation dialog shows a Cancel button on iOS 18 and none later).
+# The device-only workloads (Bluetooth, HealthKit background delivery, the 1 Hz performance
+# bundle) are not run here; RELEASE_CHECKLIST.md lists them.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15 carries the iOS 18 runtime (the minimum supported OS); macos-26 the newest.
+        runner: [macos-15, macos-26]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build watchOS companion
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project HeartSyncChecker.xcodeproj \
+            -scheme HeartSyncWatch \
+            -configuration Debug \
+            -destination 'generic/platform=watchOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/HeartSyncWatch-DerivedData" \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            CODE_SIGNING_ALLOWED=NO
+
+      # A warning introduced by a change fails the build; the project is warning-free.
+      - name: Build app and test bundles, warnings as errors
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -project HeartSyncChecker.xcodeproj \
+            -scheme HeartSyncChecker \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/HeartSyncChecker-DerivedData" \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Select iPhone and iPad simulators
+        shell: bash
+        run: |
+          pick() {
+            xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          prefix = sys.argv[1]
+          data = json.load(sys.stdin)["devices"]
+          runtimes = []
+          for key, devices in data.items():
+              if ".iOS-" not in key:
+                  continue
+              version = tuple(int(part) for part in key.rsplit("iOS-", 1)[1].split("-"))
+              if version >= (18,):
+                  runtimes.append((version, devices))
+          runtimes.sort(key=lambda item: item[0], reverse=True)
+          print(next((d["udid"] for _, devices in runtimes for d in devices if d["name"].startswith(prefix)), ""))
+          ' "$1"
+          }
+          echo "HEARTSYNC_SIMULATOR_ID=$(pick iPhone)" >> "$GITHUB_ENV"
+          echo "HEARTSYNC_IPAD_ID=$(pick iPad)" >> "$GITHUB_ENV"
+
+      - name: Run unit tests
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project HeartSyncChecker.xcodeproj \
+            -scheme HeartSyncChecker \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$HEARTSYNC_SIMULATOR_ID" \
+            -derivedDataPath "$RUNNER_TEMP/HeartSyncChecker-DerivedData" \
+            -only-testing:HeartSyncCheckerTests \
+            -resultBundlePath "$RUNNER_TEMP/unit.xcresult" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Run UI tests
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project HeartSyncChecker.xcodeproj \
+            -scheme HeartSyncChecker \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$HEARTSYNC_SIMULATOR_ID" \
+            -derivedDataPath "$RUNNER_TEMP/HeartSyncChecker-DerivedData" \
+            -only-testing:HeartSyncCheckerUITests \
+            -resultBundlePath "$RUNNER_TEMP/ui.xcresult" \
+            CODE_SIGNING_ALLOWED=NO
+
+      # The same screenshot tour on an iPad, for the regular-width layouts.
+      - name: Capture iPad screenshots
+        if: env.HEARTSYNC_IPAD_ID != ''
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project HeartSyncChecker.xcodeproj \
+            -scheme HeartSyncChecker \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$HEARTSYNC_IPAD_ID" \
+            -derivedDataPath "$RUNNER_TEMP/HeartSyncChecker-DerivedData" \
+            -only-testing:HeartSyncCheckerUITests/HeartSyncCheckerUITests/testChartGalleryScreenshots \
+            -resultBundlePath "$RUNNER_TEMP/ipad.xcresult" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeartSyncChecker-tests-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/unit.xcresult
+            ${{ runner.temp }}/ui.xcresult
+            ${{ runner.temp }}/ipad.xcresult
+          if-no-files-found: ignore
+          retention-days: 14

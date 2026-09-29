@@ -118,7 +118,9 @@ struct SourceRemovalTests {
             source: watch,
             history: .init(readingCount: 1, earliest: .now)
         )
-        #expect(consequence.message.contains("Deletes 1 reading from Apple Watch"))
+        // The plural form ("reading") comes from the string catalog, so only the count is pinned.
+        #expect(consequence.message.contains("Deletes 1 reading"))
+        #expect(consequence.message.contains("from Apple Watch"))
         #expect(consequence.message.contains("Apple Health keeps its own copy"))
         #expect(consequence.message.contains("does not import these samples again"))
     }

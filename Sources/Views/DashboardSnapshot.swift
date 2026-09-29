@@ -133,7 +133,13 @@ struct Sparkline: Equatable, Sendable {
             let high = values.max() ?? first.value
             let gaps = Set(series.segments).count - 1
             var text = "\(name): \(kind.formatWithUnit(first.value)) to \(kind.formatWithUnit(last.value)), range \(kind.format(low)) to \(kind.formatWithUnit(high))"
-            if gaps > 0 { text += ", \(gaps) gap\(gaps == 1 ? "" : "s")" }
+            if gaps > 0 {
+                text += ", " + String(
+                    localized: "dashboard.spoken.gaps",
+                    defaultValue: "\(gaps) gaps",
+                    comment: "Spoken description of a trend line. The argument is how many gaps it has."
+                )
+            }
             return text
         }
         return "Trend over \(Self.spanTitle(for: kind)). " + parts.joined(separator: ". ")

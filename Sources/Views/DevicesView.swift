@@ -15,6 +15,10 @@ struct DevicesView: View {
     @State private var exportDirectory: URL?
     @State private var exportError: String?
     @State private var isExporting = false
+    @State private var diagnosticsExport: DiagnosticsExportRequest?
+    /// Why a removal, pause, or rename did not happen, so the list never claims a change
+    /// that the database refused and that would revert at the next launch.
+    @State private var changeFailure: String?
 
     var body: some View {
         NavigationStack {
@@ -66,6 +70,20 @@ struct DevicesView: View {
                 removalActions(proposal)
             } message: { proposal in
                 Text(proposal.consequence.message)
+            }
+            .sheet(item: $diagnosticsExport) { request in
+                DiagnosticsReportSheet(source: request.source)
+            }
+            .alert(
+                "Change not saved",
+                isPresented: Binding(
+                    get: { changeFailure != nil },
+                    set: { if !$0 { changeFailure = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { changeFailure = nil }
+            } message: {
+                Text(changeFailure ?? "")
             }
             .sheet(item: $exportPayload, onDismiss: discardExport) { payload in
                 ReadingsShareSheet(items: [payload.url])
@@ -146,7 +164,9 @@ struct DevicesView: View {
     private func confirmRemoval(_ proposal: RemovalProposal) {
         removal = nil
         if let source = proposal.source {
-            model.removeSource(source)
+            if case .failed(let detail) = model.removeSource(source) {
+                changeFailure = "HeartSync could not remove \(source.displayName). Nothing was deleted. \(detail)"
+            }
         } else {
             model.oura.disconnect()
         }
@@ -187,7 +207,10 @@ struct DevicesView: View {
     }
 
     private func setCollecting(_ enabled: Bool, source: DataSource) {
-        model.store.setEnabled(enabled, forSource: source.id)
+        if case .failed(let detail) = model.store.setEnabled(enabled, forSource: source.id) {
+            changeFailure = "HeartSync could not \(enabled ? "resume" : "pause") \(source.displayName). \(detail)"
+            return
+        }
         if enabled {
             model.bluetooth.reconnect(sourceID: source.id)
         } else {
@@ -260,13 +283,13 @@ struct DevicesView: View {
                         model.bluetooth.runDiagnostics(sourceID: source.id)
                     }
                     .disabled(!model.bluetooth.isPoweredOn || !source.isEnabled)
-                    if let report = model.bluetooth.diagnosticsReport(forSource: source.id, deviceName: source.displayName) {
+                    if model.bluetooth.hasDiagnosticsReport(forSource: source.id) {
                         // Explicit export only. The report can contain raw packets from a
-                        // diagnostic session, which are health data.
-                        ShareLink(
-                            item: report,
-                            preview: SharePreview("Bluetooth diagnostics for \(source.displayName)")
-                        ) {
+                        // diagnostic session, which are health data, so it is built when the
+                        // user taps this rather than while the menu is being laid out.
+                        Button {
+                            diagnosticsExport = DiagnosticsExportRequest(source: source)
+                        } label: {
                             Label("Export diagnostics\u{2026}", systemImage: "doc.text.magnifyingglass")
                         }
                     }
@@ -568,7 +591,11 @@ struct DevicesView: View {
                 if !model.oura.endpointIssues.isEmpty {
                     // Not "unavailable": an endpoint issue can also be a collection that
                     // imported only a prefix. The Oura tab distinguishes the two.
-                    let issueText = "\(model.oura.endpointIssues.count) Oura collection\(model.oura.endpointIssues.count == 1 ? " needs" : "s need") attention: unavailable or incomplete. The Oura tab shows permissions and details."
+                    let issueText = String(
+                        localized: "devices.oura.issues",
+                        defaultValue: "\(model.oura.endpointIssues.count) Oura collections need attention: unavailable or incomplete. The Oura tab shows permissions and details.",
+                        comment: "Warning on the Devices list. The argument is how many Oura collections have a problem."
+                    )
                     Label(issueText, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.orange)
@@ -718,6 +745,7 @@ private struct RenameSourceView: View {
     @Environment(\.dismiss) private var dismiss
     var source: DataSource
     @State private var name: String = ""
+    @State private var failure: String?
 
     var body: some View {
         NavigationStack {
@@ -726,8 +754,13 @@ private struct RenameSourceView: View {
                     TextField("Device name", text: $name)
                         .autocorrectionDisabled()
                 } footer: {
-                    if let model = source.model {
-                        Text("Reported as \(model)")
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let model = source.model {
+                            Text("Reported as \(model)")
+                        }
+                        if let failure {
+                            Text(failure).foregroundStyle(.red)
+                        }
                     }
                 }
             }
@@ -741,13 +774,65 @@ private struct RenameSourceView: View {
                     Button("Save") {
                         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmed.isEmpty {
-                            model.store.rename(sourceID: source.id, to: trimmed)
+                            if case .failed(let detail) = model.store.rename(sourceID: source.id, to: trimmed) {
+                                failure = "HeartSync could not save the new name. \(detail)"
+                                return
+                            }
                         }
                         dismiss()
                     }
                 }
             }
             .onAppear { name = source.displayName }
+        }
+    }
+}
+
+/// A request to show one device's diagnostics report.
+private struct DiagnosticsExportRequest: Identifiable {
+    var source: DataSource
+    var id: String { source.id }
+}
+
+/// The report for one device, built when this sheet appears rather than while the device
+/// list is laid out. It can contain raw packets from a diagnostic session, which are health
+/// data, so it goes nowhere unless the user shares it.
+private struct DiagnosticsReportSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    var source: DataSource
+    @State private var report: String?
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(report ?? "This device has no diagnostics for its current connection.")
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .navigationTitle("Diagnostics")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+                if let report {
+                    ToolbarItem(placement: .primaryAction) {
+                        ShareLink(
+                            item: report,
+                            preview: SharePreview("Bluetooth diagnostics for \(source.displayName)")
+                        )
+                    }
+                }
+            }
+            .task {
+                report = model.bluetooth.diagnosticsReport(
+                    forSource: source.id,
+                    deviceName: source.displayName
+                )
+            }
         }
     }
 }

@@ -177,7 +177,11 @@ struct WatchVerdictLabel: View {
 
     var body: some View {
         if comparison.outsideTolerancePairs > 0 {
-            Label("\(comparison.outsideTolerancePairs) pair\(comparison.outsideTolerancePairs == 1 ? "" : "s") outside tolerance", systemImage: "exclamationmark.triangle.fill")
+            Label(String(
+                localized: "watch.comparison.outside",
+                defaultValue: "\(comparison.outsideTolerancePairs) pairs outside tolerance",
+                comment: "Wrist comparison summary. The argument is how many device pairs disagree beyond tolerance."
+            ), systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
         } else if comparison.allPairsAgree {
             Label("Within tolerance", systemImage: "checkmark.circle.fill")

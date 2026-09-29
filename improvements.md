@@ -3,7 +3,984 @@
 Newest review first. Earlier reviews and their implementation notes are retained below as
 history; their "Observed behavior" paragraphs describe the checkout they reviewed.
 
-## Current review: visuals, charts, and interaction (2026-09-26)
+## Current review: whole-codebase audit (2026-09-29)
+
+Reviewed `main` at commit
+[`2f167dded1f92f8b1ee2eaad27bde9387825fc7b`](https://github.com/PopShark57/HeartSync/commit/2f167dded1f92f8b1ee2eaad27bde9387825fc7b):
+the iOS app, the watch app and its complications, `Shared`, the tests, `project.yml`, and
+the documents that describe them. Numbering continues from item 41. **Items 26–41 are
+complete.**
+
+Unlike the earlier reviews, this one ran on a Mac with Xcode 27.1 and the iOS 27.0 and
+watchOS 27.0 simulator runtimes, so the hosted test bundles were executed rather than only
+compiled (see [Validation for this review](#validation-for-this-review-2026-09-29)). Each
+item states its basis:
+
+- **Observed defect:** read directly from the code at the commit above.
+- **Test failure:** an existing test fails in the hosted bundle today.
+- **Performance risk:** inferred from where and how often code runs; not profiled.
+- **Platform risk:** depends on system behavior that only a signed device run can confirm.
+- **Design proposal:** a product or structural recommendation.
+
+A list of leads from a separate pass (ChatGPT) came with the request. Each was checked
+against the code; all seven were confirmed, and two turned out worse than described. See
+[External leads checked](#external-leads-checked).
+
+### Priorities and suggested sequence
+
+| Item | Priority | Improvement | Area | Basis | Size |
+| --- | --- | --- | --- | --- | --- |
+| 42 | P0 | Apply the saved retention before any prune; never prune on defaulted settings | Persistence | Observed defect | S |
+| 43 | P0 | Scope estimate reconciliation to HeartSync's own estimates, in SQL | Persistence, analysis | Observed defect | S |
+| 44 | P0 | Stop deleting Oura history when it ages out of the 14-day cache | Oura, persistence | Observed defect | S |
+| 45 | P1 | Reject pulse-oximeter frames whose flagged status fields are missing | Bluetooth | Observed defect | S |
+| 46 | P1 | Keep interval averages out of instantaneous comparison windows | Analysis | Observed defect | M |
+| 47 | P1 | Make resets exclusive with in-flight HealthKit and Oura imports | Concurrency, HealthKit | Observed defect | M |
+| 48 | P1 | Make source mutations report and roll back failed writes | Persistence, UX | Observed defect | S–M |
+| 49 | P1 | Fix the watch chart cache and take snapshot building off the main actor | Watch, performance | Test failure + performance risk | S + M |
+| 50 | P1 | Move SQLite reads and analysis off the main actor (finishes item 21) | Architecture, performance | Performance risk | L |
+| 51 | P1 | Stop pruning, compacting, and checkpointing for every HealthKit page | HealthKit, performance | Observed behavior | S |
+| 52 | P1 | Cut per-reading write amplification in Bluetooth ingest | Persistence, battery | Performance risk | M |
+| 53 | P1 | Start transports at process launch so background relaunches work | HealthKit, Bluetooth | Platform risk | M |
+| 54 | P1 | Respect Oura rate limits on every automatic path | Oura, WatchConnectivity | Observed behavior | S |
+| 55 | P1 | Restore an automated test gate and fix the two failing tests | Process | Observed (CI deleted) + test failures | S |
+| 56 | P2 | Stop per-packet Observation churn; build diagnostics lazily | SwiftUI, performance | Performance risk | S–M |
+| 57 | P2 | Remove SHA-256 from the per-reading aggregation hot path | Analysis, performance | Observed behavior | S |
+| 58 | P2 | Replace whole-history reads used only for counts | Performance, correctness | Observed behavior | S |
+| 59 | P2 | Stream exports off the main actor with keyset pages, cancel, and cleanup | Export, privacy | Observed behavior | M |
+| 60 | P2 | Neutralise spreadsheet formulas in every CSV export | Security | Observed defect | S |
+| 61 | P2 | Read Health's date of birth in the Gregorian calendar | HealthKit | Observed defect | S |
+| 62 | P2 | Make HealthKit write-back batched, attributable, and idempotent | HealthKit | Observed behavior | S–M |
+| 63 | P2 | Reload complications only when what they show changes | Watch | Observed behavior | S |
+| 64 | P2 | Serialise watch workout delegate events | Watch, concurrency | Concurrency risk | S |
+| 65 | P2 | Give `AppModel` test seams and cover its orchestration | Testability | Observed gap | M |
+| 66 | P2 | Consolidate `BluetoothManager`'s per-peripheral state | Maintainability | Design proposal | M |
+| 67 | P2 | Keep sub-second timestamps in stored payloads | Persistence | Observed defect | S–M |
+| 68 | P2 | Localise the remaining plain-string copy and plurals | Localization | Observed gap | M |
+| 69 | P2 | Tighten smaller comparison-honesty details | Analysis, UX | Observed defects | M |
+| 70 | P3 | Remove dead code and documentation drift | Maintainability | Observed | S |
+| 71 | P3 | Keep less Oura account data; distinguish Keychain failures | Privacy | Observed | S |
+| 72 | P3 | Consider a live watch-versus-sensor view through workout mirroring | Product | Design proposal | M–L |
+
+**P0** means data is being deleted today on a default or common configuration: fix before
+anything else ships. **P1** is wrong analysis, lost or resurrected data under a race,
+blocked-main-thread work at scale, and the missing test gate. **P2** is performance, platform
+quality, maintainability, and UX work with a concrete defect or cost behind it. **P3** is
+cleanup and optional product work.
+
+Suggested order:
+
+1. 42, 43 and 44 are small, independent, and each stops a silent deletion. Add their
+   regression tests in the same change; 65 makes the `AppModel` parts testable.
+2. 55 next, so every later change runs the suites again. Fix the two failing tests (49's
+   fingerprint and the removal dialog's Cancel) in the same pass.
+3. 45, 46, 47 and 48 are correctness fixes with narrow blast radius.
+4. 51, 54 and 57 are small changes that remove large, repeated costs. Do them before
+   measuring anything.
+5. 50 is the one large structural change. 52, 56, 58 and 59 fall out of it naturally, and
+   49's off-main snapshot building depends on it. Measure with the device performance
+   bundle before and after.
+6. 53 needs a signed device and the `RELEASE_CHECKLIST.md` background steps.
+
+### Implementation status (2026-09-29)
+
+**Implemented:** 42, 43, 44, 45, 48, 51, 54, 55, 56, 57, 58, 60, 61, 62, 63, 64, 65, 67, 68, 70,
+and 71. **Not implemented:** 46, 47, 49 (except the cache fingerprint that `WatchChartTests.cache()`
+needs), 50, 52, 53, 59, 66, 69, and 72. Where an item was done in part, the part left is named.
+
+How it was checked, and what was not:
+
+- The app, the watch app with its complication extension, and the unit and UI bundles build with
+  `build-for-testing` for the generic iOS Simulator, with no warnings.
+- The simulator runtimes were unusable on the machine used (Xcode-beta 27.2 reported every runtime
+  profile as not found), so **no hosted test and no UI test was run**. The pure logic and `AppModel`
+  ran in the scratch macOS SwiftPM harness AGENTS.md describes: 595 tests, all passing, including
+  the ones added here. `WatchWorkoutManager`, the SwiftUI screens, the UI tests, and the restored
+  workflow were compiled or parsed only. The one UI test that was failing
+  (`testRemovalAsksFirstAndDeletesOnlyThatDevice`) was changed to dismiss the dialog with Cancel
+  when it exists and by tapping outside otherwise, and has not been run.
+- The compiled string catalog was read back to confirm the plural variations, including ones with
+  two arguments, resolve as written.
+
+| Item | Done | Left |
+| --- | --- | --- |
+| 42 | `HealthStore` prunes aged history only after `confirmRetention`. `AppModel` confirms from settings that loaded intact or from the user's choice. The last period is recorded in `metadata`, so a lost settings file cannot shorten it. Startup notice and a Settings button while paused. | Nothing. |
+| 43 | Reconciliation reads and deletes only estimate rows in scope (blood pressure under `heartsync.estimate`; VO₂ max by `ReadingMetadata.modelledBy`, or unmarked). The estimate source is written in the same transaction. | Nothing. |
+| 44 | Withdrawal is computed per collection from records dated inside a complete full-window response. **Forget imported history** now removes every stored Oura reading, since the cache no longer names them all. | Nothing. |
+| 45 | Every declared PLX field, fast/slow pairs and amplitude index included, must be present. | Nothing. |
+| 48 | Remove, rename, pause, and source upserts write first and roll back on failure; Devices shows the failure; removal is refused before startup finishes and happens before the peripheral or credential is forgotten. | Battery/last-seen updates log a failure only. |
+| 51 | No prune, compaction, or checkpoint per HealthKit page. They run on a 15-minute timer and at background transitions under a background-task assertion. Compaction reads only the pass span plus one window, and a maintenance run takes up to five passes. Prune is two `end`-index ranges and rewrites only clamped sources. | Not measured on a device. |
+| 54 | Foreground and timer syncs go through the minimum interval and the backoff. A 429 that the client cannot absorb ends the cycle and keeps earlier collections. The deadline is lifted only by a clean cycle. A watch refresh pulls Health and republishes only. | Nothing. |
+| 55 | `.github/workflows/ios.yml` restored (unit, UI, iPad screenshots, watch build, warnings as errors, iOS 18 and newest runtimes). Both failing tests fixed and both compile warnings removed. Documents that describe CI are accurate again. | The workflow has not run. The catalog change is uncommitted, as before. |
+| 56 | Diagnostics are not observed and are built on export; connection state, HRV progress, and pulse-oximeter quality are published only when they change; `lastSeenAt` moves in 15-second steps; the stored-readings count is polled. | Volatile source status (battery, last seen) is still inside the observed `sources` array. |
+| 57 | Legacy compacted-median check starts with a window-boundary test. | Nothing. |
+| 58 | Retention impact and session revisit counts are SQL counts; sessions count only their own sources and metric, with a fingerprint that catches replacement. A baseline from before fingerprints is not compared. | Nothing. |
+| 60 | One `CSV` writer for both exporters; the whole-history and per-source exports neutralise source names and models. | Nothing. |
+| 61 | `HealthKitManager.dateOfBirth(from:)` uses a Gregorian calendar. | Nothing. |
+| 62 | Bluetooth write-back is queued and saved every 30 seconds and at background, with `HKDevice`, a sync identifier and version, a permission check per batch, a bounded queue, and a reported issue. | Nothing. The issue is shown under the Settings toggle. |
+| 63 | The App Group holds a per-metric projection, and timelines reload only when the projection changes. | Nothing. |
+| 64 | One `AsyncStream` per manager, applied by one main-actor task. | Not exercised on hardware. |
+| 65 | `AppModel.init` seams and `TransportActions`; refresh gated on startup; loops hold `self` weakly across sleeps; tests for 42, 43, and 54. | Derived-metric computation is still methods on `AppModel`, not a pure function over reads. Tests for 47 wait for that item. |
+| 67 | Payload dates keep milliseconds. Whole seconds are written exactly as before; both forms decode. | Nothing. |
+| 68 | The types and strings this item names, and every English plural ternary found, use `String(localized:)`; plurals are catalog variations. The tolerance summary no longer compares a localised unit with `"%"`. | Two interval-only strings (`Past N days/hours`) have no plural variation because N is at least 2. |
+| 70 | `Discrepancy` and its engine functions removed, with their four tests moved to the pairwise analysis. Documents corrected. Restore no longer syncs twice. A renamed source keeps its name across syncs. One share-sheet wrapper. | Nothing. |
+| 71 | Cached personal info holds only id and email. Keychain reads distinguish absent, undecodable, and unavailable; only the first two clear. | Nothing. |
+
+### 42. Apply the saved retention before any prune; never prune on defaulted settings
+
+**Observed behavior**
+
+- `HealthStore.retention` starts at 30 days
+  ([HealthStore.swift:96](Sources/Store/HealthStore.swift#L96)). `performLoad()` ends by
+  calling `prune()` ([HealthStore.swift:802](Sources/Store/HealthStore.swift#L802)), which
+  runs `DELETE FROM readings WHERE end < cutoff`.
+- `AppModel.start()` awaits `store.loadIfNeeded()`
+  ([AppModel.swift:104](Sources/App/AppModel.swift#L104)) and only afterwards calls
+  `applyRetentionSettings()` ([AppModel.swift:122](Sources/App/AppModel.swift#L122)). Every
+  cold launch, and every `retryStartup()`, therefore deletes everything older than 30 days
+  before a 90-day or 1-year choice is applied. Settings still says "1 year". Compacted
+  medians are deleted too, since the delete is by `end`.
+- The same deletion is also reachable with the right ordering. When `settings.json` is
+  unreadable (`loadState == .failed`), was reset after corruption, or was set aside because
+  an older build found a newer schema
+  ([ReadingArchive.swift:218](Sources/Store/ReadingArchive.swift#L218)),
+  `retentionDays` is the default 30
+  ([AppSettings.swift:8](Sources/Store/AppSettings.swift#L8)). `applyRetentionSettings()`
+  installs it, and the next `saveNow()` (every HealthKit page, every background transition)
+  prunes with it. The app refuses to overwrite a settings file it could not read, yet
+  deletes months of readings on the strength of the default that file would have replaced.
+- No test covers `AppModel`'s startup order (see item 65).
+
+**Improve it**
+
+- Hand the retention to the store before it loads (for example
+  `store.loadIfNeeded(retention:)`), or remove `prune()` from `performLoad()` and prune from
+  `AppModel` after `applyRetentionSettings()`.
+- Treat retention as unknown until settings have loaded a user value. Skip pruning (not
+  compaction) while `settings.loadState != .loaded`, after a corrupt-archive reset, and after
+  a newer-schema set-aside, until the user confirms a retention again. Say so in the startup
+  notice.
+- Consider recording the retention horizon in the database's `metadata` table, so the one
+  file that decides what may be deleted is the file being deleted from.
+
+**Done when**
+
+A test seeds readings 60 and 200 days old with `retentionDays = 365`, relaunches a new
+store and settings over the same files, and finds both. The same test with an unreadable,
+corrupt, or newer-schema `settings.json` deletes nothing.
+
+### 43. Scope estimate reconciliation to HeartSync's own estimates, in SQL
+
+**Observed behavior**
+
+- `recomputeDerivedMetrics()` reconciles blood-pressure estimates with `currentSince: nil`
+  whenever the blood-pressure index is off, which is the default
+  ([AppModel.swift:344](Sources/App/AppModel.swift#L344)).
+- `HealthDatabase.removeEstimates` deletes every row whose provenance is `.estimated` and
+  whose kind matches, from **any** source
+  ([HealthDatabase.swift:302](Sources/Store/HealthDatabase.swift#L302)).
+- The ring's blood pressure is stored as `.estimated`, both live and from history imports
+  ([R11MRingSession.swift:194](Sources/Bluetooth/R11MRingSession.swift#L194)). With default
+  settings every ring blood-pressure reading ever stored is deleted at startup, every 300
+  seconds, on every foreground, and after a calibration. With the index on and calibrated,
+  ring readings from the last five minutes are deleted instead: the value from **Measure
+  blood pressure** vanishes within five minutes.
+- The same function calls `readings()` with no filter, so it decodes the entire readings
+  table from JSON, twice per recompute, on the main actor.
+- Blood-pressure estimates are written under `heartsync.estimate`, but that source is only
+  created when a calibration is saved
+  ([SettingsView.swift:643](Sources/Views/SettingsView.swift#L643)). If the user removes it,
+  later estimates land under "Unknown device".
+
+**Improve it**
+
+- Identify HeartSync's own estimates positively, never by provenance alone: the estimate
+  source ID for blood pressure, and for VO₂ max (written under each device's source ID) an
+  optional, backward-decodable marker such as `ReadingMetadata.modelledBy`, or a nullable
+  indexed column.
+- Delete with one bounded statement on the `(kind, midpoint)` index (kind, source or marker,
+  `end >= currentSince`, `id NOT IN keeping`).
+- Upsert the estimate source in the same batch as its readings.
+
+**Done when**
+
+Live and imported ring blood-pressure readings survive `recomputeDerivedMetrics()` with the
+index off and on (new test). Reconciliation reads no rows outside the estimate kinds and
+window.
+
+### 44. Stop deleting Oura history when it ages out of the 14-day cache
+
+**Observed behavior**
+
+- `sync()` merges each collection with `keepAfter: cacheCutoff`, about 15 days back
+  ([OuraManager.swift:354](Sources/Oura/OuraManager.swift#L354)). It then computes
+  `withdrawnIDs` as every reading the previous cache produced that the new cache no longer
+  produces ([OuraManager.swift:626](Sources/Oura/OuraManager.swift#L626)) and deletes them
+  from SQLite through `upsertBatch(removingReadingIDs:)`.
+- A document that merely aged past the cutoff is therefore treated as withdrawn by Oura.
+  Nightly RMSSD, lowest and average heart rate, breathing rate, daily SpO₂, and VO₂ max are
+  one row per document and are never compacted, so none of them survives past about 15
+  days, although retention defaults to 30 days and can be a year. Oura heart-rate samples
+  escape only because compaction has already replaced them with differently identified
+  medians.
+- This undoes item 10's intent. Withdrawal is only knowable inside the window that a
+  complete, untruncated full-window response covered.
+
+**Improve it**
+
+- Compute withdrawals only for records dated inside `fullReconciliationWindow`, for
+  collections whose response was complete: the same condition `merged(...)` already uses.
+  Never derive them from cache pruning or from an incremental sync.
+- Let retention, not the dashboard cache, decide when stored Oura readings go.
+
+**Done when**
+
+A test syncs a sleep document, advances the clock 20 days, syncs a response without it,
+and finds the reading still stored. A document missing from a complete full-window response
+inside the window is still removed.
+
+### 45. Reject pulse-oximeter frames whose flagged status fields are missing
+
+**Observed behavior**
+
+- Both PLX parsers read the optional status fields as
+  `result.measurementStatus = reader.uint16()` and
+  `result.deviceAndSensorStatus = reader.uint24()`
+  ([Measurements.swift:269](Sources/Bluetooth/Measurements.swift#L269),
+  [Measurements.swift:305](Sources/Bluetooth/Measurements.swift#L305)). On a truncated frame
+  both return nil.
+- `quality(for:)` reads `measurementStatus ?? 0` and `deviceAndSensorStatus ?? 0`
+  ([Measurements.swift:181](Sources/Bluetooth/Measurements.swift#L181)). A frame that says
+  "status present" but was cut before it is therefore scored `.accepted` and becomes durable
+  evidence, bypassing the invalid and questionable checks from item 1.
+- The skipped fast and slow SFLOAT pairs are not checked either, and the parser tests have
+  no truncated-status vector.
+
+**Improve it**
+
+Return nil (diagnostics `.malformed`) whenever a field its flags declare cannot be read, in
+specification order. Keep "flag clear" (field absent) distinct from "flag set, bytes
+missing". Add a vector for each truncation point.
+
+**Done when**
+
+A continuous and a spot-check frame truncated at each flagged field are rejected, and the
+existing vectors still pass.
+
+### 46. Keep interval averages out of instantaneous comparison windows
+
+**Observed behavior**
+
+- `readings(fromSleep:)` stores Oura's whole-night `average_heart_rate` as `.heartRate`,
+  `average_breath` as `.respiratoryRate`, and `average_hrv` as `.hrvRMSSD`, each spanning
+  bedtime start to end ([OuraManager.swift:1094](Sources/Oura/OuraManager.swift#L1094)).
+  `readings(fromSpO2:)` stores the day's average SpO₂ across a whole UTC day
+  ([OuraManager.swift:1123](Sources/Oura/OuraManager.swift#L1123)).
+- `ComparisonEngine.windows` buckets every reading by its midpoint: 60 seconds for heart
+  rate, breathing rate, and SpO₂, 300 seconds for RMSSD
+  ([ComparisonEngine.swift:45](Sources/Analysis/ComparisonEngine.swift#L45)). An eight-hour
+  average lands in the one minute around 03:00 and is paired with a chest strap's median for
+  that minute. The daily SpO₂ average is paired with a pulse oximeter's reading at 12:00 UTC.
+- The timing check calls such a pair simultaneous, because `representativeTime` is the
+  reading's midpoint ([ComparisonEngine.swift:124](Sources/Analysis/ComparisonEngine.swift#L124)).
+  It supports a conclusion, counts toward the evidence grade, and is exported. Nothing in
+  the pipeline looks at a reading's duration; HealthKit interval samples take the same path.
+
+**Why it matters**
+
+The difference measures a night's mean against one minute, not one device against another.
+It can look like agreement or disagreement, and it is presented as device evidence.
+
+**Improve it**
+
+- Treat a reading longer than its metric's comparison window as an interval summary.
+  Exclude it from windowed pairing by default, as estimates are, or compare it only against
+  the other source's aggregate over the same interval, labelled as such.
+- Mark any such pair with a timing quality that never supports a conclusion.
+- Draw interval readings as spans on charts, not as points at their midpoint.
+
+**Done when**
+
+An Oura sleep-average heart rate and a strap stream over the same night form no windowed
+pair, and neither the verdict, the grade, nor the export includes it.
+
+### 47. Make resets exclusive with in-flight HealthKit and Oura imports
+
+**Observed behavior**
+
+- `resetLocalData` deletes the readings, removes the HealthKit anchor keys, then awaits the
+  Oura clear ([AppModel.swift:250](Sources/App/AppModel.swift#L250)). It does not stop the
+  long-running anchored queries or wait for a running `syncAll()` or `oura.sync()`.
+- HealthKit: each observer query keeps its own anchor. Its next update commits and
+  `save(anchor:)` writes that anchor back
+  ([HealthKitManager.swift:557](Sources/Health/HealthKitManager.swift#L557)), undoing
+  `resetAnchors()`. On an Apple Watch wearer's phone a heart-rate update arrives within
+  minutes, so **Clear local cache; data may resync** usually does not re-read older Health
+  history. A page fetched before a reset but committed after it puts "forgotten" data back.
+- Oura: `sync()` works on a copy (`var next = snapshot`) taken before its first await
+  ([OuraManager.swift:360](Sources/Oura/OuraManager.swift#L360)). A clear during a sync is
+  followed by the sync writing its copy to `oura-dashboard-v1.json` and upserting its
+  readings. After **Forget imported history** the account is signed out, but its data is
+  back.
+
+**Improve it**
+
+- One data-mutation gate in `AppModel`. A reset stops the HealthKit observers and awaits a
+  running `syncAll()`, cancels and awaits a running Oura sync, deletes, resets anchors, and
+  then restarts the observers from the reset anchors (clear for resync) or leaves them
+  stopped until the next foreground (forget).
+- A generation token in both managers, so a commit that began before a reset is dropped.
+  `ObserverState` already carries a per-query generation to build on.
+
+**Done when**
+
+With a delayed fake transport (item 65), a reset during a HealthKit page or an Oura sync
+leaves no reading from before the reset, and a clear-for-resync re-reads from a nil anchor.
+
+### 48. Make source mutations report and roll back failed writes
+
+**Observed behavior**
+
+- `remove(sourceID:)` removes the source from memory first, records a database failure only
+  in `lastPersistenceError`, and returns `true`
+  ([HealthStore.swift:228](Sources/Store/HealthStore.swift#L228)). Before the store has
+  loaded it changes memory only, and the source returns at the next load. By then
+  `AppModel.removeSource` has already forgotten the peripheral or cleared the Oura
+  credential.
+- Rename, Pause (`setEnabled`), battery, body location, and `upsert(_ source:)` go through
+  `mutateSource` and `persistSourcesIfReady`
+  ([HealthStore.swift:269](Sources/Store/HealthStore.swift#L269),
+  [HealthStore.swift:1046](Sources/Store/HealthStore.swift#L1046)). Memory changes, a failed
+  write is logged, nothing is returned, and the change reverts at the next launch.
+- Devices tells the user the removal happened either way.
+
+**Improve it**
+
+Write first, then publish; on failure keep memory unchanged and return a result that
+Devices shows ("Could not remove. Nothing was deleted."). Refuse removal while the store has
+not loaded. Delete from the store before forgetting the peripheral or the credential.
+
+**Done when**
+
+With `injectDatabaseFailureOnNextCommitForTesting()`, remove, rename, and pause leave the
+source list unchanged and report failure.
+
+### 49. Fix the watch chart cache and take snapshot building off the main actor
+
+**Observed behavior**
+
+- **Test failure.** `WatchChartTests.cache()` fails today at
+  [WatchChartTests.swift:186](Tests/Watch/WatchChartTests.swift#L186): after one new reading
+  the 30-day chart is rebuilt instead of reused.
+- The cause is the cache fingerprint, which joins the shown sources in recency order
+  ([WatchSnapshotBuilder.swift:51](Sources/Watch/WatchSnapshotBuilder.swift#L51)). With two
+  live sensors the newest source changes constantly, so every period is invalidated on nearly
+  every publication. The same order feeds `MetricDetailSnapshot.symbols(for:)`, so two
+  sources sharing a colour slot can swap shapes between publications.
+- `publishNow()` runs `WatchSnapshotBuilder.make` synchronously on the main actor
+  ([WatchCompanionPublisher.swift:24](Sources/Watch/WatchCompanionPublisher.swift#L24)). Per
+  metric it runs one `latest` query per enabled source, then up to four period reads, the
+  30-day one JSON-decoding every stored row, and `allPairwiseAnalyses` for each. `fitted`
+  re-encodes the payload once per dropped chart, and `publish` encodes it again. This is
+  scheduled every 30 seconds while data arrives, including in the background during
+  Bluetooth sessions.
+- `removalGeneration` advances whenever pruning deletes a row
+  ([HealthStore.swift:638](Sources/Store/HealthStore.swift#L638)), and pruning runs on every
+  HealthKit page (item 51), so the long periods are rebuilt far more often than their 15- and
+  60-minute intervals intend.
+
+**Improve it**
+
+- Build the fingerprint and the symbol assignment from sources sorted by stable ID; keep
+  display order separate.
+- Build period results off the main actor from one read (item 50). Invalidate a cached period
+  only when a removal falls inside it (track the earliest removed timestamp); retention
+  pruning of rows older than 30 days cannot change any cached period.
+- Encode the payload once.
+
+**Done when**
+
+`WatchChartTests.cache()` passes, and a device trace shows no main-thread stall from
+publication.
+
+### 50. Move SQLite reads and analysis off the main actor
+
+This finishes the open part of item 21.
+
+**Observed behavior**
+
+- `HealthStore` and `HealthDatabase` run on the main actor, and every query decodes one JSON
+  payload per row ([HealthDatabase.swift:410](Sources/Store/HealthDatabase.swift#L410)).
+  There is no `value` column, so no read can avoid the decode.
+- Compare, metric detail, the pair screen, the watch publisher, the retention preview,
+  session revisits, calibration, and the derived-metric loop all read and analyse
+  synchronously on the main actor. `.task(id:)` only schedules them: `ComparisonSnapshot`
+  reads and analyses the whole period inside its initializer
+  ([CompareView.swift:443](Sources/Views/CompareView.swift#L443)). Fourteen raw days of a
+  1 Hz strap are about 1.2 million rows per source.
+- Source filters run after decoding
+  ([HealthStore.swift:482](Sources/Store/HealthStore.swift#L482)), so hidden and disabled
+  sources are still decoded.
+- `PRAGMA user_version` is set to 2 unconditionally
+  ([HealthDatabase.swift:104](Sources/Store/HealthDatabase.swift#L104)); there is no
+  migration ladder for the next schema change.
+
+**Improve it**
+
+- A database actor (or serial executor) owns the write connection. A second, read-only
+  connection serves snapshot reads; WAL gives each read transaction a consistent snapshot.
+- Snapshot builders become `nonisolated` functions over `Sendable` rows. `.task(id:)`
+  awaits them and publishes on the main actor. `HealthStore` stays the observable façade.
+- Add a `value REAL` column (backfilled, additive) so windowing can skip JSON, push source
+  filters into SQL, and introduce a `user_version` migration ladder with it.
+- Then run `HeartSyncCheckerPerformance` on a device and record the budgets AGENTS.md says
+  are still to be confirmed.
+
+**Done when**
+
+A 30-day, two-source Compare load and a watch publication show no main-thread hang in a
+device trace, and the budgets are written down.
+
+### 51. Stop pruning, compacting, and checkpointing for every HealthKit page
+
+**Observed behavior**
+
+`commit(_:for:)` calls `store.saveNow()` after every page, before saving its anchor
+([HealthKitManager.swift:549](Sources/Health/HealthKitManager.swift#L549)). `saveNow()`
+runs `prune()` (a delete whose `start > ?` clause scans the table, then rewrites every
+source row), a compaction pass that reads every row from `.distantPast` to the pass cutoff
+([HealthStore.swift:664](Sources/Store/HealthStore.swift#L664)), and a WAL checkpoint
+([HealthStore.swift:811](Sources/Store/HealthStore.swift#L811)). Observer updates arrive for
+new Health samples throughout the day, so this runs on the main actor many times an hour. A
+compaction failure also blocks the anchor for good: the sync reports "Could not durably
+save", although the page itself committed.
+
+The committed transaction is already durable (`synchronous = FULL`). None of the three steps
+is needed before the anchor moves.
+
+**Improve it**
+
+- Advance the anchor after a successful commit.
+- Prune and compact on a timer and at background transitions, inside a
+  `beginBackgroundTask` assertion. `enterBackground()` has none today.
+- Compact only the new pass span, `[passStart, cutoff)`. Make the prune query use the `end`
+  index, and stop rewriting every source on each prune.
+
+### 52. Cut per-reading write amplification in Bluetooth ingest
+
+**Observed behavior**
+
+- Every accepted Bluetooth value is its own `ingest([reading])`
+  ([AppModel.swift:127](Sources/App/AppModel.swift#L127)), so its own `BEGIN IMMEDIATE …
+  COMMIT`, at up to 2 Hz per metric per sensor.
+- Each commit rewrites every source row as JSON
+  ([HealthDatabase.swift:243](Sources/Store/HealthDatabase.swift#L243)), because
+  `noteObserved` moves one source's `lastSeenAt` and the store passes the whole list.
+- The connection uses `synchronous = FULL` in WAL mode
+  ([HealthDatabase.swift:59](Sources/Store/HealthDatabase.swift#L59)), so each commit
+  fsyncs, and each commit then makes three `setAttributes` calls in `protectFiles()`
+  ([HealthDatabase.swift:533](Sources/Store/HealthDatabase.swift#L533)).
+- Before inserting, `store()` issues two lookups per reading: the compacted-window check and
+  `changedReadings` ([HealthStore.swift:380](Sources/Store/HealthStore.swift#L380)).
+
+An overnight strap session is tens of thousands of fsynced transactions. Not measured.
+
+**Improve it**
+
+- Buffer Bluetooth readings for one to five seconds and commit one batch; flush on
+  disconnect and on background.
+- Write only sources whose row changed.
+- Evaluate `synchronous = NORMAL` with WAL: durable across app crashes, can lose the last
+  transaction on power loss. Record the trade-off either way.
+- Set file protection at open and after checkpoints, not on every commit. Check existence
+  with one `SELECT id … WHERE id IN (…)` per batch.
+
+**Done when**
+
+The device workload reports commits per minute and energy impact for a one-hour strap
+session, before and after.
+
+### 53. Start transports at process launch so background relaunches work
+
+**Platform risk; confirm on a signed device.**
+
+**Observed behavior**
+
+- The `CBCentralManager` with restoration identifier `com.heartsync.central` is created only
+  in `BluetoothManager.configure`
+  ([BluetoothManager.swift:183](Sources/Bluetooth/BluetoothManager.swift#L183)), which
+  `AppModel.start()` calls after the database opens, from the root view's `.task`
+  ([HeartSyncApp.swift:13](Sources/App/HeartSyncApp.swift#L13)). Apple's restoration process
+  requires re-instantiating the central manager when the system relaunches the app, and
+  notes that scene-based apps receive nil launch options and must pass the identifier on
+  every launch. A view's `.task` is not a launch hook.
+- `willRestoreState` starts service discovery on restored peripherals
+  ([BluetoothManager.swift:1201](Sources/Bluetooth/BluetoothManager.swift#L1201)) before the
+  central reports `.poweredOn`. The `.poweredOn` callback then calls
+  `reconnectKnownDevices()`, whose `connect()` starts a second discovery because
+  `discoveryStates` is still empty until the first one answers.
+- HealthKit enables hourly background delivery
+  ([HealthKitManager.swift:716](Sources/Health/HealthKitManager.swift#L716)) but installs
+  only anchored queries, from the same late path. Apple's documentation for
+  `enableBackgroundDelivery` says to set up observer queries in the app delegate's launch
+  method, to call each update's completion handler, and that HealthKit stops background
+  delivery after the app fails to respond three times. There is no `HKObserverQuery`, so
+  there is no completion handler to call.
+
+**Improve it**
+
+- Add a `UIApplicationDelegateAdaptor`. In `didFinishLaunching`, create the central manager
+  and adopt restored peripherals, but hold ingestion until the store loads.
+- Register one `HKObserverQuery` per type at launch. Its handler runs the anchored drain and
+  calls the completion handler when the commit finishes, or fails.
+- In `willRestoreState`, only adopt peripherals; discover once the central is powered on.
+
+**Done when**
+
+The `RELEASE_CHECKLIST.md` background steps pass on a device: a restored strap keeps
+recording after the app is terminated by the system, and a new Apple Watch sample arrives
+without opening the app.
+
+### 54. Respect Oura rate limits on every automatic path
+
+**Observed behavior**
+
+- Every foreground calls `oura.sync()` directly
+  ([AppModel.swift:205](Sources/App/AppModel.swift#L205)), and `sync()` clears
+  `rateLimitedUntil` before it starts
+  ([OuraManager.swift:343](Sources/Oura/OuraManager.swift#L343)). Returning to the app runs
+  the full cycle of about 19 requests, seconds after the last one and even while Oura has
+  asked the app to wait. Only the timer uses `syncIfDue`.
+- A watch's **Refresh iPhone data** runs the same `refresh()`
+  ([AppModel.swift:92](Sources/App/AppModel.swift#L92),
+  [CompanionSession.swift:163](Shared/CompanionSession.swift#L163)) as often as every 15
+  seconds, possibly with the phone in the background: a HealthKit sync, a Bluetooth
+  reconnect, and an Oura sync, to rebuild a wrist snapshot.
+- After a 429 on one endpoint, `load` records the backoff and the cycle continues through the
+  remaining endpoints ([OuraManager.swift:702](Sources/Oura/OuraManager.swift#L702)), each of
+  which may retry inline twice.
+
+**Improve it**
+
+- Give `refresh()` a `userInitiated` flag. Foreground and watch refreshes call `syncIfDue`
+  with a minimum interval since `lastSyncedAt`; pull-to-refresh and **Sync now** bypass it.
+- Clear `rateLimitedUntil` only when a cycle completes without a 429.
+- Stop the cycle after a 429 the client could not absorb, keeping cached data.
+- A watch refresh republishes the snapshot, and at most pulls HealthKit.
+
+### 55. Restore an automated test gate and fix the two failing tests
+
+**Observed behavior**
+
+- `.github/workflows/ios.yml` was deleted in `c9a354c` on 2026-09-26. README ("the normal CI
+  scheme"), AGENTS.md, `RELEASE_CHECKLIST.md` ("Compare the CI screenshots"), and the status
+  notes of items 26–41 still describe CI as the place UI tests and screenshots run. Nothing
+  runs the suites automatically now.
+- Run locally for this review: 533 unit tests in 65 suites, **one failure**
+  (`WatchChartTests.cache()`, item 49). The 15 UI tests: **one failure**.
+  `testRemovalAsksFirstAndDeletesOnlyThatDevice` cannot find the removal dialog's Cancel
+  button ([HeartSyncCheckerUITests.swift:189](UITests/HeartSyncCheckerUITests.swift#L189)).
+  On the iOS 27 simulator an iPhone confirmation dialog shows no Cancel button and is
+  dismissed by tapping outside it; the test was written against iOS 18. The only simulator
+  runtime installed is iOS 27, while the deployment target is iOS 18.0, so neither end of the
+  supported range is covered by one run.
+- Test-target warnings: `XCUIDevice.shared.orientation` is mutated from a nonisolated context
+  ([HeartSyncCheckerUITests.swift:66](UITests/HeartSyncCheckerUITests.swift#L66), also lines
+  446 and 453), which becomes an error in a stricter language mode; `var review` is never
+  mutated ([WorkoutLifecycleTests.swift:87](Tests/Watch/WorkoutLifecycleTests.swift#L87)).
+- The working tree carries an uncommitted 847-line update to `Localizable.xcstrings` from
+  Xcode's extraction, so catalog changes are not reviewed with the code that produced them.
+
+**Improve it**
+
+Restore the workflow: unit tests, UI tests, the iPad screenshot job, and a watch build, on
+both the minimum (iOS 18) and the current simulator runtime. Fail on new warnings. Fix both
+failing tests before merging more; dismiss the removal dialog in a way that works on every
+supported OS (tap Cancel when it exists, otherwise tap outside). Commit catalog updates with
+the code that changes them. Update the documents that describe CI.
+
+### 56. Stop per-packet Observation churn; build diagnostics lazily
+
+**Observed behavior**
+
+- `BluetoothManager` writes observed dictionaries on every packet. `diagnostics[id]` changes
+  on every notification ([BluetoothManager.swift:1347](Sources/Bluetooth/BluetoothManager.swift#L1347)),
+  `connectionStates[id]` is reassigned on every accepted value even when unchanged
+  ([BluetoothManager.swift:576](Sources/Bluetooth/BluetoothManager.swift#L576)), and
+  `hrvProgress[id]` on every heart-rate frame
+  ([BluetoothManager.swift:702](Sources/Bluetooth/BluetoothManager.swift#L702)). Observation
+  fires on assignment, not on change.
+- Each Bluetooth row in `DevicesView` reads these, and builds the device's full diagnostics
+  report, up to 200 hex-encoded packets, inside its `Menu` during body evaluation
+  ([DevicesView.swift:263](Sources/Views/DevicesView.swift#L263)). While a device streams,
+  the list re-renders and rebuilds reports several times a second.
+- `HealthStore.sources` is written on every commit (`noteObserved` sets `lastSeenAt`,
+  [HealthStore.swift:1052](Sources/Store/HealthStore.swift#L1052)), so every view that reads
+  `sources` or `enabledSources` re-renders at the ingest rate. Settings shows
+  `store.readingCount`, a `COUNT(*)`, and re-runs it on every ingest
+  ([SettingsView.swift:88](Sources/Views/SettingsView.swift#L88)).
+
+**Improve it**
+
+Mark high-rate internal state `@ObservationIgnored` and publish a coalesced per-device
+status only when it changes. Build the diagnostics report when the user exports it. Split
+volatile source status (last seen, battery) out of the observed source array. Show the
+reading count from a coalesced value.
+
+### 57. Remove SHA-256 from the per-reading aggregation hot path
+
+**Observed behavior**
+
+`ComparisonEngine.aggregate` filters samples with `isLegacyCompactedMedian`, which formats a
+string and hashes it with SHA-256 for every reading without aggregation metadata, that is,
+every raw reading ([ComparisonEngine.swift:94](Sources/Analysis/ComparisonEngine.swift#L94),
+[ComparisonEngine.swift:512](Sources/Analysis/ComparisonEngine.swift#L512)). Every
+`windows()` call pays it: Compare, detail, pair, the watch periods, derived metrics, and
+compaction.
+
+**Improve it**
+
+Check the cheap facts first: only a row whose start and end equal an aligned window can be a
+legacy median. Or mark legacy medians once and drop the check.
+
+### 58. Replace whole-history reads used only for counts
+
+**Observed behavior**
+
+- `retentionImpact(days:)` decodes the whole table to count two numbers
+  ([HealthStore.swift:614](Sources/Store/HealthStore.swift#L614)). Settings calls it on every
+  retention change, even an increase, where the result is unused
+  ([SettingsView.swift:174](Sources/Views/SettingsView.swift#L174)).
+- `openSession` decodes every reading in a session's period just to count them
+  ([CompareView.swift:269](Sources/Views/CompareView.swift#L269)). It counts every source
+  (`enabledOnly: false`), so "N readings have been imported for this period" includes devices
+  that are not in the session. `revisitDisclosure` compares net counts
+  ([ComparisonSession.swift:131](Sources/Model/ComparisonSession.swift#L131)), so five
+  readings added and five removed read as "unchanged".
+
+**Improve it**
+
+Use `COUNT(*)` on the existing indexes, restricted to the session's sources and metric.
+Record a fingerprint (count plus maximum `rowid`, or a hash of IDs) to detect replacement,
+not only net growth.
+
+### 59. Stream exports off the main actor with keyset pages, cancel, and cleanup
+
+**Observed behavior**
+
+- All three exports (retention, per-source removal, pairwise) run on the main actor
+  ([SettingsView.swift:419](Sources/Views/SettingsView.swift#L419),
+  [ReadingsShareSheet.swift:16](Sources/Views/ReadingsShareSheet.swift#L16)). The
+  `ProgressView` beside the button cannot animate while the main thread writes.
+- `writeExportCSV` pages with `LIMIT ? OFFSET ?`
+  ([HealthDatabase.swift:152](Sources/Store/HealthDatabase.swift#L152)). Each page re-scans
+  every earlier row, which is quadratic for millions of rows, and a prune or HealthKit
+  deletion between pages can skip or repeat rows. The `shouldContinue` cancellation hook is
+  never connected to a control.
+- Temporary directories are removed when the sheet is dismissed, but a crash or a kill while
+  sharing leaves health CSVs in `tmp`, and nothing sweeps them at launch.
+
+**Improve it**
+
+Keyset pagination on `(end, rowid)` inside one read transaction, on the database actor, with
+progress and Cancel. Sweep `HeartSync-*` temporary directories at launch.
+
+### 60. Neutralise spreadsheet formulas in every CSV export
+
+**Observed behavior**
+
+`PairwiseExporter` passes free-form names and models through `safeSpreadsheetMetadata`
+([PairwiseExport.swift:206](Sources/Analysis/PairwiseExport.swift#L206)). The whole-history
+and per-source exports (`HealthStore.exportRows`,
+[HealthStore.swift:970](Sources/Store/HealthStore.swift#L970)) write `source_name` and
+`source_model` with RFC 4180 quoting only. Those strings come from Bluetooth advertisements
+and Device Information characteristics, which any nearby device controls. A name that begins
+with `=`, `+`, `-`, or `@` becomes a formula when the file is opened in a spreadsheet. The
+two exporters also keep separate `csvEscape` implementations.
+
+**Improve it**
+
+One shared CSV writer for both, with the same neutralisation. Test with a device named
+`=HYPERLINK("https://example.com")`.
+
+### 61. Read Health's date of birth in the Gregorian calendar
+
+**Observed behavior**
+
+`readDateOfBirth()` converts with `Calendar.current.date(from: components)`
+([HealthKitManager.swift:400](Sources/Health/HealthKitManager.swift#L400)). Apple documents
+`dateOfBirthComponents()` as the birthdate in the Gregorian calendar. On a phone set to the
+Buddhist or Japanese calendar the year is read in that calendar, the date lands centuries
+away, `UserProfile.age` rejects it, and **Import from Apple Health** silently stores an
+unusable birth date. The age-predicted maximum heart rate and the VO₂ max estimate then
+disappear.
+
+**Improve it**
+
+Convert with `Calendar(identifier: .gregorian)`. Test under a Buddhist-calendar locale.
+
+### 62. Make HealthKit write-back batched, attributable, and idempotent
+
+**Observed behavior**
+
+`write(_:)` saves one `HKQuantitySample` per accepted Bluetooth reading
+([HealthKitManager.swift:874](Sources/Health/HealthKitManager.swift#L874)), up to twice a
+second per metric, from an unstructured task per batch
+([AppModel.swift:306](Sources/App/AppModel.swift#L306)). The samples carry no `HKDevice`,
+although the strap's name, model, and firmware are known, and no sync identifier. Failures
+are logged at debug level only, and share authorization is not re-checked, so a revoked
+permission fails silently on every reading.
+
+**Improve it**
+
+- Batch saves (for example every 30–60 seconds), or build heart rate with
+  `HKQuantitySeriesSampleBuilder`.
+- Attach an `HKDevice` from the source's metadata.
+- Set `HKMetadataKeySyncIdentifier` to the reading ID and `HKMetadataKeySyncVersion` to 1,
+  so a retry cannot duplicate a sample.
+- Check `authorizationStatus(for:)` and show a persistent failure in Settings.
+
+### 63. Reload complications only when what they show changes
+
+**Observed behavior**
+
+The watch app saves every received snapshot to the complication cache and reloads timelines
+whenever it differs ([HeartSyncWatchApp.swift:87](WatchApp/Sources/HeartSyncWatchApp.swift#L87),
+[WatchComplicationStore.swift:47](Shared/WatchComplicationStore.swift#L47)). `generatedAt`
+changes on every iPhone publication, up to every 30 seconds while data arrives, so nearly
+every delivery spends WidgetKit's reload budget, including on chart and comparison changes no
+complication shows. The extension then decodes the whole snapshot, up to 60 KB, to show one
+value ([MeasurementProvider.swift:36](WatchComplications/Sources/MeasurementProvider.swift#L36)).
+
+**Improve it**
+
+Compare the complication projection (each metric's displayed value, source, provenance, and
+stale deadline) and reload only when it changes. Store only that projection in the App
+Group.
+
+### 64. Serialise watch workout delegate events
+
+**Observed behavior**
+
+Each `HKWorkoutSessionDelegate` and builder callback spawns its own `Task { @MainActor … }`
+([WatchWorkoutManager.swift:258](WatchApp/Sources/WatchWorkoutManager.swift#L258)). Separate
+unstructured tasks carry no ordering guarantee, so running, paused, and stopped events can
+apply out of order. The token guard rejects events from old sessions, not reordered events
+of the current one. `HealthKitManager` already solves this with an `AsyncStream`.
+
+**Improve it**
+
+One `AsyncStream` per session, consumed by a single main-actor task. Add a lifecycle test
+that delivers events out of order.
+
+### 65. Give `AppModel` test seams and cover its orchestration
+
+**Observed behavior**
+
+- `AppModel` builds its store, settings, sessions, and managers itself
+  ([AppModel.swift:14](Sources/App/AppModel.swift#L14)). No unit test exercises startup
+  order, reset, derived metrics, or refresh, and items 42, 43, 47, and 54 all live there.
+- `refresh()` can run while `start()` is suspended, because `hasStarted` is set first. A
+  foreground at launch publishes an "unavailable" watch snapshot and recomputes estimates
+  before the store has loaded.
+- The derived-metric and Oura loops rebind `self` strongly for the whole 300-second sleep
+  ([AppModel.swift:321](Sources/App/AppModel.swift#L321),
+  [AppModel.swift:501](Sources/App/AppModel.swift#L501)), although the comments say the loop
+  ends when the model goes.
+
+**Improve it**
+
+- An initializer that accepts the store, settings, sessions, and small transport adapters
+  (only the closures `AppModel` calls). AGENTS.md allows a narrow seam when testing needs it.
+- Extract derived-metric computation as a pure function over reads.
+- Gate `refresh()` on `startupState == .ready`, and hold `self` weakly across sleeps.
+- Tests for items 42, 43, 47, and 54.
+
+### 66. Consolidate `BluetoothManager`'s per-peripheral state
+
+**Observed behavior**
+
+`BluetoothManager` is 1,456 lines, with about 23 dictionaries keyed by peripheral UUID
+([BluetoothManager.swift:40](Sources/Bluetooth/BluetoothManager.swift#L40)). `forget` and
+`endConnectionSession` must clear each one by hand; `forget` leaves `connectionSessions`
+behind. A Bluetooth power-off ends sessions without resetting the HRV accumulators, since no
+disconnect callback arrives, so an R–R series can be joined across the outage.
+
+**Improve it**
+
+One value per UUID for connection-lifetime state and one for device-lifetime state; ending a
+session replaces one value. Move the ring adapter plumbing into its own type. The state
+transitions then become testable without CoreBluetooth.
+
+### 67. Keep sub-second timestamps in stored payloads
+
+**Observed behavior**
+
+`HealthDatabase` encodes payloads with the `.iso8601` date strategy, which drops fractional
+seconds ([HealthDatabase.swift:32](Sources/Store/HealthDatabase.swift#L32)), while the
+`start`, `end`, and `midpoint` columns keep full precision. Queries select by the precise
+column, but analysis bins the truncated decoded dates. A one-second reading from 59.7 s to
+60.7 s has a stored midpoint of 60.2 s and a decoded midpoint of 59.5 s: it is returned for
+a range starting at 60 s, then dropped or binned into the previous window. HRV observation
+intervals and pair-timing separations also lose their fractions.
+
+**Improve it**
+
+Encode new payload dates with fractional seconds (or as numbers) and decode both forms, or
+decode dates from the columns. IDs do not change; payload compatibility needs a test.
+
+### 68. Localise the remaining plain-string copy and plurals
+
+**Observed behavior**
+
+The catalog holds 637 keys, English only. Several user-facing strings are plain `String`s
+that never reach it: `TimeRange.title`, `ComparisonPeriod.title`, `PairTimingQuality.title`,
+`PairwiseEvidenceGrade.title`, the evidence `reasons`, `revisitDisclosure`,
+`SensorTechnology.title`, the PLX `QualityReason.title`, the Oura sync summaries,
+`WatchChartRange.spokenTitle`, `CompanionSession.status`, the `WatchWorkoutActivity` titles,
+and several Settings alert titles. Plurals are built with English ternaries ("reading has" /
+"readings have"). `toleranceSummary` compares the localised unit with `"%"`
+([SettingsView.swift:284](Sources/Views/SettingsView.swift#L284)).
+
+**Improve it**
+
+`String(localized:)` or `LocalizedStringResource` with catalog plural variations. Exports
+stay English, as their contract requires.
+
+### 69. Tighten smaller comparison-honesty details
+
+- A fixed period prints its end time without a date
+  ([ComparisonSession.swift:28](Sources/Model/ComparisonSession.swift#L28)), so a two-day
+  session reads "3 Sep 07:00 to 08:00".
+- `HRVCalculator.metrics` takes successive differences over the filtered list
+  ([HRVCalculator.swift:209](Sources/Analysis/HRVCalculator.swift#L209)). A difference can
+  span a removed ectopic beat, and in the accumulator a gap in the R–R stream. RMSSD should
+  use adjacent normal-to-normal pairs only.
+- Confidence intervals use z = 1.96 and treat consecutive windows as independent
+  ([ComparisonEngine.swift:601](Sources/Analysis/ComparisonEngine.swift#L601)). Adjacent
+  60-second windows from one walk are autocorrelated, so the bias interval is too narrow, and
+  "strong" evidence at 30 windows can mean 30 minutes of one activity. Use a t quantile and
+  an effective sample size, and say so in the export's methodology text.
+- `isTemporallyValid` rejects any non-Oura, non-estimate reading that ends after now
+  ([HealthStore.swift:1073](Sources/Store/HealthStore.swift#L1073)). A HealthKit sample from a
+  device clock a few seconds ahead is dropped while its anchor advances, so it is never
+  imported. Allow the five-minute skew Bluetooth already allows.
+
+### 70. Remove dead code and documentation drift
+
+- `Discrepancy`, `ComparisonEngine.discrepancies`, and `allDiscrepancies` are used only by
+  tests, and duplicate the Bland–Altman statistics in `summaryStatistics`
+  ([ComparisonEngine.swift:258](Sources/Analysis/ComparisonEngine.swift#L258)).
+- AGENTS.md describes `AppModel.dataVersion`, which no longer exists. README says the UI
+  suite has 13 flows; AGENTS.md says 15.
+- `restoreSessionIfNeeded()` calls `requestAuthorization`, which syncs and starts observers
+  ([HealthKitManager+Session.swift:107](Sources/Health/HealthKitManager+Session.swift#L107));
+  `start()` then syncs again, stopping and restarting all nine observers
+  ([AppModel.swift:157](Sources/App/AppModel.swift#L157)). Its comment about avoiding the
+  manager's "private `healthStore`" is stale: the property is internal.
+- `HealthStore.merge` overwrites `displayName` on every transport upsert
+  ([HealthStore.swift:194](Sources/Store/HealthStore.swift#L194)). Harmless today, because
+  only Bluetooth rows offer Rename and Bluetooth updates reuse the stored name, but an alias
+  for a Health or Oura source (item 23) would be undone by the next sync.
+- Three share-sheet wrappers do the same job (`RetentionActivityView`, `ReadingsShareSheet`,
+  and the pairwise one).
+
+### 71. Keep less Oura account data; distinguish Keychain failures
+
+- `OuraClient.PersonalInfo` decodes and caches age, weight, and height in
+  `oura-dashboard-v1.json`, which is backed up, but only the email is shown
+  ([OuraClient.swift:352](Sources/Oura/OuraClient.swift#L352)). Drop the unused fields, or
+  the `personal` scope if the email is not needed.
+- `Keychain.get` returns nil for every failure
+  ([Keychain.swift:41](Sources/Store/Keychain.swift#L41)), and `OuraManager.configure` clears
+  the credential when it reads nil
+  ([OuraManager.swift:205](Sources/Oura/OuraManager.swift#L205)). Today this runs after the
+  database opens, so after first unlock, but a transient `errSecInteractionNotAllowed` would
+  sign the user out. Return the status and clear only on "not found" or an invalid value.
+
+### 72. Consider a live watch-versus-sensor view through workout mirroring
+
+**Design proposal.** `HKWorkoutSession` mirroring (watchOS 10 and iOS 17 onwards) can stream
+a workout's live heart rate to the paired iPhone. During a watch workout, Now could show
+Apple Watch beside a chest strap in real time, while the samples still arrive through the
+HealthKit import afterwards. It needs a deliberate HealthKit and product decision, and a
+display-only rule so mirrored values never enter the store or a comparison.
+
+### External leads checked
+
+| Lead | Outcome | Item |
+| --- | --- | --- |
+| HealthKit import can overlap a data reset | Confirmed. Observer anchors are written back after the reset, and pages fetched before it commit after it. Oura has the same race | 47 |
+| Watch snapshots do substantial synchronous history work | Confirmed, together with a failing cache test | 49 |
+| Truncated pulse-oximeter packets pass without their declared quality fields | Confirmed | 45 |
+| Some source mutations report success in memory when the database write fails | Confirmed for remove, rename, pause, and metadata updates | 48 |
+| Oura cache cleanup can remove retained comparison history | Confirmed: aging out of the cache is treated as an upstream withdrawal | 44 |
+| Startup pruning can run before the saved retention is applied | Confirmed on every launch, and also reachable through defaulted settings | 42 |
+| Estimate reconciliation can include the ring's blood pressure | Confirmed and broader: with the index off (the default), every ring blood-pressure reading is deleted every five minutes | 43 |
+
+### Strengths to preserve
+
+- Outcome types that refuse to read "failed" as "empty" (`HealthStoreQueryOutcome`,
+  `ReadingArchive.ReadOutcome`), and startup that will not attach transports to an
+  inconclusive store.
+- Pure, testable cores: `ComparisonEngine`, the GATT parsers, `WorkoutLifecycle`,
+  `R11MRingSession`, `LiveReloadPolicy`, and `SourceRemovalConsequence`.
+- HealthKit's finite pages, anchor-after-commit rule, and backpressured observer stream.
+- Oura's per-collection isolation, merge-by-ID cache, and careful 401 handling.
+- The evidence rules: estimates outside agreement, five paired windows, insufficient
+  evidence never green.
+- A validated, size-capped watch payload.
+- 533 unit tests that run in under five seconds.
+
+### Validation for this review (2026-09-29)
+
+**Executed**
+
+- Read every Swift file under `Sources/App`, `Sources/Store`, `Sources/Model`,
+  `Sources/Analysis`, `Sources/Health`, `Sources/Oura`, `Sources/Watch`, `Shared`, the watch
+  app's workout, dashboard, and entry files, and the complication provider and store in
+  full; read `BluetoothManager`, `Measurements`, `BinaryReader`, and
+  `BluetoothIngestionPolicy` in full; read `SettingsView` and the loading paths of
+  `CompareView`, `DashboardView`, `DevicesView`, `MetricDetailSnapshot`, and
+  `DashboardSnapshot`. The remaining view files, the ring codec and history files, and the
+  diagnostics types were swept for the patterns above (store reads in bodies, unstructured
+  tasks, formatter construction, forced unwraps) rather than read line by line; items 26–41
+  reviewed those views in depth.
+- `xcodebuild test` of the `HeartSyncChecker` scheme, unit bundle only, on an iPhone 17 Pro
+  Max simulator (iOS 27.0) with Xcode 27.1: 533 tests in 65 suites, 532 passed, 1 failed
+  (`WatchChartTests.cache()`, item 49).
+- `xcodebuild test` of the UI bundle on the same simulator: 15 tests in 422 seconds, 14
+  passed, 1 failed (`testRemovalAsksFirstAndDeletesOnlyThatDevice`: iOS 27's confirmation
+  dialog exposes no Cancel button; see item 55). The chart-gallery screenshot flow passed.
+- Checked the HealthKit background-delivery and date-of-birth claims, and the CoreBluetooth
+  restoration claim, against Apple's documentation (sources below).
+
+**Not done**
+
+- No device, watch, ring, or Oura account was used. Items 50, 52, and 53 need device
+  measurements or a signed build before any claim about their effect.
+- No Instruments trace; every performance statement is inferred from the code.
+- No code was changed. Only `improvements.md` was edited; the uncommitted
+  `Localizable.xcstrings` change in the working tree predates this review and was left as it
+  was.
+
+**Sources**
+
+- Apple, [`enableBackgroundDelivery(for:frequency:withCompletion:)`](https://developer.apple.com/documentation/healthkit/hkhealthstore/enablebackgrounddelivery(for:frequency:withcompletion:))
+  and [Executing observer queries](https://developer.apple.com/documentation/healthkit/executing-observer-queries):
+  set up observer queries in the app delegate at launch, call the update's completion
+  handler, and HealthKit stops background updates after three failures to respond.
+- Apple, [`dateOfBirthComponents()`](https://developer.apple.com/documentation/healthkit/hkhealthstore/dateofbirthcomponents()):
+  the components represent the birthdate in the Gregorian calendar.
+- Apple, [`CBCentralManagerOptionRestoreIdentifierKey`](https://developer.apple.com/documentation/corebluetooth/cbcentralmanageroptionrestoreidentifierkey)
+  (scene-based apps receive nil launch options and must pass the identifier on every launch)
+  and [Core Bluetooth background processing](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/CoreBluetoothBackgroundProcessingForIOSApps/PerformingTasksWhileYourAppIsInTheBackground.html)
+  (re-instantiate central managers when the app is relaunched).
+
+---
+
+
+## Previous review: visuals, charts, and interaction (2026-09-26)
 
 Reviewed `main` at commit
 [`9d611f54c8d94a3f2835e1c1ad3cc0d17f51e352`](https://github.com/PopShark57/HeartSync/commit/9d611f54c8d94a3f2835e1c1ad3cc0d17f51e352),
@@ -43,22 +1020,25 @@ was and was not executed.
 
 | Item | Priority | Improvement | Basis | Size | Status |
 | --- | --- | --- | --- | --- | --- |
-| 26 | P1 | Confirm before a swipe or button deletes a device's history | Observed defect | S | Done. Splitting "forget device" from "delete history" is still a product decision |
-| 27 | P1 | Keep the chosen range and a saved session's period when drilling down | Observed defect | S–M | Done. UI tests written; first run is in CI |
-| 28 | P1 | Stop re-running the pairwise analysis on every drag frame | Observed performance risk | M | Done in code. The device Time Profiler trace is still to do |
-| 29 | P1 | Bound and coalesce the live screens' reloads during ingest | Performance risk; measure on device | M | Partial. Bounded, throttled and budgeted, but not measured on a device. One 30-day load still blocks the main actor (item 21) |
-| 30 | P1 | Break every chart line and band across data gaps; no overshooting curves | Observed honesty gap | S | Done. On-screen check still to do |
-| 31 | P1 | Fix colour collisions for colour-blind readers and between meanings | Measured | M | Done. Validator runs as a unit test; on-device visual check still to do |
-| 32 | P2 | Make the metric-detail chart scrubbable with an inline callout | Design proposal | M | Done in code. On-screen and VoiceOver checks still to do |
-| 33 | P2 | Add pan, zoom, and period selection to history charts | Design proposal (+ observed axis gap) | M–L | Done with buttons, not pinch or scroll (Apple chart bugs); see status |
-| 34 | P2 | Rebuild pairwise-chart selection on the native selection API | Design proposal (+ observed gaps) | M | Done in code. The list-scrolling device check is still to do |
-| 35 | P2 | Turn the Oura cards into real charts: heart rate, hypnogram, 14-day trends | Design proposal (+ observed legend gap) | M–L | Done in code. On-screen and VoiceOver checks still to do |
-| 36 | P2 | Give the Now tab sparklines, motion, and honest "live" labelling | Design proposal (+ observed wording issue) | M | Done in code. UI test written; on-screen and Reduce Motion checks still to do |
-| 37 | P2 | Make dense charts work with VoiceOver, Audio Graphs, and Dynamic Type | Accessibility gap | M | Done in code. The AX5 VoiceOver and Audio Graph pass is still to do |
-| 38 | P2 | Adapt layouts for iPad and landscape | Design proposal | M | Done in code. iPad screenshots come from CI; a device look is still to do |
-| 39 | P2 | Consolidate visual tokens, chart styling, and loading feedback | Polish and maintainability | S–M | Done |
-| 40 | P2 | Adopt Always On guidance and gauges on the watch | Design proposal | S–M | Done in code. The physical-watch Always On and face checks are still to do |
-| 41 | P2 | Add previews, chart fixtures, and screenshot artefacts for UI work | Developer experience | M | Done. Previews not yet opened in Xcode; vectorized plots evaluated, not adopted |
+| 26 | P1 | Confirm before a swipe or button deletes a device's history | Observed defect | S | Complete |
+| 27 | P1 | Keep the chosen range and a saved session's period when drilling down | Observed defect | S–M | Complete |
+| 28 | P1 | Stop re-running the pairwise analysis on every drag frame | Observed performance risk | M | Complete |
+| 29 | P1 | Bound and coalesce the live screens' reloads during ingest | Performance risk; measure on device | M | Complete |
+| 30 | P1 | Break every chart line and band across data gaps; no overshooting curves | Observed honesty gap | S | Complete |
+| 31 | P1 | Fix colour collisions for colour-blind readers and between meanings | Measured | M | Complete |
+| 32 | P2 | Make the metric-detail chart scrubbable with an inline callout | Design proposal | M | Complete |
+| 33 | P2 | Add pan, zoom, and period selection to history charts | Design proposal (+ observed axis gap) | M–L | Complete |
+| 34 | P2 | Rebuild pairwise-chart selection on the native selection API | Design proposal (+ observed gaps) | M | Complete |
+| 35 | P2 | Turn the Oura cards into real charts: heart rate, hypnogram, 14-day trends | Design proposal (+ observed legend gap) | M–L | Complete |
+| 36 | P2 | Give the Now tab sparklines, motion, and honest "live" labelling | Design proposal (+ observed wording issue) | M | Complete |
+| 37 | P2 | Make dense charts work with VoiceOver, Audio Graphs, and Dynamic Type | Accessibility gap | M | Complete |
+| 38 | P2 | Adapt layouts for iPad and landscape | Design proposal | M | Complete |
+| 39 | P2 | Consolidate visual tokens, chart styling, and loading feedback | Polish and maintainability | S–M | Complete |
+| 40 | P2 | Adopt Always On guidance and gauges on the watch | Design proposal | S–M | Complete |
+| 41 | P2 | Add previews, chart fixtures, and screenshot artefacts for UI work | Developer experience | M | Complete |
+
+**Status (2026-09-29):** items 26–41 are complete. Each item's own status note records what
+was verified when it was implemented.
 
 **P1** here means fix first: data loss, wrong analysis period, misleading drawing, or work
 that interactive charts would make worse. **P2** is the interactive and visual roadmap
@@ -1541,7 +2521,7 @@ report("Oura sleep ribbon", list(combinations(sleep.items(), 2)))
 ---
 
 
-## Previous follow-up review (2026-09-08)
+## Earlier follow-up review (2026-09-08)
 
 Reviewed `main` at commit
 [`ca8f07a7993572722a0d09967f8a8c416acb4389`](https://github.com/PopShark57/HeartSync/commit/ca8f07a7993572722a0d09967f8a8c416acb4389),

@@ -349,11 +349,13 @@ struct OuraClient: Sendable {
         var size: Int?
     }
 
+    /// Only what the app shows. Oura also returns age, weight, height, and biological sex;
+    /// none of it is used, and this value is cached in `oura-dashboard-v1.json`, which is
+    /// included in device backups, so the unused body measurements are not decoded and not
+    /// kept. A cache written before this change still decodes: unknown keys are ignored, and
+    /// the next sync rewrites the file without them.
     struct PersonalInfo: Codable, Hashable, Sendable {
         var id: String? = nil
-        var age: Int?
-        var weight: Double?
-        var height: Double?
         var email: String?
     }
 

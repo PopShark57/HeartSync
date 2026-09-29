@@ -174,3 +174,28 @@ Record the ring's model, firmware, and the diagnostic report with each result.
   - no line, band, or area bridges a data gap, and no curve overshoots its samples;
   - a saved session's banner, not the range picker, on metric detail and on the pair
     screen.
+
+## Data safety and background behavior (2026-09 review, items 42–71)
+
+These need a signed build on a physical iPhone and watch; the automated tests cover the logic
+but not the platform behavior.
+
+- [ ] Retention: with a 1-year period saved and readings older than 30 days present, force-quit
+  and relaunch, then relaunch with the device locked after a restart (first unlock). Nothing older
+  than 30 days disappears. Delete `settings.json` from a test build and relaunch: Settings shows
+  "Resume deleting readings…" and the startup notice, and nothing is pruned until a period is
+  chosen.
+- [ ] Ring blood pressure: import stored readings and measure blood pressure on the ring, leave the
+  blood-pressure index off, wait five minutes and foreground twice. The ring's values remain.
+- [ ] Oura: kill the app while a sync is in progress, relaunch, then use Forget imported history.
+  No Oura reading older than 14 days remains. Lock the phone straight after a restart and open the
+  app in the background: the account is not signed out.
+- [ ] Write-back: with Bluetooth mirroring on, confirm samples appear in Health in batches roughly
+  every 30 seconds, attributed to the strap's name, without duplicates after a reconnect. Turn write
+  permission off in Health and confirm Settings reports it instead of failing silently.
+- [ ] Complications: watch the reload count while a strap streams; a new delivery that changes no
+  displayed value must not reload the timelines.
+- [ ] Watch workout: pause, resume, and stop in quick succession several times; the workout ends
+  in review with the right elapsed time and never returns to running.
+- [ ] Diagnostics: open Devices while a strap streams and confirm the list stays still, and that
+  **Export diagnostics…** builds the report only when tapped.

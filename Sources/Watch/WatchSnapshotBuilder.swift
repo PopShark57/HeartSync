@@ -46,7 +46,12 @@ enum WatchSnapshotBuilder {
             }
             guard !latest.isEmpty else { return nil }
             let shown = Array(latest.prefix(WatchSnapshot.maximumSourcesPerMetric))
-            let shownSources = shown.map(\.source)
+            // Stable order for everything a cached period depends on. `shown` is in recency
+            // order, which changes whenever either of two live sensors reports; keying the
+            // cache, the series order, and the shape assignment on it invalidated every
+            // period on nearly every publication and let two sources that share a colour
+            // swap shapes between them.
+            let shownSources = shown.map(\.source).sorted { $0.id < $1.id }
             // Anything that changes what a cached period would draw or compare.
             let fingerprint = enabledIDs + "|" + shownSources
                 .map { "\($0.id)\u{001F}\($0.displayName)\u{001F}\($0.colorIndex)" }

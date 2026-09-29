@@ -130,7 +130,17 @@ final class HealthKitManager {
     // Internal so HealthKitManager+Session can query authorization status.
     let healthStore = HKHealthStore()
     private var activeQueries: [HKQuery] = []
-    private weak var store: HealthStore?
+    private(set) weak var store: HealthStore?
+    /// Measured Bluetooth readings waiting for the next batched save; see
+    /// `HealthKitManager+WriteBack`. Stored here because an extension cannot add state.
+    var pendingWrites: [Reading] = []
+    var writeFlushTask: Task<Void, Never>?
+    var isFlushingWrites = false
+    /// Why the last save into Health did not happen, for Settings to show. Nil when the last
+    /// flush succeeded or nothing has been written.
+    var writeBackIssue: String?
+    /// Readings the buffer dropped because it was full or Health refused them.
+    var writeBackDroppedCount = 0
     private var onReadings: (@MainActor ([Reading], [DataSource], Set<UUID>) -> Bool)?
 
     /// HealthKit query results are deliberately drained in finite pages. The total budget is a
@@ -398,10 +408,18 @@ final class HealthKitManager {
     /// have to type what Health already knows. HeartSync deliberately does not request or
     /// retain biological sex because no current feature uses it.
     func readDateOfBirth() -> Date? {
-        if let components = try? healthStore.dateOfBirthComponents() {
-            return Calendar.current.date(from: components)
-        }
-        return nil
+        guard let components = try? healthStore.dateOfBirthComponents() else { return nil }
+        return Self.dateOfBirth(from: components)
+    }
+
+    /// HealthKit documents `dateOfBirthComponents()` as the birth date in the **Gregorian**
+    /// calendar. Converting with `Calendar.current` reads the year in whatever calendar the
+    /// phone uses, so under the Buddhist or Japanese calendar a 1990 birth lands centuries
+    /// away, `UserProfile.age` rejects it, and the age-based estimates quietly disappear.
+    nonisolated static func dateOfBirth(from components: DateComponents) -> Date? {
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = .current
+        return gregorian.date(from: components)
     }
 
     // MARK: - Sync
@@ -544,12 +562,11 @@ final class HealthKitManager {
             return nil
         }
 
-        // `saveNow()` checkpoints and applies retention before the anchor write. The next
-        // query must never skip a page that was not confirmed on durable storage.
-        guard await store.saveNow() else {
-            logger.error("HealthKit archive write failed; refusing to advance sync")
-            return nil
-        }
+        // The page committed as one SQLite transaction with `synchronous = FULL`, so it is
+        // already durable and the anchor may move. Pruning, compaction, and the checkpoint
+        // used to run here for every page, on the main actor, several times an hour; they
+        // are maintenance and now run on `AppModel`'s timer and at background transitions.
+        // A failure in one of them must not hold the anchor behind a page that committed.
         guard store.loadState == .loaded else {
             logger.error("HealthKit archive is not durably available; refusing to advance sync")
             return nil
@@ -864,44 +881,6 @@ final class HealthKitManager {
     /// before anything crosses to the main actor.
     nonisolated static func deletedReadingIDs(_ deleted: [HKDeletedObject]) -> [UUID] {
         deleted.map(\.uuid)
-    }
-
-    // MARK: - Writing back
-
-    /// Mirrors a Bluetooth-measured reading into Health.
-    ///
-    /// Only measured values are eligible; estimates never enter the user's health record.
-    func write(_ reading: Reading) async {
-        guard reading.provenance == .measured else { return }
-        let now = Date.now
-        guard reading.start <= reading.end,
-              reading.start <= now,
-              reading.end <= now,
-              reading.start.timeIntervalSinceReferenceDate.isFinite,
-              reading.end.timeIntervalSinceReferenceDate.isFinite
-        else {
-            logger.debug("Refusing to write a reading with an invalid or future timestamp")
-            return
-        }
-        guard let mapping = Self.mappings.first(where: { $0.kind == reading.kind }),
-              let type = mapping.quantityType,
-              Self.shareTypes.contains(type)
-        else { return }
-
-        let value = reading.value / mapping.scale
-        let quantity = HKQuantity(unit: mapping.unit, doubleValue: value)
-        let sample = HKQuantitySample(
-            type: type,
-            quantity: quantity,
-            start: reading.start,
-            end: reading.end,
-            metadata: [HKMetadataKeyWasUserEntered: false]
-        )
-        do {
-            try await healthStore.save(sample)
-        } catch {
-            logger.debug("Write-back failed: \(error.localizedDescription, privacy: .public)")
-        }
     }
 
     // MARK: - Anchors

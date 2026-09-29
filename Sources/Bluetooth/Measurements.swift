@@ -136,31 +136,31 @@ struct PulseOximeterMeasurement: Equatable, Sendable {
 
         var title: String {
             switch self {
-            case .measurementOngoing: "measurement ongoing"
-            case .earlyEstimatedData: "early estimate"
-            case .dataFromStorage: "stored historical data"
-            case .demonstrationData: "demonstration data"
-            case .testingData: "testing data"
-            case .calibrationOngoing: "calibration ongoing"
-            case .measurementUnavailable: "measurement unavailable"
-            case .questionableMeasurement: "questionable measurement"
-            case .invalidMeasurement: "invalid measurement"
-            case .extendedDisplayUpdateOngoing: "display update ongoing"
-            case .equipmentMalfunction: "equipment malfunction"
-            case .signalProcessingIrregularity: "signal processing irregularity"
-            case .inadequateSignal: "inadequate signal"
-            case .poorSignal: "poor signal"
-            case .lowPerfusion: "low perfusion"
-            case .erraticSignal: "erratic signal"
-            case .nonPulsatileSignal: "non-pulsatile signal"
-            case .questionablePulse: "questionable pulse"
-            case .signalAnalysisOngoing: "signal analysis ongoing"
-            case .sensorInterference: "sensor interference"
-            case .sensorUnconnectedFromUser: "sensor not on user"
-            case .unknownSensorConnected: "unknown sensor"
-            case .sensorDisplaced: "sensor displaced"
-            case .sensorMalfunction: "sensor malfunction"
-            case .sensorDisconnected: "sensor disconnected"
+            case .measurementOngoing: String(localized: "plx.reason.measurementOngoing", defaultValue: "measurement ongoing", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .earlyEstimatedData: String(localized: "plx.reason.earlyEstimatedData", defaultValue: "early estimate", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .dataFromStorage: String(localized: "plx.reason.dataFromStorage", defaultValue: "stored historical data", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .demonstrationData: String(localized: "plx.reason.demonstrationData", defaultValue: "demonstration data", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .testingData: String(localized: "plx.reason.testingData", defaultValue: "testing data", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .calibrationOngoing: String(localized: "plx.reason.calibrationOngoing", defaultValue: "calibration ongoing", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .measurementUnavailable: String(localized: "plx.reason.measurementUnavailable", defaultValue: "measurement unavailable", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .questionableMeasurement: String(localized: "plx.reason.questionableMeasurement", defaultValue: "questionable measurement", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .invalidMeasurement: String(localized: "plx.reason.invalidMeasurement", defaultValue: "invalid measurement", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .extendedDisplayUpdateOngoing: String(localized: "plx.reason.extendedDisplayUpdateOngoing", defaultValue: "display update ongoing", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .equipmentMalfunction: String(localized: "plx.reason.equipmentMalfunction", defaultValue: "equipment malfunction", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .signalProcessingIrregularity: String(localized: "plx.reason.signalProcessingIrregularity", defaultValue: "signal processing irregularity", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .inadequateSignal: String(localized: "plx.reason.inadequateSignal", defaultValue: "inadequate signal", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .poorSignal: String(localized: "plx.reason.poorSignal", defaultValue: "poor signal", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .lowPerfusion: String(localized: "plx.reason.lowPerfusion", defaultValue: "low perfusion", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .erraticSignal: String(localized: "plx.reason.erraticSignal", defaultValue: "erratic signal", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .nonPulsatileSignal: String(localized: "plx.reason.nonPulsatileSignal", defaultValue: "non-pulsatile signal", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .questionablePulse: String(localized: "plx.reason.questionablePulse", defaultValue: "questionable pulse", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .signalAnalysisOngoing: String(localized: "plx.reason.signalAnalysisOngoing", defaultValue: "signal analysis ongoing", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .sensorInterference: String(localized: "plx.reason.sensorInterference", defaultValue: "sensor interference", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .sensorUnconnectedFromUser: String(localized: "plx.reason.sensorUnconnectedFromUser", defaultValue: "sensor not on user", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .unknownSensorConnected: String(localized: "plx.reason.unknownSensorConnected", defaultValue: "unknown sensor", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .sensorDisplaced: String(localized: "plx.reason.sensorDisplaced", defaultValue: "sensor displaced", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .sensorMalfunction: String(localized: "plx.reason.sensorMalfunction", defaultValue: "sensor malfunction", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
+            case .sensorDisconnected: String(localized: "plx.reason.sensorDisconnected", defaultValue: "sensor disconnected", comment: "Why a pulse-oximeter reading is doubtful or not saved (Bluetooth status flag)")
             }
         }
     }
@@ -264,11 +264,25 @@ struct PulseOximeterMeasurement: Equatable, Sendable {
 
         var result = PulseOximeterMeasurement(spo2Percent: spo2, pulseRateBPM: pulse)
 
-        if flags & 0x01 != 0 { _ = reader.sfloat(); _ = reader.sfloat() }   // fast
-        if flags & 0x02 != 0 { _ = reader.sfloat(); _ = reader.sfloat() }   // slow
-        if flags & 0x04 != 0 { result.measurementStatus = reader.uint16() }
-        if flags & 0x08 != 0 { result.deviceAndSensorStatus = reader.uint24() }
-        if flags & 0x10 != 0 { result.pulseAmplitudeIndex = reader.sfloat() }
+        // Every field a flag declares must be present. A frame cut off inside a declared
+        // field is malformed, not "clean": `quality(for:)` scores an absent status as zero,
+        // so a truncated frame would otherwise be admitted as `.accepted` evidence and
+        // bypass the invalid and questionable checks. A flag that is clear leaves its field
+        // absent, which is a different fact and stays valid.
+        if flags & 0x01 != 0, !reader.skipSFloatPair() { return nil }   // fast
+        if flags & 0x02 != 0, !reader.skipSFloatPair() { return nil }   // slow
+        if flags & 0x04 != 0 {
+            guard let status = reader.uint16() else { return nil }
+            result.measurementStatus = status
+        }
+        if flags & 0x08 != 0 {
+            guard let status = reader.uint24() else { return nil }
+            result.deviceAndSensorStatus = status
+        }
+        if flags & 0x10 != 0 {
+            guard let index = reader.presentSFloat() else { return nil }
+            result.pulseAmplitudeIndex = index.value
+        }
 
         return result
     }
@@ -302,9 +316,19 @@ struct PulseOximeterMeasurement: Equatable, Sendable {
                 return nil
             }
         }
-        if flags & 0x02 != 0 { result.measurementStatus = reader.uint16() }
-        if flags & 0x04 != 0 { result.deviceAndSensorStatus = reader.uint24() }
-        if flags & 0x08 != 0 { result.pulseAmplitudeIndex = reader.sfloat() }
+        // See `continuous(data:)`: a declared field that cannot be read rejects the frame.
+        if flags & 0x02 != 0 {
+            guard let status = reader.uint16() else { return nil }
+            result.measurementStatus = status
+        }
+        if flags & 0x04 != 0 {
+            guard let status = reader.uint24() else { return nil }
+            result.deviceAndSensorStatus = status
+        }
+        if flags & 0x08 != 0 {
+            guard let index = reader.presentSFloat() else { return nil }
+            result.pulseAmplitudeIndex = index.value
+        }
 
         return result
     }

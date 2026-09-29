@@ -73,11 +73,35 @@ struct OuraOAuthCredential: Codable, Equatable, Sendable {
 }
 
 enum OuraOAuthCredentialStore {
+    /// What reading the stored credential found.
+    enum Load: Equatable, Sendable {
+        case credential(OuraOAuthCredential)
+        /// Nothing is stored.
+        case absent
+        /// Something is stored and cannot be decoded, so it can never be used.
+        case unusable
+        /// Keychain could not be read right now (`errSecInteractionNotAllowed` while locked,
+        /// for example). The credential may exist. Nothing may be cleared on this.
+        case unavailable(Int32)
+    }
+
+    static func read() -> Load {
+        switch Keychain.lookup(.ouraOAuthCredentials) {
+        case .notFound:
+            return .absent
+        case .unavailable(let status):
+            return .unavailable(status)
+        case .found(let encoded):
+            guard let data = Data(base64Encoded: encoded),
+                  let credential = try? JSONDecoder().decode(OuraOAuthCredential.self, from: data)
+            else { return .unusable }
+            return .credential(credential)
+        }
+    }
+
     static func load() -> OuraOAuthCredential? {
-        guard let encoded = Keychain.get(.ouraOAuthCredentials),
-              let data = Data(base64Encoded: encoded)
-        else { return nil }
-        return try? JSONDecoder().decode(OuraOAuthCredential.self, from: data)
+        if case .credential(let credential) = read() { return credential }
+        return nil
     }
 
     @discardableResult

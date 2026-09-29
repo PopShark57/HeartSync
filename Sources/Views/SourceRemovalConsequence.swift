@@ -52,10 +52,20 @@ struct SourceRemovalConsequence: Equatable, Sendable {
                 stored = "No readings from \(name) are stored on this device."
                 deletesReadings = false
             } else {
-                let count = history.readingCount.formatted()
-                let noun = history.readingCount == 1 ? "reading" : "readings"
-                let since = history.earliest.map { " recorded since \(dayText($0, now: now))" } ?? ""
-                stored = "Deletes \(count) \(noun) from \(name)\(since)."
+                let count = history.readingCount
+                if let earliest = history.earliest {
+                    stored = String(
+                        localized: "removal.deletes.since",
+                        defaultValue: "Deletes \(count) readings from \(name) recorded since \(dayText(earliest, now: now)).",
+                        comment: "Removal confirmation. Arguments: how many readings are deleted, the device name, the day the earliest was recorded."
+                    )
+                } else {
+                    stored = String(
+                        localized: "removal.deletes",
+                        defaultValue: "Deletes \(count) readings from \(name).",
+                        comment: "Removal confirmation. Arguments: how many readings are deleted, the device name."
+                    )
+                }
                 deletesReadings = true
             }
         } else {

@@ -122,7 +122,7 @@ struct PairwiseAnalysisView: View {
             lastLoadedAt = .now
         }
         .sheet(item: $sharePayload, onDismiss: discardShareFiles) { payload in
-            PairwiseActivityView(items: payload.urls)
+            ReadingsShareSheet(items: payload.urls)
                 .ignoresSafeArea()
         }
         .alert(
@@ -951,14 +951,4 @@ struct PairwiseAnalysisView: View {
 private struct PairwiseSharePayload: Identifiable {
     let id = UUID()
     var urls: [URL]
-}
-
-private struct PairwiseActivityView: UIViewControllerRepresentable {
-    var items: [URL]
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

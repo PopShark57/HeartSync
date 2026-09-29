@@ -30,11 +30,19 @@ struct WatchComplicationStore {
         }
     }
 
+    /// Stores what the complications draw and reports whether it differs from what was there.
+    ///
+    /// The caller reloads timelines only on `true`. Compared on the projection
+    /// (`complicationProjection`), not the snapshot: a new delivery time, a redrawn chart, or
+    /// a changed comparison count leaves every complication exactly as it was.
+    ///
     /// A valid reset/unavailable snapshot replaces previous values. Never turn an unreadable
     /// protected file into an empty cache, and never resurrect data with an older delivery.
     @discardableResult
     func save(_ snapshot: WatchSnapshot) throws -> Bool {
-        let data = try snapshot.encoded()
+        _ = try snapshot.encoded()   // Validate the full payload before trusting any of it.
+        let projection = snapshot.complicationProjection
+        let data = try projection.encoded()
         guard let directory else { throw StoreError.unavailableContainer }
         let previous: WatchSnapshot?
         do {
@@ -45,7 +53,10 @@ struct WatchComplicationStore {
             previous = nil
         }
         if let previous {
-            guard snapshot.generatedAt >= previous.generatedAt, snapshot != previous else { return false }
+            guard snapshot.generatedAt >= previous.generatedAt else { return false }
+            // An entry written by an earlier build holds the whole payload; project it too so
+            // the first delivery after an update does not reload for nothing.
+            guard !projection.drawsSameComplications(as: previous.complicationProjection) else { return false }
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         // Establish backup exclusion before replacing data. A metadata failure must not

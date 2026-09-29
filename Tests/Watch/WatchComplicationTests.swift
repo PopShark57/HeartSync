@@ -95,7 +95,7 @@ struct WatchComplicationTests {
         let store = WatchComplicationStore(directory: directory)
         #expect(try store.load() == nil)
         #expect(try store.save(fixture()))
-        #expect(try store.load() == fixture())
+        #expect(try store.load() == fixture().complicationProjection)
         #expect(try !store.save(fixture()))
         #expect(try directory.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
     }
@@ -110,10 +110,10 @@ struct WatchComplicationTests {
         #expect(try store.save(reset))
         let relaunched = WatchComplicationStore(directory: directory)
         #expect(try !relaunched.save(fixture()))
-        #expect(try relaunched.load() == reset)
+        #expect(try relaunched.load() == reset.complicationProjection)
         let unavailable = WatchSnapshot(generatedAt: now.addingTimeInterval(20), availability: .unavailable, metrics: [])
         #expect(try relaunched.save(unavailable))
-        #expect(try relaunched.load() == unavailable)
+        #expect(try relaunched.load() == unavailable.complicationProjection)
     }
 
     @Test("Invalid incoming data leaves the previous cache intact")
@@ -125,7 +125,7 @@ struct WatchComplicationTests {
         var invalid = fixture()
         invalid.metrics[0].readings[0].value = 1_000
         #expect(throws: WatchSnapshot.PayloadError.self) { try store.save(invalid) }
-        #expect(try store.load() == fixture())
+        #expect(try store.load() == fixture().complicationProjection)
     }
 
     @Test("A corrupt disposable cache recovers only when a valid context arrives")
@@ -138,7 +138,67 @@ struct WatchComplicationTests {
         let store = WatchComplicationStore(directory: directory)
         #expect(throws: (any Error).self) { try store.load() }
         #expect(try store.save(fixture()))
-        #expect(try store.load() == fixture())
+        #expect(try store.load() == fixture().complicationProjection)
+    }
+
+    @Test("Only a change a complication can show reloads its timelines")
+    func reloadsOnlyOnDisplayedChange() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = WatchComplicationStore(directory: directory)
+        #expect(try store.save(fixture()))
+
+        // A later delivery, a different comparison count, and a chart change nothing drawn.
+        var redelivered = fixture()
+        redelivered.generatedAt = now.addingTimeInterval(30)
+        redelivered.metrics[0].comparison = WatchComparison(
+            readyPairs: 3, incompletePairs: 0, outsideTolerancePairs: 1, lookback: 86_400
+        )
+        #expect(try !store.save(redelivered))
+
+        // A new measurement, a different source, or a changed provenance is drawn.
+        var measured = redelivered
+        measured.generatedAt = now.addingTimeInterval(60)
+        measured.metrics[0].readings[0].value = 74
+        #expect(try store.save(measured))
+
+        var otherSource = measured
+        otherSource.generatedAt = now.addingTimeInterval(90)
+        otherSource.metrics[0].readings[0].id = "ring"
+        otherSource.metrics[0].readings[0].sourceName = "Ring"
+        #expect(try store.save(otherSource))
+
+        var derived = otherSource
+        derived.generatedAt = now.addingTimeInterval(120)
+        derived.metrics[0].readings[0].provenance = .derived
+        #expect(try store.save(derived))
+
+        // An older delivery never overwrites, even when it differs.
+        var late = fixture()
+        late.generatedAt = now.addingTimeInterval(-60)
+        late.metrics[0].readings[0].value = 60
+        #expect(try !store.save(late))
+    }
+
+    @Test("The cache holds the displayed reading, not the whole payload")
+    func projectionIsSmall() throws {
+        var snapshot = fixture()
+        var estimate = snapshot.metrics[0].readings[0]
+        estimate.id = "estimate"
+        estimate.timestamp = now.addingTimeInterval(1)
+        estimate.provenance = .estimated
+        var older = snapshot.metrics[0].readings[0]
+        older.id = "older"
+        older.timestamp = now.addingTimeInterval(-500)
+        snapshot.metrics[0].readings += [estimate, older]
+        let projection = snapshot.complicationProjection
+        #expect(projection.metrics.count == 1)
+        #expect(projection.metrics[0].readings.map(\.id) == ["strap"])
+        #expect(projection.metrics[0].chart == nil)
+        #expect(
+            WatchComplicationValue(kind: .heartRate, snapshot: projection).reading
+                == WatchComplicationValue(kind: .heartRate, snapshot: snapshot).reading
+        )
     }
 
     @Test("Missing entitlements and inaccessible cache paths fail without fabricated data")

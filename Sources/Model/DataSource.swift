@@ -114,6 +114,11 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
     /// True when the stable id identifies a HealthKit writing app rather than a proven
     /// physical instrument. Optional keeps older source archives backward-decodable.
     var identifiesHealthKitWriter: Bool?
+    /// True once the user has renamed this source. A transport upsert then leaves the name
+    /// alone: Bluetooth updates reuse the stored name anyway, but a Health or Oura source
+    /// re-reports its own name on every sync, which would undo the user's alias. Optional
+    /// keeps older source archives backward-decodable.
+    var displayNameIsUserChosen: Bool?
 
     init(
         id: String,
@@ -241,9 +246,12 @@ enum SensorTechnology: String, Codable, Hashable, Sendable, CaseIterable {
 
     var title: String {
         switch self {
-        case .opticalPPG: "Optical (PPG)"
-        case .electricalECG: "Electrical (ECG)"
-        case .other: "Other"
+        case .opticalPPG:
+            String(localized: "sensorTechnology.opticalPPG", defaultValue: "Optical (PPG)", comment: "How a sensor acquires its signal: light through the skin")
+        case .electricalECG:
+            String(localized: "sensorTechnology.electricalECG", defaultValue: "Electrical (ECG)", comment: "How a sensor acquires its signal: electrical activity of the heart")
+        case .other:
+            String(localized: "sensorTechnology.other", defaultValue: "Other", comment: "How a sensor acquires its signal: something else")
         }
     }
 }
@@ -300,6 +308,13 @@ struct ReadingMetadata: Codable, Hashable, Sendable {
     var pnn50: Double?
     var impliedHeartRate: Double?
     var aggregation: AggregationMetadata?
+    /// Set on values HeartSync computed itself rather than read from a device, so a
+    /// reconciliation pass can recognise them positively instead of by provenance alone.
+    /// Optional and absent from older rows, which decode unchanged.
+    var modelledBy: String?
+
+    /// The `modelledBy` value HeartSync's own estimators write.
+    static let heartSyncModel = "heartsync.estimator"
 
     init(
         quality: MeasurementQuality? = nil,
@@ -309,7 +324,8 @@ struct ReadingMetadata: Codable, Hashable, Sendable {
         artefactFraction: Double? = nil,
         pnn50: Double? = nil,
         impliedHeartRate: Double? = nil,
-        aggregation: AggregationMetadata? = nil
+        aggregation: AggregationMetadata? = nil,
+        modelledBy: String? = nil
     ) {
         self.quality = quality
         self.pulseAmplitudeIndex = pulseAmplitudeIndex
@@ -319,6 +335,7 @@ struct ReadingMetadata: Codable, Hashable, Sendable {
         self.pnn50 = pnn50
         self.impliedHeartRate = impliedHeartRate
         self.aggregation = aggregation
+        self.modelledBy = modelledBy
     }
 }
 

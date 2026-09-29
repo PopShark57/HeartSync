@@ -55,7 +55,15 @@ final class BluetoothManager: NSObject {
     private(set) var pulseOximeterQuality: [UUID: (quality: PulseOximeterMeasurement.Quality, pulseAmplitudeIndex: Double?)] = [:]
     /// Evidence for each peripheral's current connection: inventory, packet counts before
     /// parsing, named rejections, commands, and (in a diagnostic session only) raw packets.
-    private(set) var diagnostics: [UUID: BluetoothDiagnostics] = [:]
+    ///
+    /// Not observed. It changes on every notification a device sends, and Observation fires
+    /// on assignment, so observing it re-rendered the Devices list several times a second
+    /// while a strap streamed. A view learns that a report exists from `diagnosticsIDs`,
+    /// which changes only when a connection session begins or the device is forgotten, and
+    /// reads the report itself only when the user exports it.
+    @ObservationIgnored private var diagnostics: [UUID: BluetoothDiagnostics] = [:]
+    /// Peripherals that currently have a diagnostics record.
+    private(set) var diagnosticsIDs: Set<UUID> = []
     /// Vendor ring sessions for peripherals whose GATT topology matched `R11MRingSession`.
     private(set) var ringSessions: [UUID: R11MRingSession] = [:]
 
@@ -363,6 +371,12 @@ final class BluetoothManager: NSObject {
         reconnect(sourceID: sourceID)
     }
 
+    /// Whether a report can be produced. Cheap and observed; building it is not.
+    func hasDiagnosticsReport(forSource sourceID: String) -> Bool {
+        UUID(uuidString: sourceID).map { diagnosticsIDs.contains($0) } ?? false
+    }
+
+    /// Builds the report on demand, when the user asks to export it.
     func diagnosticsReport(forSource sourceID: String, deviceName: String) -> String? {
         guard let uuid = UUID(uuidString: sourceID) else { return nil }
         return diagnostics[uuid]?.exportText(deviceName: deviceName)
@@ -432,6 +446,7 @@ final class BluetoothManager: NSObject {
         }
         endConnectionSession(for: uuid)
         diagnostics[uuid] = nil
+        diagnosticsIDs.remove(uuid)
         cancelPendingReconnect(for: uuid)
         // Everything keyed by this peripheral goes, or a device re-added later inherits
         // the stale HRV window, quality caveat, or half-collected model string of the one
@@ -516,6 +531,7 @@ final class BluetoothManager: NSObject {
             connectionSession: connectionSessions[id] ?? 0,
             fullDiscovery: fullDiscovery
         )
+        diagnosticsIDs.insert(id)
         peripheral.delegate = self
         // Ordinarily pass an explicit list rather than nil: discovering every service on a
         // chatty device costs seconds and yields nothing this app can read. Only an explicit
@@ -562,6 +578,13 @@ final class BluetoothManager: NSObject {
         return true
     }
 
+    /// Publishes a connection state only when it differs. Observation fires on assignment, not
+    /// on change, and a streaming device reports the same state with every value.
+    private func setConnectionState(_ state: PeripheralConnectionState, for peripheralID: UUID) {
+        guard connectionStates[peripheralID] != state else { return }
+        connectionStates[peripheralID] = state
+    }
+
     private func note(metric: MetricKind, for peripheralID: UUID, at date: Date = .now) {
         observedMetrics[peripheralID, default: []].insert(metric)
         streamCadences[peripheralID, default: StreamCadence()].record(date)
@@ -574,7 +597,7 @@ final class BluetoothManager: NSObject {
         streamStallTasks[peripheralID]?.cancel()
         streamStallTasks[peripheralID] = nil
         let state = (connectionStates[peripheralID] ?? .disconnected).receiving(metric)
-        connectionStates[peripheralID] = state
+        setConnectionState(state, for: peripheralID)
         if case .streaming = state {
             scheduleStreamStallCheck(for: peripheralID)
         }
@@ -593,7 +616,7 @@ final class BluetoothManager: NSObject {
             onDemandStatus: onDemand ? ring?.statusText : nil,
             adapterWarning: onDemand ? nil : ring?.statusText
         )
-        connectionStates[peripheralID] = state
+        setConnectionState(state, for: peripheralID)
         if armsWatchdog {
             scheduleStreamStallCheck(for: peripheralID)
         }
@@ -699,7 +722,12 @@ final class BluetoothManager: NSObject {
         guard !measurement.rrIntervalsMS.isEmpty else { return }
         var accumulator = hrvAccumulators[id] ?? HRVAccumulator()
         accumulator.add(intervals: measurement.rrIntervalsMS, at: now)
-        hrvProgress[id] = (accumulator.bufferedBeats, accumulator.bufferedDuration)
+        // The only thing shown is the beat count towards the first HRV reading, so publish
+        // when that changes and stop once the target is reached instead of every frame.
+        let shownBeats = min(accumulator.bufferedBeats, HRVMetrics.minimumBeats)
+        if hrvProgress[id]?.beats != shownBeats {
+            hrvProgress[id] = (shownBeats, accumulator.bufferedDuration)
+        }
 
         if let emission = accumulator.emissionIfReady(at: now) {
             let metrics = emission.metrics
@@ -730,7 +758,10 @@ final class BluetoothManager: NSObject {
             return
         }
         let quality = measurement.quality(for: isSpotCheck ? .spotCheck : .continuous)
-        pulseOximeterQuality[peripheral.identifier] = (quality, measurement.pulseAmplitudeIndex)
+        let published = pulseOximeterQuality[peripheral.identifier]
+        if published?.quality != quality || published?.pulseAmplitudeIndex != measurement.pulseAmplitudeIndex {
+            pulseOximeterQuality[peripheral.identifier] = (quality, measurement.pulseAmplitudeIndex)
+        }
         let values = PulseOximeterIngestionPolicy.durableValues(
             from: measurement,
             sampleType: isSpotCheck ? .spotCheck : .continuous
@@ -972,7 +1003,11 @@ final class BluetoothManager: NSObject {
             )
         }
         guard !readings.isEmpty else { return }
-        diagnostics[id]?.adapterNote = "Forwarded \(readings.count) stored value\(readings.count == 1 ? "" : "s") from the ring's memory."
+        diagnostics[id]?.adapterNote = String(
+            localized: "ring.history.forwarded",
+            defaultValue: "Forwarded \(readings.count) stored values from the ring's memory.",
+            comment: "Bluetooth diagnostics note. The argument is how many stored values were passed on."
+        )
         if let onReadings {
             onReadings(readings)
         } else {
