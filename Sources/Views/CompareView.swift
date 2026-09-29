@@ -155,9 +155,12 @@ struct CompareView: View {
             }
         }
         .navigationTitle("Compare")
+        .toolbarTitleDisplayMode(.inlineLarge)
+        .heartSyncScreenBackground()
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
-            ToolbarItem(placement: .topBarLeading) {
+            // Both menus trail: an inline-large title owns the leading edge, and a leading
+            // item beside it is not shown.
+            ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button("Saved sessions\u{2026}", systemImage: "bookmark") { showingSessions = true }
                     Button("Save this period\u{2026}", systemImage: "bookmark.square") { savingSession = true }
@@ -172,6 +175,7 @@ struct CompareView: View {
                 }
                 .accessibilityIdentifier("compare.sessions")
             }
+            ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
         }
         .sheet(isPresented: $showingSessions) {
             ComparisonSessionsView { session in openSession(session) }

@@ -379,9 +379,10 @@ final class HealthStore {
         }
     }
 
-    func updateBattery(_ percent: Int, forSource id: String) {
+    func updateBattery(_ percent: Int, isCharging: Bool? = nil, forSource id: String) {
         mutateSource(id) {
             $0.batteryPercent = percent
+            $0.batteryIsCharging = isCharging
             $0.lastSeenAt = .now
         }
     }

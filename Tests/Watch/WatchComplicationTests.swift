@@ -220,8 +220,7 @@ struct WatchComplicationTests {
         for kind in MetricKind.allCases {
             #expect(WatchComplicationLink(url: WatchComplicationLink.metric(kind).url) == .metric(kind))
         }
-        #expect(WatchComplicationLink(url: WatchComplicationLink.workout.url) == .workout)
-        for string in ["https://workout", "heartsync-watch://metric/unknown", "heartsync-watch://workout?start=true",
+        for string in ["https://metric/heartRate", "heartsync-watch://workout", "heartsync-watch://metric/unknown", "heartsync-watch://workout?start=true",
                        "heartsync-watch://metric/heartRate/extra", "heartsync-watch://user@workout"] {
             #expect(WatchComplicationLink(url: try #require(URL(string: string))) == nil)
         }

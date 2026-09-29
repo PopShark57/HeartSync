@@ -5,7 +5,6 @@ import WidgetKit
 struct HeartSyncComplications: WidgetBundle {
     var body: some Widget {
         HeartSyncMeasurementWidget()
-        HeartSyncWorkoutWidget()
     }
 }
 
@@ -134,61 +133,6 @@ struct MeasurementComplicationView: View {
         let age = isStale ? String(localized: "Older reading") : String(localized: "Recent reading")
         let aggregation = reading.isCompacted ? String(localized: "Compacted window median") : ""
         return "\(value.kind.title), \(value.kind.formatWithUnit(reading.value)). \(age). \(reading.provenance.title). \(aggregation) \(reading.sourceName). \(time)."
-    }
-}
-
-private struct WorkoutEntry: TimelineEntry { let date: Date }
-
-private struct WorkoutProvider: TimelineProvider {
-    func placeholder(in context: Context) -> WorkoutEntry { WorkoutEntry(date: .now) }
-    func getSnapshot(in context: Context, completion: @escaping (WorkoutEntry) -> Void) {
-        completion(WorkoutEntry(date: .now))
-    }
-    func getTimeline(in context: Context, completion: @escaping (Timeline<WorkoutEntry>) -> Void) {
-        completion(Timeline(entries: [WorkoutEntry(date: .now)], policy: .never))
-    }
-}
-
-struct HeartSyncWorkoutWidget: Widget {
-    var body: some WidgetConfiguration {
-        StaticConfiguration(kind: "HeartSyncWorkout", provider: WorkoutProvider()) { _ in
-            WorkoutComplicationView()
-                .containerBackground(.fill.tertiary, for: .widget)
-                .widgetURL(WatchComplicationLink.workout.url)
-        }
-        .configurationDisplayName("HeartSync Workout")
-        .description("Open your workout controls. Recording starts only when you tap Start in HeartSync.")
-        .supportedFamilies([.accessoryCircular, .accessoryRectangular, .accessoryInline, .accessoryCorner])
-    }
-}
-
-private struct WorkoutComplicationView: View {
-    @Environment(\.widgetFamily) private var family
-
-    var body: some View {
-        Group {
-            switch family {
-            case .accessoryInline:
-                Label("Workout", systemImage: "figure.run")
-            case .accessoryRectangular:
-                VStack(alignment: .leading) {
-                    Label("HeartSync", systemImage: "figure.run").font(.headline).widgetAccentable()
-                    Text("Open workout").font(.caption)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            case .accessoryCorner:
-                Image(systemName: "figure.run").font(.title2)
-                    .widgetLabel { Text("Workout") }
-            default:
-                ZStack {
-                    AccessoryWidgetBackground()
-                    Image(systemName: "figure.run").font(.title2).widgetAccentable()
-                }
-            }
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("HeartSync workout")
-        .accessibilityHint("Open workout controls. Does not start recording.")
     }
 }
 

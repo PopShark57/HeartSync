@@ -51,6 +51,8 @@ struct DevicesView: View {
                 }
             }
             .navigationTitle("Devices")
+            .toolbarTitleDisplayMode(.inlineLarge)
+            .heartSyncScreenBackground()
             .sheet(isPresented: $showingScanner) { BluetoothScanView() }
             .sheet(isPresented: $showingOuraSetup) { OuraSetupView() }
             .sheet(item: $renamingSource) { source in
@@ -105,7 +107,7 @@ struct DevicesView: View {
                     ExportProgressRow(job: export)
                         .frame(maxWidth: 320)
                         .padding()
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: HeartSyncTheme.compactCornerRadius))
+                        .background { HeartSyncCardBackground(cornerRadius: HeartSyncTheme.compactCornerRadius) }
                         .padding()
                 }
             }
@@ -237,6 +239,7 @@ struct DevicesView: View {
                         statusText: source.isEnabled ? state.title : "Paused",
                         statusColor: statusColor(for: state, enabled: source.isEnabled),
                         battery: source.batteryPercent,
+                        batteryIsCharging: source.batteryIsCharging ?? false,
                         hrvProgress: bluetoothDetailText(for: source)
                     )
                     .accessibilityIdentifier("source.\(source.id)")
@@ -644,6 +647,7 @@ private struct SourceRow: View {
     var statusText: String
     var statusColor: Color
     var battery: Int?
+    var batteryIsCharging = false
     var hrvProgress: String?
 
     var body: some View {
@@ -664,7 +668,7 @@ private struct SourceRow: View {
                     }
                 }
                 Spacer()
-                if let battery { BatteryBadge(percent: battery) }
+                if let battery { BatteryBadge(percent: battery, isCharging: batteryIsCharging) }
             }
 
             if !source.observedMetrics.isEmpty {
@@ -721,7 +725,7 @@ private struct SourceRow: View {
     /// the abbreviation the chip shows.
     private var accessibilityDescription: String {
         var parts: [String] = [source.displayName, statusText]
-        if let battery { parts.append("Battery \(battery) percent") }
+        if let battery { parts.append(BatteryBadge.spoken(percent: battery, isCharging: batteryIsCharging)) }
         if let location = source.bodyLocation {
             parts.append("Reported placement \(location.title.lowercased())")
         }

@@ -301,7 +301,7 @@ enum WatchSnapshotBuilder {
     /// Longest periods are dropped first, from the last metric backwards, so the payload
     /// stays under its cap. Readings, the default comparison, and the period list always
     /// travel; a dropped period shows "open HeartSync on iPhone" rather than a false empty.
-    static let dropOrder: [WatchChartRange] = [.month, .week, .hour, .day]
+    static let dropOrder: [WatchChartRange] = [.month, .week, .hour, .threeHours, .day]
 
     static func fitted(_ snapshot: WatchSnapshot) -> WatchSnapshot {
         fittedPayload(snapshot).snapshot
@@ -416,6 +416,7 @@ final class WatchChartCache: @unchecked Sendable {
     static func refreshInterval(for range: WatchChartRange) -> TimeInterval {
         switch range {
         case .hour:  0
+        case .threeHours: 0
         case .day:   2 * 60
         case .week:  15 * 60
         case .month: 60 * 60

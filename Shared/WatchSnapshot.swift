@@ -90,8 +90,8 @@ struct WatchMetric: Codable, Equatable, Identifiable, Sendable {
     /// directions stay compatible: an older iPhone build sends none (the watch says so), and
     /// an older watch build ignores the key.
     var chart: WatchChart? = nil
-    /// The other periods' charts (1H, 7D, 30D beside the 24H `chart`; 30D beside 7D for daily
-    /// metrics). Nil from an iPhone build without period choice.
+    /// The other periods' charts (1H, 3H, 7D, 30D beside the 24H `chart`; 30D beside 7D for
+    /// daily metrics). Nil from an iPhone build without period choice.
     var rangeCharts: [WatchChart]? = nil
     /// The periods the iPhone computed. A listed period without a chart had no readings.
     /// Nil from an iPhone build without period choice.
@@ -113,9 +113,11 @@ struct WatchMetric: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-/// The periods the watch can compare over, matching iPhone's 1H, 24H, 7D, and 30D presets.
+/// The periods the watch can compare over: iPhone's 1H, 24H, 7D, and 30D presets plus a
+/// three-hour span for comparing devices over an afternoon.
 enum WatchChartRange: String, Codable, CaseIterable, Identifiable, Sendable {
     case hour = "1H"
+    case threeHours = "3H"
     case day = "24H"
     case week = "7D"
     case month = "30D"
@@ -128,6 +130,7 @@ enum WatchChartRange: String, Codable, CaseIterable, Identifiable, Sendable {
     var duration: TimeInterval {
         switch self {
         case .hour:  3_600
+        case .threeHours: 10_800
         case .day:   86_400
         case .week:  604_800
         case .month: 2_592_000
@@ -138,6 +141,8 @@ enum WatchChartRange: String, Codable, CaseIterable, Identifiable, Sendable {
         switch self {
         case .hour:
             String(localized: "watch.spoken.pastHour", defaultValue: "Past hour", comment: "Spoken name of the 1H wrist chart period")
+        case .threeHours:
+            String(localized: "watch.spoken.pastThreeHours", defaultValue: "Past 3 hours", comment: "Spoken name of the 3H wrist chart period")
         case .day:
             String(localized: "watch.spoken.pastDay", defaultValue: "Past 24 hours", comment: "Spoken name of the 24H wrist chart period")
         case .week:

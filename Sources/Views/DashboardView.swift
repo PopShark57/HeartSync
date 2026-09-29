@@ -64,14 +64,6 @@ struct DashboardView: View {
                         ScrollView {
                             VStack(alignment: .leading, spacing: 16) {
                                 sourcesHeader
-                                if let mirrored = model.workoutMirror.latest {
-                                    MirroredWorkoutCard(
-                                        payload: mirrored,
-                                        bluetoothRows: snapshot.metrics
-                                            .first { $0.kind == .heartRate }?
-                                            .rows.filter { $0.source.transport == .bluetooth } ?? []
-                                    )
-                                }
                                 // One column on iPhone; as many 320-point columns as fit on
                                 // iPad or in landscape.
                                 LazyVGrid(
@@ -120,6 +112,9 @@ struct DashboardView: View {
             }
             .background { HeartSyncAmbientBackground() }
             .navigationTitle("Now")
+            // The large title shares the toolbar's row with Refresh instead of taking a
+            // second band of its own above the content.
+            .toolbarTitleDisplayMode(.inlineLarge)
             .heartSyncChrome()
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -179,26 +174,26 @@ struct DashboardView: View {
     }
 
     /// Hidden entirely when nothing qualifies: an empty row under a title says nothing.
+    ///
+    /// No separate "Sources" heading: the chips sit directly under the title, where they
+    /// read as the screen's subtitle, and the vertical room goes to the cards.
     @ViewBuilder
     private var sourcesHeader: some View {
         let chips = sourceChips
         if !chips.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Sources")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
-                    .tracking(0.6)
-                    .accessibilityAddTraits(.isHeader)
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(chips, id: \.source.id) { chip in
-                            SourceChip(source: chip.source, status: chip.status, now: now)
-                        }
+            ScrollView(.horizontal, showsIndicators: false) {
+                GlassChipRow {
+                    ForEach(chips, id: \.source.id) { chip in
+                        SourceChip(source: chip.source, status: chip.status, now: now)
                     }
                 }
+                .padding(.vertical, 4)
             }
-            .padding(.top, 6)
+            // Chips scroll edge to edge; the first and last still line up with the cards.
+            .contentMargins(.horizontal, 16, for: .scrollContent)
+            .padding(.horizontal, -16)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Sources")
             .accessibilityIdentifier("now.sources")
         }
     }
@@ -215,18 +210,31 @@ private struct SourceChip: View {
         HStack(spacing: 6) {
             SourceDot(color: source.color, size: 8)
             Text(source.displayName)
-                .font(.caption.weight(.medium))
+                .font(.caption.weight(.semibold))
                 .lineLimit(1)
             Text(title)
                 .font(.caption2.weight(status == .live ? .semibold : .regular))
                 .foregroundStyle(status == .live ? AnyShapeStyle(source.color) : AnyShapeStyle(.secondary))
+            if let battery = source.batteryPercent {
+                BatteryMeter(percent: battery, isCharging: source.batteryIsCharging ?? false, width: 18)
+                Text("\(battery)%")
+                    .font(.caption2.monospacedDigit().weight(.medium))
+                    .foregroundStyle(battery <= 15 && source.batteryIsCharging != true ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+            }
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 7)
-        .background(source.color.opacity(0.14), in: Capsule())
-        .overlay(Capsule().strokeBorder(source.color.opacity(0.22), lineWidth: 0.8))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .heartSyncGlassCapsule(tint: source.color)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(source.displayName), \(title.lowercased())")
+        .accessibilityLabel(accessibilityText(title))
+    }
+
+    private func accessibilityText(_ title: String) -> String {
+        var parts = [source.displayName, title.lowercased()]
+        if let battery = source.batteryPercent {
+            parts.append(BatteryBadge.spoken(percent: battery, isCharging: source.batteryIsCharging ?? false).lowercased())
+        }
+        return parts.joined(separator: ", ")
     }
 }
 
@@ -330,12 +338,12 @@ private struct MetricCard: View {
                     Image(systemName: "chevron.right")
                         .font(.caption2.weight(.semibold))
                 }
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 14)
                 .padding(.vertical, 9)
                 // Apple's minimum hit target is 44 × 44 points.
                 .frame(minHeight: 44)
-                .background(summary.kind.tint.opacity(0.10), in: Capsule())
                 .contentShape(Capsule())
+                .heartSyncGlassCapsule(tint: summary.kind.tint, interactive: true)
             }
             .buttonStyle(.plain)
             .foregroundStyle(summary.kind.tint)
@@ -397,58 +405,5 @@ private struct SparklineView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(sparkline.spokenSummary(names: sources.mapValues(\.displayName)))
         .accessibilityIdentifier("now.sparkline.\(sparkline.kind.rawValue)")
-    }
-}
-
-/// A workout Apple Watch is mirroring to this phone, beside the Bluetooth heart rate on the
-/// Now screen (improvement 72).
-///
-/// Display only. The value is never stored, compared, or exported, so it gets no agreement
-/// badge; the workout's samples arrive through Apple Health after the watch syncs, and are
-/// compared from there.
-private struct MirroredWorkoutCard: View {
-    let payload: MirroredWorkoutPayload
-    let bluetoothRows: [SourceReadingRow]
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { timeline in
-            VStack(alignment: .leading, spacing: 10) {
-                Label(payload.activityTitle ?? "Apple Watch workout", systemImage: "applewatch.radiowaves.left.and.right")
-                    .font(.headline)
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Apple Watch")
-                    Spacer()
-                    Text(payload.heartRate.map { MetricKind.heartRate.formatWithUnit($0) } ?? "\u{2014}")
-                        .monospacedDigit()
-                        .font(.title3.weight(.semibold))
-                }
-                .accessibilityElement(children: .combine)
-                Text(status(at: timeline.date))
-                    .font(.caption)
-                    .foregroundStyle(payload.isLive(at: timeline.date) ? Color.green : Color.secondary)
-                ForEach(bluetoothRows, id: \.source.id) { row in
-                    HStack(alignment: .firstTextBaseline) {
-                        SourceDot(color: row.source.color, size: 8)
-                        Text(row.source.displayName).lineLimit(1)
-                        Spacer()
-                        Text(MetricKind.heartRate.formatWithUnit(row.value)).monospacedDigit()
-                    }
-                    .accessibilityElement(children: .combine)
-                }
-                Text("Display only. This live value is not stored or compared; the workout's heart rate reaches HeartSync through Apple Health after the watch syncs.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .metricCard()
-        }
-        .accessibilityIdentifier("now.mirroredWorkout")
-    }
-
-    private func status(at now: Date) -> String {
-        if payload.isPaused { return "Workout paused" }
-        if payload.isLive(at: now) { return "Live from the workout" }
-        guard let measuredAt = payload.measuredAt else { return "Waiting for heart rate" }
-        return "Last heart rate \(WindowLabel.elapsed(max(0, now.timeIntervalSince(measuredAt)))) ago"
     }
 }

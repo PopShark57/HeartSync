@@ -82,7 +82,6 @@ extension WatchSnapshot {
 
 enum WatchComplicationLink: Equatable {
     case metric(MetricKind)
-    case workout
 
     var url: URL {
         var components = URLComponents()
@@ -91,8 +90,6 @@ enum WatchComplicationLink: Equatable {
         case .metric(let kind):
             components.host = "metric"
             components.path = "/\(kind.rawValue)"
-        case .workout:
-            components.host = "workout"
         }
         return components.url!
     }
@@ -100,9 +97,7 @@ enum WatchComplicationLink: Equatable {
     init?(url: URL) {
         guard url.scheme == "heartsync-watch", url.user == nil, url.password == nil,
               url.port == nil, url.query == nil, url.fragment == nil else { return nil }
-        if url.host == "workout", url.path.isEmpty || url.path == "/" {
-            self = .workout
-        } else if url.host == "metric",
+        if url.host == "metric",
                   let kind = MetricKind(rawValue: String(url.path.dropFirst())),
                   url.path == "/\(kind.rawValue)" {
             self = .metric(kind)

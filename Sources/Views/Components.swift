@@ -198,7 +198,7 @@ struct EmptyStateView: View {
                 .multilineTextAlignment(.center)
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
-                    .buttonStyle(.borderedProminent)
+                    .heartSyncButtonStyle(prominent: true)
                     .tint(HeartSyncTheme.accent)
                     .padding(.top, 4)
             }
@@ -236,32 +236,71 @@ struct EstimateDisclaimer: View {
     }
 }
 
-/// Battery pill for a Bluetooth source.
-struct BatteryBadge: View {
+/// A drawn battery gauge: the fill is the charge, green while charging, red at 20% or
+/// below, the primary ink otherwise. Decorative for VoiceOver; its container speaks.
+struct BatteryMeter: View {
     var percent: Int
+    var isCharging: Bool = false
+    /// Body width in points; the height and terminal follow from it.
+    var width: CGFloat = 24
 
     var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: symbol)
-            Text("\(percent)%")
+        let height = width * 0.5
+        let fraction = CGFloat(min(max(percent, 0), 100)) / 100
+        HStack(spacing: width * 0.05) {
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: height * 0.3, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.45), lineWidth: 1)
+                RoundedRectangle(cornerRadius: height * 0.18, style: .continuous)
+                    .fill(fill)
+                    .padding(2)
+                    .frame(width: max(height * 0.3, width * fraction))
+                if isCharging {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: height * 0.72, weight: .bold))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.35), radius: 1)
+                        .frame(width: width)
+                }
+            }
+            .frame(width: width, height: height)
+            Capsule()
+                .fill(Color.primary.opacity(0.45))
+                .frame(width: width * 0.07, height: height * 0.4)
         }
-        .font(.caption2.monospacedDigit().weight(.medium))
-        .foregroundStyle(percent <= 15 ? .red : .secondary)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
-        .background((percent <= 15 ? Color.red : Color.secondary).opacity(0.10), in: Capsule())
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(percent <= 15 ? "Battery low, \(percent) percent" : "Battery \(percent) percent")
+        .accessibilityHidden(true)
     }
 
-    private var symbol: String {
-        switch percent {
-        case ..<13:  "battery.0percent"
-        case ..<38:  "battery.25percent"
-        case ..<63:  "battery.50percent"
-        case ..<88:  "battery.75percent"
-        default:     "battery.100percent"
+    private var fill: Color {
+        if isCharging { return .green }
+        return percent <= 20 ? .red : .primary
+    }
+}
+
+/// Battery pill for a device that reports its charge: a meter and the percentage.
+struct BatteryBadge: View {
+    var percent: Int
+    var isCharging: Bool = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            BatteryMeter(percent: percent, isCharging: isCharging, width: 20)
+            Text("\(percent)%")
         }
+        .font(.caption2.monospacedDigit().weight(.semibold))
+        .foregroundStyle(isLow ? .red : .secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .heartSyncGlassCapsule(tint: isLow ? .red : .secondary)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(BatteryBadge.spoken(percent: percent, isCharging: isCharging))
+    }
+
+    private var isLow: Bool { percent <= 15 && !isCharging }
+
+    static func spoken(percent: Int, isCharging: Bool) -> String {
+        if isCharging { return "Battery \(percent) percent, charging" }
+        return percent <= 15 ? "Battery low, \(percent) percent" : "Battery \(percent) percent"
     }
 }
 
@@ -330,7 +369,7 @@ struct HistoryUnavailableView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Button("Try again", action: retry)
-                .buttonStyle(.bordered)
+                .heartSyncButtonStyle()
                 .accessibilityIdentifier("history.retry")
         }
         .padding(.vertical, 4)

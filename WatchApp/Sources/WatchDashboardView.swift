@@ -3,17 +3,15 @@ import SwiftUI
 struct WatchDashboardView: View {
     let connection: CompanionSession
     var openCompare: () -> Void
-    var openWorkout: () -> Void
 
     var body: some View {
         List {
-            Button(action: openWorkout) {
-                Label("Workout", systemImage: "figure.run")
-            }
-            .accessibilityHint("Open live heart-rate workout controls")
             Button(action: openCompare) {
                 Label("Compare devices", systemImage: "square.split.2x1")
+                    .font(.headline)
             }
+            .watchGlassButton()
+            .listRowBackground(Color.clear)
             .accessibilityHint("Open comparison charts for metrics reported by two or more sources")
 
             if let snapshot = connection.snapshot {
@@ -33,6 +31,7 @@ struct WatchDashboardView: View {
                             } label: {
                                 WatchMetricRow(metric: metric)
                             }
+                            .listRowBackground(WatchCardBackground(tint: metric.kind.tint))
                         }
                     }
                 } header: {
@@ -47,7 +46,7 @@ struct WatchDashboardView: View {
             } else {
                 Section("From iPhone") {
                     Label("Welcome to HeartSync", systemImage: "heart.fill")
-                    Text("Open HeartSync on your paired iPhone to receive your latest readings. You can start a workout on this watch independently.")
+                    Text("Open HeartSync on your paired iPhone to receive your latest readings.")
                         .font(.caption)
                 }
             }
@@ -58,11 +57,15 @@ struct WatchDashboardView: View {
                 } label: {
                     Label(connection.isRequesting ? "Requesting…" : "Refresh iPhone data", systemImage: "arrow.clockwise")
                 }
+                .watchGlassButton()
+                .listRowBackground(Color.clear)
                 .disabled(connection.isRequesting || !connection.isReachable)
                 Text(connection.status).font(.caption).foregroundStyle(.secondary)
+                    .listRowBackground(Color.clear)
             }
         }
         .navigationTitle("HeartSync")
+        .containerBackground(WatchTheme.backdrop, for: .navigation)
     }
 }
 
@@ -96,7 +99,7 @@ private struct WatchMetricRow: View {
                     .font(.caption2)
                     .opacity(isLuminanceReduced ? 0.6 : 1)
                 }
-                // Always On hides the trend, as the workout screen does.
+                // Always On hides the trend.
                 if !isLuminanceReduced, let chart = metric.chart, !chart.series.isEmpty {
                     WatchTrendChart(kind: metric.kind, chart: chart, lookback: metric.comparison.lookback, compact: true)
                 }
@@ -140,12 +143,13 @@ struct WatchMetricDetailView: View {
             }
         }
         .navigationTitle(metric.kind.shortTitle)
+        .containerBackground(WatchTheme.backdrop, for: .navigation)
     }
 
     /// Nil from an iPhone build without period choice; the single chart is then shown.
     private var available: [WatchChartRange]? { metric.availableRanges }
 
-    /// The chosen period, or the nearest one this metric has (a daily metric has no 1H).
+    /// The chosen period, or the nearest one this metric has (a daily metric has no 1H or 3H).
     private var range: WatchChartRange? {
         available.flatMap { WatchChartRange.resolved(selectedRange, among: $0) }
     }

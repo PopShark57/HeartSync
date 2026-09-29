@@ -142,17 +142,11 @@ targets:
         WKApplication: true
         WKCompanionAppBundleIdentifier: com.heartsync.HeartSyncChecker
         WKRunsIndependentlyOfCompanionApp: true
-        WKBackgroundModes:
-          - workout-processing
-        NSHealthShareUsageDescription: "HeartSync reads your heart rate during workouts to show live measurements on Apple Watch."
-        NSHealthUpdateUsageDescription: "HeartSync saves workouts and their heart-rate readings to Apple Health when you choose Save."
     entitlements:
       path: WatchApp/Resources/HeartSyncWatch.entitlements
       properties:
         com.apple.security.application-groups:
           - group.com.heartsync.HeartSyncChecker.watch
-        com.apple.developer.healthkit: true
-        com.apple.developer.healthkit.access: []
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.heartsync.HeartSyncChecker.watchkitapp

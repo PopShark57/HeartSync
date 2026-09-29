@@ -144,61 +144,85 @@ struct ReferenceLineSwatch: View {
 
 // MARK: - Surfaces
 
-/// Ambient wash behind the live dashboard. Subtle enough that cards stay the focus,
-/// strong enough that the screen no longer sits on a flat system grey.
+/// Ambient wash behind the app's screens. Subtle enough that cards stay the focus, with two
+/// soft glows for Liquid Glass to refract, so the glass reads as glass rather than grey.
 struct HeartSyncAmbientBackground: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
+        let strength = colorScheme == .dark ? 1.4 : 1.0
         ZStack {
             Color(.systemGroupedBackground)
-            LinearGradient(
-                colors: [
-                    HeartSyncTheme.accent.opacity(0.16),
-                    HeartSyncTheme.accentSecondary.opacity(0.08),
-                    Color.clear,
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+            RadialGradient(
+                colors: [HeartSyncTheme.accent.opacity(0.20 * strength), .clear],
+                center: .topLeading,
+                startRadius: 0,
+                endRadius: 520
             )
-            .ignoresSafeArea()
+            RadialGradient(
+                colors: [HeartSyncTheme.accentSecondary.opacity(0.14 * strength), .clear],
+                center: .bottomTrailing,
+                startRadius: 0,
+                endRadius: 560
+            )
         }
+        .ignoresSafeArea()
+        .accessibilityHidden(true)
     }
 }
 
-/// Glass tile used by Now cards and empty states.
+/// The one content-card surface: Now cards, Oura cards, and empty states.
+///
+/// On iOS 26 and later it is Liquid Glass tinted by the card's metric, so the cards pick up
+/// the ambient wash behind them and match the system's glass tab bar and toolbars. Earlier
+/// releases (the target is iOS 18) keep the translucent material tile it replaces, with the
+/// same shape and padding, so layout never differs between them.
 struct HeartSyncCardBackground: View {
     var tint: Color = HeartSyncTheme.accent
     var cornerRadius: CGFloat = HeartSyncTheme.cardCornerRadius
 
     var body: some View {
-        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            shape
+                .fill(.clear)
+                .glassEffect(.regular.tint(tint.opacity(0.10)), in: shape)
+        } else {
+            LegacyCardBackground(tint: tint, shape: shape)
+        }
+        #else
+        LegacyCardBackground(tint: tint, shape: shape)
+        #endif
+    }
+}
+
+/// The pre-glass tile: thin material, a tinted wash, and a hairline rim.
+private struct LegacyCardBackground: View {
+    var tint: Color
+    var shape: RoundedRectangle
+
+    var body: some View {
+        shape
             .fill(.ultraThinMaterial)
             .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                tint.opacity(0.10),
-                                Color.white.opacity(0.02),
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
+                shape.fill(
+                    LinearGradient(
+                        colors: [tint.opacity(0.10), Color.white.opacity(0.02)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
                     )
+                )
             }
             .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.28),
-                                tint.opacity(0.22),
-                                Color.white.opacity(0.06),
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 1
-                    )
+                shape.strokeBorder(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.28), tint.opacity(0.22), Color.white.opacity(0.06)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
             }
             .shadow(color: HeartSyncTheme.cardShadow, radius: 16, y: 8)
     }
@@ -214,11 +238,94 @@ extension View {
             .background { HeartSyncCardBackground(tint: tint) }
     }
 
-    /// Applies the brand tint to controls and selected tabs.
+    /// Applies the brand tint. Before iOS 26 the navigation bar also gets a material
+    /// background; from iOS 26 the system's glass bar and scroll-edge effect are left alone,
+    /// because a forced bar background hides them and leaves an empty band above the content.
+    @ViewBuilder
     func heartSyncChrome() -> some View {
+        if #available(iOS 26.0, *) {
+            self.tint(HeartSyncTheme.accent)
+        } else {
+            self
+                .tint(HeartSyncTheme.accent)
+                .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
+                .toolbarBackground(.visible, for: .navigationBar)
+        }
+    }
+
+    /// A List or Form over the ambient wash instead of flat grouped grey. Rows keep their
+    /// own opaque grouped background, so text contrast is unchanged.
+    func heartSyncScreenBackground() -> some View {
         self
-            .tint(HeartSyncTheme.accent)
-            .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
+            .scrollContentBackground(.hidden)
+            .background { HeartSyncAmbientBackground() }
+    }
+
+    /// A capsule chip or pill: tinted glass on iOS 26, a tinted fill with a hairline before.
+    @ViewBuilder
+    func heartSyncGlassCapsule(tint: Color, interactive: Bool = false) -> some View {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            glassEffect(
+                interactive ? .regular.tint(tint.opacity(0.16)).interactive() : .regular.tint(tint.opacity(0.16)),
+                in: Capsule()
+            )
+        } else {
+            legacyCapsule(tint: tint)
+        }
+        #else
+        legacyCapsule(tint: tint)
+        #endif
+    }
+
+    private func legacyCapsule(tint: Color) -> some View {
+        background(tint.opacity(0.14), in: Capsule())
+            .overlay(Capsule().strokeBorder(tint.opacity(0.22), lineWidth: 0.8))
+    }
+
+    /// Glass buttons on iOS 26 (`.glass`, or `.glassProminent` for the primary action);
+    /// bordered buttons before.
+    @ViewBuilder
+    func heartSyncButtonStyle(prominent: Bool = false) -> some View {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            if prominent {
+                buttonStyle(.glassProminent)
+            } else {
+                buttonStyle(.glass)
+            }
+        } else if prominent {
+            buttonStyle(.borderedProminent)
+        } else {
+            buttonStyle(.bordered)
+        }
+        #else
+        if prominent {
+            buttonStyle(.borderedProminent)
+        } else {
+            buttonStyle(.bordered)
+        }
+        #endif
+    }
+}
+
+/// A horizontal row of glass chips. On iOS 26 the chips share one glass container, so they
+/// render as one layer and blend as they scroll past each other.
+struct GlassChipRow<Content: View>: View {
+    var spacing: CGFloat = 8
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: spacing) {
+                HStack(spacing: spacing) { content }
+            }
+        } else {
+            HStack(spacing: spacing) { content }
+        }
+        #else
+        HStack(spacing: spacing) { content }
+        #endif
     }
 }

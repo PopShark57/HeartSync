@@ -31,16 +31,8 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<key>NSHealthShareUsageDescription</key>
-	<string>HeartSync reads your heart rate during workouts to show live measurements on Apple Watch.</string>
-	<key>NSHealthUpdateUsageDescription</key>
-	<string>HeartSync saves workouts and their heart-rate readings to Apple Health when you choose Save.</string>
 	<key>WKApplication</key>
 	<true/>
-	<key>WKBackgroundModes</key>
-	<array>
-		<string>workout-processing</string>
-	</array>
 	<key>WKCompanionAppBundleIdentifier</key>
 	<string>com.heartsync.HeartSyncChecker</string>
 	<key>WKRunsIndependentlyOfCompanionApp</key>

@@ -195,14 +195,14 @@ struct WatchVerdictLabel: View {
     }
 }
 
-/// Chooses the comparison period, like iPhone's 1H/24H/7D/30D control. Periods the iPhone
-/// did not send for this metric (a daily metric has no 1H) are shown but disabled.
+/// Chooses the comparison period: 1H, 3H, 24H, 7D, or 30D. Periods the iPhone did not send
+/// for this metric (a daily metric has no 1H or 3H) are shown but disabled.
 struct WatchRangePicker: View {
     @Binding var selection: WatchChartRange
     let available: [WatchChartRange]
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 3) {
             ForEach(WatchChartRange.allCases) { range in
                 let isSelected = range == selection
                 let isAvailable = available.contains(range)
@@ -213,11 +213,10 @@ struct WatchRangePicker: View {
                         .font(.caption2.weight(isSelected ? .bold : .regular))
                         .monospacedDigit()
                         .lineLimit(1)
-                        .minimumScaleFactor(0.8)
+                        .minimumScaleFactor(0.6)
                         .frame(maxWidth: .infinity, minHeight: 30)
-                        .background(
-                            Capsule().fill(isSelected ? Color.pink.opacity(0.45) : Color.gray.opacity(0.22))
-                        )
+                        .contentShape(Capsule())
+                        .watchGlassCapsule(selected: isSelected)
                 }
                 .buttonStyle(.borderless)
                 .disabled(!isAvailable)
@@ -260,6 +259,7 @@ struct WatchCompareView: View {
                             } label: {
                                 WatchCompareRow(metric: metric, selection: selectedRange)
                             }
+                            .listRowBackground(WatchCardBackground(tint: metric.kind.tint))
                         }
                     } footer: {
                         Text("At least five paired windows are needed for a verdict. Estimates are excluded. A comparison does not show which device is right.")
@@ -274,6 +274,7 @@ struct WatchCompareView: View {
             }
         }
         .navigationTitle("Compare")
+        .containerBackground(WatchTheme.backdrop, for: .navigation)
     }
 
     /// Two or more sources now, or pairs in any period.

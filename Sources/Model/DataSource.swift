@@ -95,8 +95,11 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
     /// Metrics this source has actually produced at least once. Populated as data arrives,
     /// so the UI never advertises a capability the device hasn't demonstrated.
     var observedMetrics: Set<MetricKind>
-    /// Last known battery level, 0...100, when the device exposes the Battery Service.
+    /// Last known battery level, 0...100, from the Battery Service or a ring's identity reply.
     var batteryPercent: Int?
+    /// True while the device last reported charging. Only a vendor ring reports it; nil
+    /// otherwise. Optional keeps older source archives backward-decodable.
+    var batteryIsCharging: Bool?
     /// Where on the body the sensor sits, when it reports Body Sensor Location (0x2A38).
     /// The characteristic says nothing about sensing technology; chest must not be treated
     /// as proof of ECG and wrist/finger must not be treated as proof of PPG.

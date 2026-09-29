@@ -129,6 +129,8 @@ struct SettingsView: View {
                 .disabled(settingsUnavailable)
             }
             .navigationTitle("Settings")
+            .toolbarTitleDisplayMode(.inlineLarge)
+            .heartSyncScreenBackground()
             .sheet(isPresented: $showingCalibration) { BPCalibrationView() }
             .sheet(item: $retentionProposal) { proposal in
                 RetentionConfirmationView(proposal: proposal) {

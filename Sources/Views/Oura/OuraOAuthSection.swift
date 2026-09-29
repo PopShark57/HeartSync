@@ -61,7 +61,7 @@ struct OuraOAuthSection: View {
                     Label(hasAuthorization ? "Update permissions" : "Reconnect Oura", systemImage: "person.badge.key.fill")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
+                .heartSyncButtonStyle(prominent: true)
 
                 Divider()
 

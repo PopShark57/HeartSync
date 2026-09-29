@@ -96,6 +96,7 @@ struct PairwiseAnalysisView: View {
         }
         .navigationTitle(kind.title)
         .navigationBarTitleDisplayMode(.inline)
+        .heartSyncScreenBackground()
         .onChange(of: range) {
             selectedObservationStart = nil
         }

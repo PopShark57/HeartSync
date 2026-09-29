@@ -50,9 +50,14 @@ struct RootView: View {
                             .accessibilityIdentifier("settings.retry")
                     }
                 }
-                .padding(10)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.orange.opacity(0.18))
+                .background {
+                    HeartSyncCardBackground(tint: .orange, cornerRadius: HeartSyncTheme.compactCornerRadius)
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 4)
             }
         }
     }
@@ -70,7 +75,7 @@ private struct StartupRecoveryView: View {
             Text("HeartSync has not started Bluetooth, HealthKit, or Oura. Your existing files have not been overwritten. Unlock the device or resolve storage access, then retry.\n\n\(detail)")
         } actions: {
             Button("Retry") { Task { await model.retryStartup() } }
-                .buttonStyle(.borderedProminent)
+                .heartSyncButtonStyle(prominent: true)
                 .accessibilityIdentifier("startup.retry")
             ShareLink(item: "HeartSync startup diagnostics\n\(detail)") {
                 Label("Share diagnostics", systemImage: "square.and.arrow.up")
