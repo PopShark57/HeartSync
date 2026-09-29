@@ -807,6 +807,20 @@ final class BluetoothManager: NSObject {
         updateRingSession(sourceID: sourceID) { $0.importHistory() }
     }
 
+    /// Import stored on every connected ring that is identified and idle, for a wrist
+    /// sync-all. A ring that is measuring, importing, or not yet identified is left alone.
+    /// Returns how many imports started.
+    func importStoredReadingsFromReadyRings() -> Int {
+        var started = 0
+        for (uuid, session) in ringSessions where session.canStartMeasurement {
+            let sourceID = uuid.uuidString
+            guard store?.source(id: sourceID)?.isEnabled ?? false else { continue }
+            importRingHistory(sourceID: sourceID)
+            if ringSessions[uuid]?.isImportingHistory == true { started += 1 }
+        }
+        return started
+    }
+
     private func updateRingSession(
         sourceID: String,
         _ change: (inout R11MRingSession) -> [R11MRingSession.Action]

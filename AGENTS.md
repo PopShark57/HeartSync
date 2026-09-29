@@ -72,13 +72,13 @@ HeartSyncApp
 | Target | Type | Sources | Important identity |
 | --- | --- | --- | --- |
 | `HeartSyncChecker` | iOS application | All of `Sources`, `Shared`, and the non-plist contents of `Resources` | Bundle ID `com.heartsync.HeartSyncChecker`; product/executable `HeartSync`; Swift module `HeartSyncChecker` |
-| `HeartSyncWatch` | watchOS application | `WatchApp/Sources`, `Shared`, selected model files | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp`; product/module `HeartSyncWatch`; display name HeartSync |
+| `HeartSyncWatch` | watchOS application | `WatchApp/Sources`, `Shared`, selected model files, `ChartLookup` | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp`; product/module `HeartSyncWatch`; display name HeartSync |
 | `HeartSyncWatchComplications` | watchOS app extension | `WatchComplications/Sources`, selected shared/model files | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp.complications`; embedded in watch app |
 | `HeartSyncCheckerTests` | Hosted iOS unit-test bundle | All of `Tests` | Imports `@testable import HeartSyncChecker`; explicit host is `HeartSync.app/HeartSync` |
 | `HeartSyncCheckerUITests` | iOS UI-test bundle | All of `UITests` | Drives deterministic Debug-only launch scenarios; targets `HeartSyncChecker` |
 | `HeartSyncCheckerPerformanceTests` | Hosted iOS unit-test bundle | All of `PerformanceTests` | Manual physical-device release workload; explicit host is `HeartSync.app/HeartSync` |
 
-The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI, which is `.github/workflows/ios.yml` (unit, UI, iPad screenshots, and the watch build on the iOS 18 and newest runtimes, warnings as errors). Debug and Release configurations are generated.
+The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI, which is `.github/workflows/ios.yml` (unit, UI on an iPhone simulator, and the watch build on the iOS 18 and newest runtimes, warnings as errors; iPad is not run in CI because the owner uses only iPhone and Apple Watch). Debug and Release configurations are generated.
 
 The target/product/module naming difference is intentional and fragile: the target, scheme, and module are `HeartSyncChecker`, but the installed bundle and executable are `HeartSync`. Preserve `PRODUCT_NAME`, `PRODUCT_MODULE_NAME`, `TEST_HOST`, and `BUNDLE_LOADER` together.
 
@@ -92,7 +92,7 @@ The app uses only Apple system frameworks and libraries: SwiftUI, Observation, C
 
 ## Shared Versus Platform-Specific Code
 
-Every file under `Sources` is compiled into the iOS app module. `Shared` plus `MetricKind`, `DiscrepancySeverity`, and `Provenance` are also compiled directly into the watchOS app. There is no separate shared framework or package. The watch does not compile the iPhone store, transports, or views.
+Every file under `Sources` is compiled into the iOS app module. `Shared` plus `MetricKind`, `DiscrepancySeverity`, `Provenance`, and the Foundation-only `Sources/Views/ChartLookup.swift` are also compiled directly into the watchOS app. There is no separate shared framework or package. The watch does not compile the iPhone store, transports, or views.
 
 The complication extension compiles only its own sources, the watch snapshot/projection/cache,
 and the selected metric/provenance models. It does not compile `CompanionSession` and does not access HealthKit. App Group sharing is local to the watch, not a phone sync path.
@@ -147,7 +147,7 @@ CoreBluetooth has an important actor assumption. `BluetoothManager` creates `CBC
 
 HealthKit callbacks convert framework samples into Sendable value data inside the callback and then hop to `MainActor`. Keep non-Sendable `HKSample` objects out of unconstrained tasks.
 
-Oura endpoint requests currently run sequentially. Do not casually convert them to a task group: endpoint status, token invalidation, partial-permission behavior, cached-data preservation, and API rate behavior are coupled to the current flow. A 429 that `OuraClient` cannot absorb inline ends the cycle (`SyncAbort.rateLimited`): collections fetched before it are committed, the rest are not asked for, the cycle is not counted as a full backfill, and the deadline is kept until a cycle finishes without another 429. Foreground returns and the timer are unattended and go through `syncIfDue(minimumInterval:)` (the scheduled interval, floor five minutes); pull-to-refresh and **Sync now** call `sync()`. A watch's refresh request pulls Health and republishes; it never reconnects Bluetooth or asks Oura. `OuraClient` also has shared `nonisolated(unsafe)` ISO-8601 formatters that must be re-audited before concurrent use is expanded.
+Oura endpoint requests currently run sequentially. Do not casually convert them to a task group: endpoint status, token invalidation, partial-permission behavior, cached-data preservation, and API rate behavior are coupled to the current flow. A 429 that `OuraClient` cannot absorb inline ends the cycle (`SyncAbort.rateLimited`): collections fetched before it are committed, the rest are not asked for, the cycle is not counted as a full backfill, and the deadline is kept until a cycle finishes without another 429. Foreground returns and the timer are unattended and go through `syncIfDue(minimumInterval:)` (the scheduled interval, floor five minutes); pull-to-refresh and **Sync now** call `sync()`. A watch's refresh request pulls Health and republishes; it never reconnects Bluetooth or asks Oura. A watch's **Sync all sources** request (`WatchSyncReport.requestKey`, `AppModel.syncAllFromWatch`) is the user's own request and does what the Devices tab's buttons do: reconnect known Bluetooth devices, start Import stored on every identified idle ring, `syncAll` Health, and a full `sync()` of Oura. Runs are at least 60 seconds apart; the iPhone replies with a `WatchSyncReport` by a 25-second deadline, marking any transport still running, and the readings follow in the next snapshot. `OuraClient` also has shared `nonisolated(unsafe)` ISO-8601 formatters that must be re-audited before concurrent use is expanded.
 
 ## Bluetooth Architecture
 
@@ -184,7 +184,7 @@ Readiness and diagnostics (`RingFix.md`):
 Vendor ring candidate (`R11MRingSession`, `YCBTFrameCodec`):
 
 - It is selected only from GATT topology: the YCBT service with a writable, subscribable command characteristic and a subscribable event characteristic. Never select it from the advertised name.
-- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query, which is repeated every 15 minutes while the session is idle (`refreshBattery`, `RingLink.batteryTask`, purpose `.batteryQuery`) and never during a measurement or import. A measurement or history import starts only after a CRC-valid identity reply, and only from the user's Measure heart rate / blood oxygen / blood pressure or Import stored readings action.
+- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query, which is repeated every 15 minutes while the session is idle (`refreshBattery`, `RingLink.batteryTask`, purpose `.batteryQuery`) and never during a measurement or import. A measurement or history import starts only after a CRC-valid identity reply, and only from the user's Measure heart rate / blood oxygen / blood pressure or Import stored readings action, or the watch's Sync all sources request, which starts Import stored only on a connected, enabled ring whose session is identified and idle (`importStoredReadingsFromReadyRings`).
 - Live values are provisional. Only the ring's completion event for the running sensor emits a reading (the last live value, through `emit`). Zero, no-contact, rejection, timeout, and another sensor's frames store nothing.
 - Battery: the identity reply (`02 00`) is decoded as `YCBTFrameCodec.DeviceInfo`; payload byte 4 is the charging state (non-zero while charging) and byte 5 the percent (above 100 is discarded), as `SmartRingWatcher`'s `YCParsers.deviceInfo` reads them. The session emits `.battery`, which `BluetoothManager` stores with `HealthStore.updateBattery(_:isCharging:forSource:)` on `DataSource.batteryPercent`/`batteryIsCharging`. It is source metadata, never a reading.
 - `YCBTHistory` reads stored heart-rate, blood-pressure, combined, SpO₂, and temperature records (`05` group). A type is decoded only when its concatenated bytes match the terminal block's length and CRC; the app then acknowledges (`05 80 00`, or `04` on failure). Nothing is ever deleted from the ring. Timestamps are the ring's local wall clock since 2000; records older than 30 days, in the future, or with a repeated timestamp are skipped. History IDs are `UUID(stableFrom:)` of source, metric, and timestamp, and a batch goes through `onReadings`, bypassing receipt-time admission only because it is one user-started, checked import.
@@ -196,7 +196,7 @@ The restoration identifier is `com.heartsync.central`. `UIBackgroundModes = blue
 
 ## HealthKit and Apple Watch Architecture
 
-Apple Watch data reaches iPhone only through the HealthKit import. The watchOS companion is display only: it records no workouts, does not use HealthKit, and has no workout-mirroring path (workout recording, `MirroredWorkoutPayload`, and `MirroredWorkoutMonitor` were removed at the user's request). WatchConnectivity carries a display snapshot from iPhone and refresh requests from watch; it never carries measurements. Do not add or imply direct Apple Watch BLE access.
+Apple Watch data reaches iPhone only through the HealthKit import. The watchOS companion is display only: it records no workouts, does not use HealthKit, and has no workout-mirroring path (workout recording, `MirroredWorkoutPayload`, and `MirroredWorkoutMonitor` were removed at the user's request). WatchConnectivity carries a display snapshot from iPhone, and refresh and sync-all requests (with the sync-all's per-transport report) between them; it never carries measurements. Do not add or imply direct Apple Watch BLE access.
 
 `HealthKitManager.TypeMapping` owns the HealthKit identifier, metric, unit, and scale. Current reads include heart rate, resting heart rate, SDNN HRV, oxygen saturation, respiratory rate, VO2 max, body temperature, and blood pressure. HealthKit oxygen saturation is a fraction and is multiplied by 100 on ingestion. There is no HealthKit RMSSD mapping.
 
@@ -247,12 +247,20 @@ The watch app's dashboard requires a snapshot from the paired iPhone and always 
   `CompanionSession.publish(encoded:)`, so a snapshot is encoded once, off the main actor. Watch charts label the x axis with round local times inside the plot edges
   (`WatchChartProjection.axisTicks`/`axisFormat`), break at gaps, dash estimates, use neutral
   reference inks, and are hidden in Always On. The watch never recomputes statistics.
+  A tap, or a touch-and-hold then slide, on a detail trend or difference chart selects the
+  nearest window within `ChartLookup.selectionRadius` (`WatchChartProjection.windows`,
+  `nearestDate`) and shows a popup with its local time span and each source's window
+  median (never a raw sample); the selection stays when the finger lifts, a touch in empty
+  plot area clears it, and it ticks `.sensoryFeedback(.selection)`. VoiceOver steps windows
+  with the adjustable action and has a Clear selection action. Row sparklines are not
+  selectable, because a tap there opens the metric.
 - `WatchCompanionPublisher` observes source changes, reading generations, and load state;
   it coalesces ordinary publications to at most once every 30 seconds while iOS is running.
   Foreground refresh and WatchConnectivity activation can publish immediately. This is not
   an always-running background timer or a guaranteed delivery interval.
 - `CompanionSession` uses `updateApplicationContext` for latest-state delivery and reachable
-  messages for user refresh. Its versioned payload is capped at 60 KB, excludes credentials,
+  messages for user refresh and sync-all (the only message with a reply, sent once through
+  `ReplyOnce`; the watch gives up 20 seconds after the iPhone's deadline). Its versioned payload is capped at 60 KB, excludes credentials,
   rejects malformed data, and ignores older contexts after newer resets. The watch restores
   the OS-managed received context. `WatchComplicationStore` caches one replaceable display
   snapshot for the extension; there is no second health history database.
@@ -528,8 +536,7 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
 - `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
 - `UITests/HeartSyncCheckerUITests.swift`: 15 deterministic flows, which keep screenshots
-  (`XCTAttachment`, `.keepAlways`) of key screens; CI also runs the screenshot flow on an
-  iPad simulator:
+  (`XCTAttachment`, `.keepAlways`) of key screens; CI runs them on an iPhone simulator only:
   - recovery and settings;
   - device actions, including removal that asks first and deletes only that device;
   - retention and evidence;
@@ -551,7 +558,7 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/PairTimingTests.swift`: 10 tests covering the pair timing policy — near/far samples
   inside one bucket, close samples across a boundary, bursty delivery, interval summaries,
   unknown timing from compacted rows, evidence grading, and sparse coverage.
-- `Tests/AppModelTests.swift`: 15 tests over temporary files and inert transports covering saved retention across relaunch, unreadable/corrupt/newer-schema settings deleting nothing, a lost settings file not shortening a longer period, the user's choice lifting the hold, refresh gating, Oura throttling, ring blood pressure surviving reconciliation, and a failed removal reporting.
+- `Tests/AppModelTests.swift`: 20 tests over temporary files and inert transports covering saved retention across relaunch, unreadable/corrupt/newer-schema settings deleting nothing, a lost settings file not shortening a longer period, the user's choice lifting the hold, refresh gating, Oura throttling, the wrist sync-all (every transport asked in order, the 60-second bound, unconnected sources, before load, and the reply deadline), ring blood pressure surviving reconciliation, and a failed removal reporting.
 - `Tests/StoreMaintenanceTests.swift`: 22 tests covering source mutations that roll back, estimate reconciliation scope, ingest not pruning, compaction across a pass boundary, SQL-counted retention impact and session summaries, sub-second payload dates, coarse last-seen updates, and CSV formula neutralisation.
 - `Tests/HealthKitWriteBackTests.swift`: 7 tests covering the Gregorian date of birth and the write plan (sync identifier, device, scaling, refusals), the bounded queue, and refusal classification.
 - `Tests/ComparisonSourceSelectionTests.swift`: 6 tests covering comparison-only source
@@ -593,6 +600,13 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   pruning kept, the bounded removal record), one read sliced into every period, palette
   colours and shared-slot shapes, pair choice and threshold, estimate marking, the size drop
   order and its single encode, axis ticks, gap segmentation, domains, and spoken text.
+- `Tests/Watch/WatchChartSelectionTests.swift`: 7 tests covering the wrist chart selection:
+  windows grouped across sources at the drawn dates, snapping inside the radius and nothing
+  in empty plot area, the radius in seconds, VoiceOver stepping, the popup's time span, and
+  the spoken window and difference.
+- `Tests/Watch/WatchSyncReportTests.swift`: 6 tests covering the sync-all reply's round trip
+  and rejection of impossible, newer, and oversized replies, its lines, and the Health and
+  Oura outcome rules (never synced for a run that predates the request or met a rate limit).
 - `Tests/ExportStreamingTests.swift`: 8 tests covering keyset export pages (rows sharing an
   end, one source), one snapshot across a mid-export deletion, the off-main writer against
   the whole-string export, progress, Cancel and empty exports leaving no file, a not-loaded

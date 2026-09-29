@@ -212,7 +212,11 @@ HeartSync includes a native **watchOS 11+** app with two pages:
 
 - **Dashboard:** latest readings from your iPhone, source names, measured/derived/estimated
   badges, timestamps, and comparison evidence. Tap a metric for the available sources and
-  evidence details. Open HeartSync on iPhone to sync; Refresh requests an update when reachable.
+  evidence details. **Sync all sources** (the button at the top right, or at the foot of the
+  dashboard) asks the iPhone to do what its Devices tab does one source at a time: sync Apple
+  Health and Oura, reconnect Bluetooth devices, and import readings stored on rings. It shows
+  what happened to each; the new readings arrive with the next update. Refresh only resends
+  what the iPhone already has.
 - **Compare:** every metric with two or more sources, its verdict for the chosen period, and
   the leading pair's mean difference.
 
@@ -229,7 +233,8 @@ all enabled sources using the iPhone engine. The watch offers **1H, 3H, 24H, 7D,
 refreshed less often (up to an hour for 30D) and show when they were computed. Each metric's
 detail charts every shown source's window medians in its
 iPhone colour and shape (estimates dashed, gaps left empty) and, once a pair has five paired
-windows, its mean difference and 95% limits with a difference plot. A **Compare** page lists
+windows, its mean difference and 95% limits with a difference plot. Tap a chart, or touch
+and hold and slide, to see a window's time and each source's median value there. A **Compare** page lists
 every metric with two or more sources. Charts are hidden in Always On. Exports and the full
 interactive analysis remain on iPhone.
 
@@ -253,8 +258,8 @@ Oura deletion/durability behavior, and chart selection, zoom, period, and Oura c
 projections, plus `AppModel` startup, retention, derived metrics, and refresh over injected
 transports. A 15-flow XCUI suite exercises deterministic recovery, empty/error,
 data-control, evidence, drill-down, chart-interaction, Oura chart, and pseudo-localization
-states. `.github/workflows/ios.yml` runs the unit bundle, the UI bundle, an iPad screenshot
-flow, and the watch build, with warnings as errors, on the oldest and newest simulator
+states. `.github/workflows/ios.yml` runs the unit bundle, the UI bundle on an iPhone
+simulator, and the watch build (there is no iPad run), with warnings as errors, on the oldest and newest simulator
 runtime a hosted runner offers.
 The separate `HeartSyncCheckerPerformance` scheme writes the full fourteen-day 1 Hz workload;
 run it on a representative physical iPhone with Instruments before release.

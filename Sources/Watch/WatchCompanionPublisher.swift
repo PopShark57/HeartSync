@@ -16,10 +16,15 @@ final class WatchCompanionPublisher {
     /// Keeps the 24-hour, 7-day, and 30-day periods between publications.
     private let chartCache = WatchChartCache()
 
-    func start(store: HealthStore, onRefresh: @escaping @MainActor () -> Void) {
+    func start(
+        store: HealthStore,
+        onRefresh: @escaping @MainActor () -> Void,
+        onSyncAll: @escaping @MainActor () async -> WatchSyncReport
+    ) {
         guard self.store == nil else { return }
         self.store = store
         connection.onRefresh = onRefresh
+        connection.onSyncAll = onSyncAll
         connection.onActivation = { [weak self] in self?.publishNow() }
         observeStore()
         connection.start()

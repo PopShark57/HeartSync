@@ -356,6 +356,132 @@ struct AppModelRefreshTests {
         #expect(bluetoothReconnects == 0)
         #expect(ouraSyncs == 0)
     }
+
+    @Test("A wrist sync-all asks every transport, as the Devices tab's buttons do, and reports each")
+    func watchSyncAllAsksEveryTransport() async {
+        var calls: [String] = []
+        var ouraRequests: [(userInitiated: Bool, minimumInterval: TimeInterval)] = []
+        var transports = AppModel.TransportActions.inert
+        transports.isBluetoothPoweredOn = { true }
+        transports.reconnectBluetooth = { calls.append("reconnect") }
+        transports.importRingHistories = { calls.append("rings"); return 1 }
+        transports.isHealthKitAuthorized = { true }
+        transports.syncHealthKit = { calls.append("health") }
+        transports.healthKitSyncOutcome = { _ in .synced }
+        transports.hasOuraAuthorization = { true }
+        transports.syncOura = { userInitiated, minimum in
+            calls.append("oura")
+            ouraRequests.append((userInitiated, minimum))
+        }
+        transports.ouraSyncOutcome = { _ in .partial }
+        let model = makeModel(transports: transports)
+        await model.start()
+        model.store.upsert(DataSource(id: "ring", displayName: "Ring", transport: .bluetooth))
+        model.store.upsert(DataSource(id: "strap", displayName: "Strap", transport: .bluetooth))
+        calls.removeAll()
+
+        let report = await model.syncAllFromWatch()
+
+        #expect(calls == ["reconnect", "rings", "health", "oura"])
+        // A user's own request: a full Oura attempt, as Sync now and pull-to-refresh make.
+        #expect(ouraRequests.count == 1)
+        #expect(ouraRequests.first?.userInitiated == true)
+        #expect(report.status == .completed)
+        #expect(report.health == .synced)
+        #expect(report.oura == .partial)
+        #expect(report.bluetoothDevices == 2)
+        #expect(report.ringImports == 1)
+    }
+
+    @Test("A second wrist sync-all within a minute starts nothing")
+    func watchSyncAllIsBounded() async {
+        var ouraSyncs = 0
+        var transports = AppModel.TransportActions.inert
+        transports.hasOuraAuthorization = { true }
+        transports.syncOura = { _, _ in ouraSyncs += 1 }
+        let model = makeModel(transports: transports)
+        await model.start()
+
+        _ = await model.syncAllFromWatch()
+        let second = await model.syncAllFromWatch()
+
+        #expect(ouraSyncs == 1)
+        #expect(second.status == .tooSoon)
+    }
+
+    @Test("Sources that are not connected are reported as such, never as synced")
+    func watchSyncAllReportsUnconnectedSources() async {
+        let model = makeModel(transports: .inert)
+        await model.start()
+
+        let report = await model.syncAllFromWatch()
+
+        #expect(report.status == .completed)
+        #expect(report.health == .notConnected)
+        #expect(report.oura == .notConnected)
+        #expect(report.bluetoothDevices == 0)
+        #expect(report.ringImports == 0)
+    }
+
+    @Test("A wrist sync-all before history loads reports iPhone data unavailable")
+    func watchSyncAllBeforeStart() async {
+        var healthSyncs = 0
+        var transports = AppModel.TransportActions.inert
+        transports.isHealthKitAuthorized = { true }
+        transports.syncHealthKit = { healthSyncs += 1 }
+        let model = makeModel(transports: transports)
+
+        let report = await model.syncAllFromWatch()
+
+        #expect(report.status == .unavailable)
+        #expect(healthSyncs == 0)
+    }
+
+    @Test("The reply goes at the deadline with what has finished; the rest keeps running")
+    func watchSyncAllRepliesAtTheDeadline() async {
+        let oura = OuraGate()
+        var transports = AppModel.TransportActions.inert
+        transports.isHealthKitAuthorized = { true }
+        transports.healthKitSyncOutcome = { _ in .synced }
+        transports.hasOuraAuthorization = { true }
+        transports.syncOura = { _, _ in await oura.hold() }
+        let model = makeModel(transports: transports)
+        await model.start()
+
+        let report = await model.syncAllFromWatch(deadline: 0.05)
+
+        #expect(report.status == .stillRunning)
+        #expect(report.health == .synced)
+        #expect(report.oura == .running)
+        #expect(!oura.finished)
+        oura.release()
+        for _ in 0..<200 where !oura.finished {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(oura.finished)
+    }
+}
+
+/// Holds a fake Oura sync open until the test releases it, so a deadline test does not
+/// depend on how quickly a busy main actor wakes a sleeping task.
+@MainActor
+private final class OuraGate {
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var released = false
+    private(set) var finished = false
+
+    func hold() async {
+        if !released {
+            await withCheckedContinuation { waiter = $0 }
+        }
+        finished = true
+    }
+
+    func release() {
+        released = true
+        waiter?.resume()
+        waiter = nil
+    }
 }
 
 @Suite("AppModel source removal")

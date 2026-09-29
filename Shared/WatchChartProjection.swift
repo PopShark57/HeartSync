@@ -53,6 +53,108 @@ enum WatchChartProjection {
             .sorted { $0.date < $1.date }
     }
 
+    // MARK: Selection
+
+    /// One median window as a tap or a touch-and-hold describes it: every drawn source's
+    /// value in that window, in the chart's series order.
+    struct Window: Identifiable, Equatable, Sendable {
+        struct Entry: Equatable, Sendable {
+            var seriesID: String
+            var sourceName: String
+            var color: WatchColor
+            var shape: WatchSourceShape
+            var value: Double
+            var isEstimated: Bool
+        }
+
+        /// The middle of the window, where its points are drawn.
+        var date: Date
+        var start: Date
+        var end: Date
+        var entries: [Entry]
+
+        var id: Date { date }
+    }
+
+    /// Every window any series draws, ascending, so a selection can snap to one with a
+    /// binary search instead of scanning the marks.
+    static func windows(in chart: WatchChart) -> [Window] {
+        var byOffset: [Int: [Window.Entry]] = [:]
+        for series in chart.series {
+            for (offset, value) in zip(series.offsets, series.values) {
+                byOffset[offset, default: []].append(Window.Entry(
+                    seriesID: series.id,
+                    sourceName: series.sourceName,
+                    color: series.color,
+                    shape: series.shape,
+                    value: value,
+                    isEstimated: series.isEstimated
+                ))
+            }
+        }
+        return byOffset.keys.sorted().map { offset in
+            let start = chart.start.addingTimeInterval(Double(offset))
+            return Window(
+                date: start.addingTimeInterval(chart.bucket / 2),
+                start: start,
+                end: start.addingTimeInterval(chart.bucket),
+                entries: byOffset[offset] ?? []
+            )
+        }
+    }
+
+    /// The plotted date nearest `target` within `tolerance` seconds (the selection radius
+    /// on screen), or nil when the touch is in empty plot area. A nil tolerance, before the
+    /// chart is measured, accepts the nearest date.
+    static func nearestDate(to target: Date, in sortedDates: [Date], within tolerance: TimeInterval?) -> Date? {
+        let seconds = sortedDates.map(\.timeIntervalSince1970)
+        guard let index = ChartLookup.nearestIndex(in: seconds, to: target.timeIntervalSince1970, within: tolerance) else {
+            return nil
+        }
+        return sortedDates[index]
+    }
+
+    /// The next or previous plotted date, for VoiceOver's adjustable action; from no
+    /// selection it starts at the newest window, which is the one people ask about.
+    static func steppedDate(from current: Date?, in sortedDates: [Date], forward: Bool) -> Date? {
+        guard let last = sortedDates.last else { return nil }
+        guard let current, let index = sortedDates.firstIndex(of: current) else { return last }
+        let next = forward ? index + 1 : index - 1
+        return sortedDates.indices.contains(next) ? sortedDates[next] : current
+    }
+
+    /// The window's local times: "14:00 – 14:05" within a day, with weekdays once a period
+    /// spans days. Windows are aligned to UTC, so a daily one is not a local calendar day
+    /// and is shown with its times rather than as a date.
+    static func windowText(start: Date, end: Date, range: WatchChartRange?, timeZone: TimeZone = .current) -> String {
+        var style: Date.IntervalFormatStyle
+        switch range {
+        case .hour, .threeHours, .day:
+            style = .interval.hour().minute()
+        case .week, .month, nil:
+            style = .interval.weekday(.abbreviated).hour().minute()
+        }
+        style.timeZone = timeZone
+        return (start..<end).formatted(style)
+    }
+
+    /// What VoiceOver reads for the selected window, which the callout shows.
+    static func selectionSummary(kind: MetricKind, window: Window, range: WatchChartRange?) -> String {
+        let values = window.entries.map { entry in
+            let estimate = entry.isEstimated ? ", estimate" : ""
+            return "\(entry.sourceName)\(estimate) \(kind.formatWithUnit(entry.value))"
+        }
+        return "\(windowText(start: window.start, end: window.end, range: range)), median: "
+            + values.joined(separator: "; ")
+    }
+
+    /// What VoiceOver reads for the selected difference.
+    static func differenceSummary(kind: MetricKind, pair: WatchPairAgreement, point: DifferencePoint, window: TimeInterval, range: WatchChartRange?) -> String {
+        let start = point.date.addingTimeInterval(-window / 2)
+        return "\(windowText(start: start, end: start.addingTimeInterval(window), range: range)): "
+            + "\(pair.sourceA) minus \(pair.sourceB) \(signed(point.difference, kind: kind))"
+    }
+
     /// The metric's usual range, widened to include every drawn value, so a flat line does
     /// not fill the screen and an outlier is never clipped.
     static func valueDomain(kind: MetricKind, chart: WatchChart) -> ClosedRange<Double> {
