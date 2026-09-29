@@ -254,6 +254,11 @@ The watch app's dashboard requires a snapshot from the paired iPhone and always 
   plot area clears it, and it ticks `.sensoryFeedback(.selection)`. VoiceOver steps windows
   with the adjustable action and has a Clear selection action. Row sparklines are not
   selectable, because a tap there opens the metric.
+- Do not put `.toolbar` items on the watch pages. Each page of the vertical-page `TabView`
+  has its own `NavigationStack`, and a `topBarTrailing` item on the dashboard crashed
+  watchOS with "Layout requested for visible navigation bar … when the top item belongs to a
+  different navigation bar". Actions go in the list (Sync all sources sits under Compare
+  devices).
 - `WatchCompanionPublisher` observes source changes, reading generations, and load state;
   it coalesces ordinary publications to at most once every 30 seconds while iOS is running.
   Foreground refresh and WatchConnectivity activation can publish immediately. This is not

@@ -14,6 +14,24 @@ struct WatchDashboardView: View {
             .listRowBackground(Color.clear)
             .accessibilityHint("Open comparison charts for metrics reported by two or more sources")
 
+            // At the top rather than in the toolbar: a toolbar item on a page of the vertical
+            // TabView, each page with its own NavigationStack, crashes watchOS ("Layout requested
+            // for visible navigation bar … when the top item belongs to a different navigation
+            // bar").
+            Button {
+                connection.requestSyncAll()
+            } label: {
+                Label(connection.isSyncingAll ? "Syncing…" : "Sync all sources", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .watchGlassButton()
+            .listRowBackground(Color.clear)
+            .disabled(connection.isSyncingAll || !connection.isReachable)
+            .accessibilityHint("Asks iPhone to sync Apple Health and Oura, reconnect Bluetooth devices, and import readings stored on rings")
+            if let report = connection.lastSyncReport {
+                WatchSyncReportView(report: report)
+                    .listRowBackground(Color.clear)
+            }
+
             if let snapshot = connection.snapshot {
                 Section {
                     if snapshot.availability == .unavailable {
@@ -53,15 +71,6 @@ struct WatchDashboardView: View {
 
             Section {
                 Button {
-                    connection.requestSyncAll()
-                } label: {
-                    Label(connection.isSyncingAll ? "Syncing…" : "Sync all sources", systemImage: "arrow.triangle.2.circlepath")
-                }
-                .watchGlassButton()
-                .listRowBackground(Color.clear)
-                .disabled(connection.isSyncingAll || !connection.isReachable)
-                .accessibilityHint("Asks iPhone to sync Apple Health and Oura, reconnect Bluetooth devices, and import readings stored on rings")
-                Button {
                     connection.requestRefresh()
                 } label: {
                     Label(connection.isRequesting ? "Requesting…" : "Refresh iPhone data", systemImage: "arrow.clockwise")
@@ -72,30 +81,10 @@ struct WatchDashboardView: View {
                 .accessibilityHint("Sends the readings iPhone already has, after a quick Apple Health check")
                 Text(connection.status).font(.caption).foregroundStyle(.secondary)
                     .listRowBackground(Color.clear)
-                if let report = connection.lastSyncReport {
-                    WatchSyncReportView(report: report)
-                        .listRowBackground(Color.clear)
-                }
             }
         }
         .navigationTitle("HeartSync")
         .containerBackground(WatchTheme.backdrop, for: .navigation)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    connection.requestSyncAll()
-                } label: {
-                    if connection.isSyncingAll {
-                        ProgressView()
-                    } else {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                    }
-                }
-                .disabled(connection.isSyncingAll || !connection.isReachable)
-                .accessibilityLabel(connection.isSyncingAll ? "Syncing all sources" : "Sync all sources")
-                .accessibilityHint("Asks iPhone to sync Apple Health and Oura, reconnect Bluetooth devices, and import readings stored on rings")
-            }
-        }
     }
 }
 
