@@ -83,8 +83,8 @@ Record the ring's model, firmware, and the diagnostic report with each result.
 ## Liquid Glass (iOS 26+, and the iOS 18 fallback)
 
 - [ ] On an iOS 26+ iPhone: Now's large title shares the Refresh button's row with no empty band
-  above the source chips; cards, chips, and the History and agreement buttons are glass; the tab
-  bar shrinks while scrolling down. Check light, dark, Increase Contrast, and Reduce
+  above the source chips; cards, chips, and the History and agreement buttons are glass; Compare's
+  Sessions and Sources menus both sit at the trailing edge. Check light, dark, Increase Contrast, and Reduce
   Transparency (glass must fall back to legible solid surfaces).
 - [ ] On iOS 18: the same screens keep the material cards and bordered buttons, with the same
   layout, and the navigation bar has its material background.

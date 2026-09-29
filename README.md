@@ -200,8 +200,7 @@ no Health data.
 ## Design
 
 The iOS screens use Liquid Glass on iOS 26 and later: glass metric and Oura cards tinted by
-their metric, glass source chips, glass buttons, the system's glass tab bar (which shrinks
-while you scroll), and large titles that share the toolbar row instead of taking a band of
+their metric, glass source chips, glass buttons, the system's glass tab bar, and large titles that share the toolbar row instead of taking a band of
 their own. `HeartSyncTheme` and its view modifiers (`metricCard`, `heartSyncGlassCapsule`,
 `heartSyncButtonStyle`, `heartSyncScreenBackground`) hold every glass call behind an
 availability check, so iOS 18–25 keep the translucent material styling with the same layout.

@@ -307,21 +307,6 @@ extension View {
         }
         #endif
     }
-
-    /// Lets the iPhone tab bar shrink while the user scrolls down on iOS 26, returning the
-    /// room to content. No effect before iOS 26 or on the iPad sidebar.
-    @ViewBuilder
-    func heartSyncTabBarMinimizes() -> some View {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            tabBarMinimizeBehavior(.onScrollDown)
-        } else {
-            self
-        }
-        #else
-        self
-        #endif
-    }
 }
 
 /// A horizontal row of glass chips. On iOS 26 the chips share one glass container, so they
