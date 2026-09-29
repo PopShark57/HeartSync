@@ -5,6 +5,8 @@ struct WatchWorkoutView: View {
     let workout: WatchWorkoutManager
     @State private var activity = WatchWorkoutActivity.other
     @State private var indoors = false
+    /// Off by default: mirroring hands the workout to the paired iPhone, which is a choice.
+    @AppStorage("workout.mirrorToPhone") private var mirrorToPhone = false
     @State private var confirmDiscard = false
     /// True in Always On. Heart rate and elapsed time stay prominent; everything secondary
     /// dims, and the trend is hidden, following Apple's Always On guidance.
@@ -25,14 +27,19 @@ struct WatchWorkoutView: View {
                         }
                     }
                     if activity != .other { Toggle("Indoors", isOn: $indoors) }
+                    Toggle("Show live on iPhone", isOn: $mirrorToPhone)
                     Button {
-                        Task { await workout.start(activity: activity, indoors: indoors) }
+                        Task { await workout.start(activity: activity, indoors: indoors, mirrorToPhone: mirrorToPhone) }
                     } label: {
                         Label("Start workout", systemImage: "play.fill")
                     }
                     .tint(.green)
                     Text("Records a workout with live heart rate. Wear your watch snugly. Saving adds the workout to Apple Health.")
                         .font(.caption).foregroundStyle(.secondary)
+                    if mirrorToPhone {
+                        Text("While HeartSync is open on iPhone, it shows this heart rate beside your other devices. It is not stored there; the workout reaches iPhone through Apple Health.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             } else {
                 Section(workout.activityTitle) {

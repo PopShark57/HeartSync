@@ -94,7 +94,10 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
         eventTask?.cancel()
     }
 
-    func start(activity: WatchWorkoutActivity, indoors: Bool) async {
+    /// Whether the running workout is mirrored to iPhone for its live display.
+    private(set) var isMirroring = false
+
+    func start(activity: WatchWorkoutActivity, indoors: Bool, mirrorToPhone: Bool = false) async {
         // A second Start tap while one is in flight returns nil here, so no second
         // HKWorkoutSession is ever created for one intent.
         guard let operation = lifecycle.beginStart(), session == nil else { return }
@@ -132,6 +135,7 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
             try await builder.beginCollection(at: date)
             guard self.session === session else { return }
             lifecycle.markCollecting(operation, paused: session.state == .paused)
+            if mirrorToPhone { await startMirroring(session) }
         } catch {
             guard lifecycle.accepts(operation) else { return }
             // A start failure has no reviewable workout. Detach before ending so queued
@@ -217,6 +221,34 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
         }
     }
 
+    /// Mirrors the session to the paired iPhone, which shows its heart rate beside other
+    /// devices while the workout runs (improvement 72). A failure leaves the workout itself
+    /// untouched: mirroring is a display, not part of recording.
+    private func startMirroring(_ session: HKWorkoutSession) async {
+        do {
+            try await session.startMirroringToCompanionDevice()
+            guard self.session === session else { return }
+            isMirroring = true
+            sendMirrorUpdate()
+        } catch {
+            isMirroring = false
+        }
+    }
+
+    /// Sends the latest heart rate to the mirrored session on iPhone. Display only there;
+    /// the samples themselves reach iPhone through Health after the workout.
+    private func sendMirrorUpdate() {
+        guard isMirroring, let session else { return }
+        let payload = MirroredWorkoutPayload(
+            heartRate: heartRate?.value,
+            measuredAt: heartRate?.timestamp,
+            isPaused: phase == .paused,
+            activityTitle: activityTitle
+        )
+        guard let data = try? payload.encoded() else { return }
+        Task { try? await session.sendToRemoteWorkoutSession(data: data) }
+    }
+
     private func attach(_ session: HKWorkoutSession) {
         self.session = session
         let builder = session.associatedWorkoutBuilder()
@@ -258,6 +290,7 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
     /// so any callback still queued for them is ignored on arrival.
     private func detachHealthKitObjects(discard: Bool) {
         token = nil
+        isMirroring = false
         let previous = session
         previous?.delegate = nil
         builder?.delegate = nil
@@ -278,6 +311,7 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
             heartRateTrend.append(latest)
         }
         averageHeartRate = sample.average
+        sendMirrorUpdate()
     }
 
     private struct StatisticsSnapshot: Sendable {
@@ -313,8 +347,10 @@ final class WatchWorkoutManager: NSObject, HKWorkoutSessionDelegate, HKLiveWorko
             switch toState {
             case .running:
                 lifecycle.applyRunning(operation)
+                sendMirrorUpdate()
             case .paused:
                 lifecycle.applyPaused(operation)
+                sendMirrorUpdate()
             case .stopped, .ended:
                 await prepareReview(operation, at: date)
             default: break

@@ -18,6 +18,8 @@ final class AppModel {
     let healthKit: HealthKitManager
     let oura: OuraManager
     private let watchCompanion = WatchCompanionPublisher()
+    /// A workout Apple Watch mirrors to this phone, for display on Now only.
+    let workoutMirror = MirroredWorkoutMonitor()
     private let transports: TransportActions
 
     /// The concrete services are the defaults; a test passes its own store and settings over
@@ -69,6 +71,8 @@ final class AppModel {
         ) -> Void
         /// Installs HealthKit's background-delivery observer queries. Called at launch.
         var registerHealthKitBackgroundDelivery: @MainActor () -> Void = {}
+        /// Sets HealthKit's workout-mirroring handler. Called at launch.
+        var installWorkoutMirroring: @MainActor (MirroredWorkoutMonitor) -> Void = { _ in }
         var restoreHealthKit: @MainActor () async -> Void
         var isHealthKitAuthorized: @MainActor () -> Bool
         var syncHealthKit: @MainActor () async -> Void
@@ -111,6 +115,7 @@ final class AppModel {
                     healthKit.configure(store: store, onReadings: onReadings)
                 },
                 registerHealthKitBackgroundDelivery: { healthKit.registerBackgroundObservers() },
+                installWorkoutMirroring: { $0.install(on: healthKit.healthStore) },
                 restoreHealthKit: { await healthKit.restoreSessionIfNeeded() },
                 isHealthKitAuthorized: { healthKit.availability == .authorized },
                 syncHealthKit: { await healthKit.syncAll() },
@@ -208,6 +213,7 @@ final class AppModel {
             { [weak self] in self?.flushBluetoothBuffer() }
         )
         transports.registerHealthKitBackgroundDelivery()
+        transports.installWorkoutMirroring(workoutMirror)
     }
 
     func start() async {
