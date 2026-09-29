@@ -212,7 +212,7 @@ HeartSync includes a native **watchOS 11+** app with two pages:
 
 - **Dashboard:** latest readings from your iPhone, source names, measured/derived/estimated
   badges, timestamps, and comparison evidence. Tap a metric for the available sources and
-  evidence details. **Sync all sources** (the button at the top right, or at the foot of the
+  evidence details. **Sync all sources** (under Compare devices at the top of the
   dashboard) asks the iPhone to do what its Devices tab does one source at a time: sync Apple
   Health and Oura, reconnect Bluetooth devices, and import readings stored on rings. It shows
   what happened to each; the new readings arrive with the next update. Refresh only resends
