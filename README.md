@@ -258,8 +258,8 @@ Oura deletion/durability behavior, and chart selection, zoom, period, and Oura c
 projections, plus `AppModel` startup, retention, derived metrics, and refresh over injected
 transports. A 15-flow XCUI suite exercises deterministic recovery, empty/error,
 data-control, evidence, drill-down, chart-interaction, Oura chart, and pseudo-localization
-states. `.github/workflows/ios.yml` runs the unit bundle, the UI bundle, an iPad screenshot
-flow, and the watch build, with warnings as errors, on the oldest and newest simulator
+states. `.github/workflows/ios.yml` runs the unit bundle, the UI bundle on an iPhone
+simulator, and the watch build (there is no iPad run), with warnings as errors, on the oldest and newest simulator
 runtime a hosted runner offers.
 The separate `HeartSyncCheckerPerformance` scheme writes the full fourteen-day 1 Hz workload;
 run it on a representative physical iPhone with Instruments before release.

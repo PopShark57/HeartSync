@@ -78,7 +78,7 @@ HeartSyncApp
 | `HeartSyncCheckerUITests` | iOS UI-test bundle | All of `UITests` | Drives deterministic Debug-only launch scenarios; targets `HeartSyncChecker` |
 | `HeartSyncCheckerPerformanceTests` | Hosted iOS unit-test bundle | All of `PerformanceTests` | Manual physical-device release workload; explicit host is `HeartSync.app/HeartSync` |
 
-The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI, which is `.github/workflows/ios.yml` (unit, UI, iPad screenshots, and the watch build on the iOS 18 and newest runtimes, warnings as errors). Debug and Release configurations are generated.
+The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI, which is `.github/workflows/ios.yml` (unit, UI on an iPhone simulator, and the watch build on the iOS 18 and newest runtimes, warnings as errors; iPad is not run in CI because the owner uses only iPhone and Apple Watch). Debug and Release configurations are generated.
 
 The target/product/module naming difference is intentional and fragile: the target, scheme, and module are `HeartSyncChecker`, but the installed bundle and executable are `HeartSync`. Preserve `PRODUCT_NAME`, `PRODUCT_MODULE_NAME`, `TEST_HOST`, and `BUNDLE_LOADER` together.
 
@@ -536,8 +536,7 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
 - `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
 - `UITests/HeartSyncCheckerUITests.swift`: 15 deterministic flows, which keep screenshots
-  (`XCTAttachment`, `.keepAlways`) of key screens; CI also runs the screenshot flow on an
-  iPad simulator:
+  (`XCTAttachment`, `.keepAlways`) of key screens; CI runs them on an iPhone simulator only:
   - recovery and settings;
   - device actions, including removal that asks first and deletes only that device;
   - retention and evidence;
