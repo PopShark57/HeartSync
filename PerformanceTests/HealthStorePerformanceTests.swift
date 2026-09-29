@@ -327,4 +327,86 @@ struct HealthStorePerformanceTests {
         #expect(nowP95 <= Self.nowReloadBudget)
         #expect(share <= Self.mainThreadShareBudget)
     }
+
+    /// One hour of a 1 Hz strap with an RMSSD value a minute, committed the way the app
+    /// commits it (`BluetoothIngestBuffer`) and, for comparison, one transaction per value
+    /// as before improvement 52.
+    ///
+    /// Prints commits per minute and the wall time spent committing for each. Energy impact
+    /// is not measurable from a test: record it with the Energy Log instrument on the same
+    /// device run and write both into `RELEASE_CHECKLIST.md`.
+    @Test("An hour of strap ingest commits in batches, not once per value")
+    func batchedStrapIngest() async throws {
+        func makeStore(_ name: String) async throws -> (HealthStore, URL) {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("HeartSync-device-ingest-\(name)-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let store = HealthStore(
+                persistenceEnabled: true,
+                databaseURL: directory.appendingPathComponent("health.sqlite3"),
+                archive: ReadingArchive(directory: directory)
+            )
+            await store.loadIfNeeded()
+            store.upsert(DataSource(id: "performance.strap", displayName: "Strap", transport: .bluetooth))
+            return (store, directory)
+        }
+
+        let start = Date.now.addingTimeInterval(-3_700)
+        func values(at second: Int) -> [Reading] {
+            let stamp = start.addingTimeInterval(TimeInterval(second))
+            var result = [Reading(
+                id: UUID(stableFrom: "perf.ingest.hr.\(second)"),
+                sourceID: "performance.strap", kind: .heartRate, value: 60 + Double(second % 30), start: stamp
+            )]
+            if second % 60 == 59 {
+                result.append(Reading(
+                    id: UUID(stableFrom: "perf.ingest.rmssd.\(second)"),
+                    sourceID: "performance.strap", kind: .hrvRMSSD, value: 40,
+                    start: stamp.addingTimeInterval(-300), end: stamp, provenance: .derived
+                ))
+            }
+            return result
+        }
+
+        let clock = ContinuousClock()
+        let (batched, batchedDirectory) = try await makeStore("batched")
+        defer { try? FileManager.default.removeItem(at: batchedDirectory) }
+        var buffer = BluetoothIngestBuffer()
+        let batchedCommitsBefore = batched.commitCount
+        var batchedTime = Duration.zero
+        for second in 0..<3_600 {
+            let now = start.addingTimeInterval(TimeInterval(second))
+            var due = buffer.isDue(at: now)
+            for reading in values(at: second) { due = buffer.append(reading, at: now) || due }
+            if due {
+                let batch = buffer.drain()
+                let began = clock.now
+                _ = batched.appendBatch(readings: batch)
+                batchedTime += began.duration(to: clock.now)
+            }
+        }
+        _ = batched.appendBatch(readings: buffer.drain())
+        let batchedCommits = batched.commitCount - batchedCommitsBefore
+
+        let (single, singleDirectory) = try await makeStore("single")
+        defer { try? FileManager.default.removeItem(at: singleDirectory) }
+        let singleCommitsBefore = single.commitCount
+        var singleTime = Duration.zero
+        for second in 0..<3_600 {
+            for reading in values(at: second) {
+                let began = clock.now
+                _ = single.appendBatch(readings: [reading])
+                singleTime += began.duration(to: clock.now)
+            }
+        }
+        let singleCommits = single.commitCount - singleCommitsBefore
+
+        print("""
+            One hour of 1 Hz strap ingest
+              batched: \(batchedCommits) commits (\(batchedCommits / 60) per minute), \(batchedTime) committing
+              per value: \(singleCommits) commits (\(singleCommits / 60) per minute), \(singleTime) committing
+            """)
+        #expect(batched.readingCount == single.readingCount)
+        #expect(batchedCommits * 2 <= singleCommits + 2)
+    }
 }

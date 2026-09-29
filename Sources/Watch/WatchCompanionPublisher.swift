@@ -8,6 +8,10 @@ final class WatchCompanionPublisher {
     let connection = CompanionSession()
     private weak var store: HealthStore?
     private var pending: Task<Void, Never>?
+    /// The build in flight, and a number that only the newest build may publish under, so a
+    /// slow build that finishes after a newer one cannot replace it.
+    private var building: Task<Void, Never>?
+    private var buildSequence = 0
     private var lastPublished = Date.distantPast
     /// Keeps the 24-hour, 7-day, and 30-day periods between publications.
     private let chartCache = WatchChartCache()
@@ -21,12 +25,30 @@ final class WatchCompanionPublisher {
         connection.start()
     }
 
+    /// Starts a publication now. The snapshot is read and built off the main actor; only
+    /// handing it to WatchConnectivity happens here.
     func publishNow() {
         pending?.cancel()
         pending = nil
         guard connection.isInstalled, let store else { return }
-        connection.publish(WatchSnapshotBuilder.make(store: store, cache: chartCache))
+        let history = store.history
+        let cache = chartCache
+        buildSequence &+= 1
+        let sequence = buildSequence
         lastPublished = .now
+        building = Task { [weak self] in
+            let snapshot = await HealthHistory.offMain(priority: .utility) {
+                WatchSnapshotBuilder.make(history: history, cache: cache)
+            }
+            guard let self, sequence == self.buildSequence else { return }
+            self.connection.publish(snapshot)
+        }
+    }
+
+    /// Waits for the build in flight, for tests and for callers that must know the
+    /// newest snapshot has been handed over.
+    func waitForPublication() async {
+        await building?.value
     }
 
     private func observeStore() {

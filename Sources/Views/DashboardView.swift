@@ -64,6 +64,14 @@ struct DashboardView: View {
                         ScrollView {
                             VStack(alignment: .leading, spacing: 16) {
                                 sourcesHeader
+                                if let mirrored = model.workoutMirror.latest {
+                                    MirroredWorkoutCard(
+                                        payload: mirrored,
+                                        bluetoothRows: snapshot.metrics
+                                            .first { $0.kind == .heartRate }?
+                                            .rows.filter { $0.source.transport == .bluetooth } ?? []
+                                    )
+                                }
                                 // One column on iPhone; as many 320-point columns as fit on
                                 // iPad or in landscape.
                                 LazyVGrid(
@@ -100,11 +108,13 @@ struct DashboardView: View {
                 )
                 try? await Task.sleep(for: .seconds(wait))
                 guard !Task.isCancelled else { return }
-                snapshot = DashboardSnapshot(
-                    store: model.store,
-                    now: .now,
-                    sparklineCache: snapshot?.sparklineCache ?? [:]
-                )
+                let history = model.store.history
+                let cache = snapshot?.sparklineCache ?? [:]
+                let resolved = await HealthHistory.offMain {
+                    DashboardSnapshot(history: history, now: .now, sparklineCache: cache)
+                }
+                guard !Task.isCancelled else { return }
+                snapshot = resolved
                 lastLoadedAt = .now
                 lastRetryToken = retryToken
             }
@@ -387,5 +397,58 @@ private struct SparklineView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(sparkline.spokenSummary(names: sources.mapValues(\.displayName)))
         .accessibilityIdentifier("now.sparkline.\(sparkline.kind.rawValue)")
+    }
+}
+
+/// A workout Apple Watch is mirroring to this phone, beside the Bluetooth heart rate on the
+/// Now screen (improvement 72).
+///
+/// Display only. The value is never stored, compared, or exported, so it gets no agreement
+/// badge; the workout's samples arrive through Apple Health after the watch syncs, and are
+/// compared from there.
+private struct MirroredWorkoutCard: View {
+    let payload: MirroredWorkoutPayload
+    let bluetoothRows: [SourceReadingRow]
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            VStack(alignment: .leading, spacing: 10) {
+                Label(payload.activityTitle ?? "Apple Watch workout", systemImage: "applewatch.radiowaves.left.and.right")
+                    .font(.headline)
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Apple Watch")
+                    Spacer()
+                    Text(payload.heartRate.map { MetricKind.heartRate.formatWithUnit($0) } ?? "\u{2014}")
+                        .monospacedDigit()
+                        .font(.title3.weight(.semibold))
+                }
+                .accessibilityElement(children: .combine)
+                Text(status(at: timeline.date))
+                    .font(.caption)
+                    .foregroundStyle(payload.isLive(at: timeline.date) ? Color.green : Color.secondary)
+                ForEach(bluetoothRows, id: \.source.id) { row in
+                    HStack(alignment: .firstTextBaseline) {
+                        SourceDot(color: row.source.color, size: 8)
+                        Text(row.source.displayName).lineLimit(1)
+                        Spacer()
+                        Text(MetricKind.heartRate.formatWithUnit(row.value)).monospacedDigit()
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+                Text("Display only. This live value is not stored or compared; the workout's heart rate reaches HeartSync through Apple Health after the watch syncs.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .metricCard()
+        }
+        .accessibilityIdentifier("now.mirroredWorkout")
+    }
+
+    private func status(at now: Date) -> String {
+        if payload.isPaused { return "Workout paused" }
+        if payload.isLive(at: now) { return "Live from the workout" }
+        guard let measuredAt = payload.measuredAt else { return "Waiting for heart rate" }
+        return "Last heart rate \(WindowLabel.elapsed(max(0, now.timeIntervalSince(measuredAt)))) ago"
     }
 }

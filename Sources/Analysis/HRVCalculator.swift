@@ -143,23 +143,31 @@ enum HRVCalculator {
     /// The returned `rejected` count is relative to the *supplied* intervals, so it
     /// includes both out-of-range values and beats the relative filter dropped.
     static func filterArtefacts(_ intervals: [Double]) -> (clean: [Double], rejected: Int) {
-        let inRange = intervals.filter { plausibleIntervalMS.contains($0) }
-        guard inRange.count >= 2 else {
-            return (inRange, intervals.count - inRange.count)
-        }
+        let kept = keptIndices(intervals)
+        return (kept.map { intervals[$0] }, intervals.count - kept.count)
+    }
 
-        var clean: [Double] = []
+    /// Positions in `intervals` that `filterArtefacts` keeps, in order.
+    ///
+    /// Positions rather than values, so `metrics` can tell two kept beats that were
+    /// neighbours from two that had a rejected ectopic between them.
+    static func keptIndices(_ intervals: [Double]) -> [Int] {
+        let inRange = intervals.indices.filter { plausibleIntervalMS.contains(intervals[$0]) }
+        guard inRange.count >= 2 else { return inRange }
+
+        var clean: [Int] = []
         clean.reserveCapacity(inRange.count)
         // Seed the reference with the median so a corrupted first beat cannot poison the
         // whole sequence.
         var recentAccepted: [Double] = []
-        var reference = median(inRange)
-        var rejectedRun: [Double] = []
+        var reference = median(inRange.map { intervals[$0] })
+        var rejectedRun: [Int] = []
 
-        for interval in inRange {
+        for index in inRange {
+            let interval = intervals[index]
             let deviation = abs(interval - reference) / reference
             if deviation <= maximumDeviationFromReference {
-                clean.append(interval)
+                clean.append(index)
                 recentAccepted.append(interval)
                 if recentAccepted.count > referenceWindow { recentAccepted.removeFirst() }
                 reference = median(recentAccepted)
@@ -167,33 +175,40 @@ enum HRVCalculator {
                 continue
             }
 
-            rejectedRun.append(interval)
+            rejectedRun.append(index)
             guard rejectedRun.count >= rejectionRunLimit else { continue }
 
             // Only the trailing run is considered, so noise immediately followed by a real
             // rate change still re-seeds on the change rather than being held back by the
             // scattered intervals in front of it.
             let candidate = Array(rejectedRun.suffix(rejectionRunLimit))
-            let candidateReference = median(candidate)
-            let isConsistent = candidate.allSatisfy {
+            let candidateValues = candidate.map { intervals[$0] }
+            let candidateReference = median(candidateValues)
+            let isConsistent = candidateValues.allSatisfy {
                 abs($0 - candidateReference) / candidateReference <= maximumDeviationFromReference
             }
             guard isConsistent else { continue }
 
             clean.append(contentsOf: candidate)
-            recentAccepted = candidate
+            recentAccepted = candidateValues
             reference = candidateReference
             rejectedRun.removeAll(keepingCapacity: true)
         }
 
-        return (clean, intervals.count - clean.count)
+        return clean
     }
 
     /// Computes time-domain HRV from raw R\u{2013}R intervals in milliseconds.
     /// Returns `nil` when too few intervals survive filtering to say anything.
-    static func metrics(from intervals: [Double]) -> HRVMetrics? {
+    ///
+    /// - Parameter breaksBefore: positions in `intervals` that do not directly follow the
+    ///   previous interval, because beats were lost in between (a gap in the stream). The
+    ///   accumulator supplies these from the beats' timing.
+    static func metrics(from intervals: [Double], breaksBefore: Set<Int> = []) -> HRVMetrics? {
         guard !intervals.isEmpty else { return nil }
-        let (clean, rejected) = filterArtefacts(intervals)
+        let kept = keptIndices(intervals)
+        let clean = kept.map { intervals[$0] }
+        let rejected = intervals.count - kept.count
         guard clean.count >= 2 else { return nil }
 
         let n = Double(clean.count)
@@ -203,15 +218,22 @@ enum HRVCalculator {
         let variance = clean.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / n
         let sdnn = variance.squareRoot()
 
-        // RMSSD and pNN50 both operate on successive differences.
+        // RMSSD and pNN50 both operate on successive differences, and only between beats
+        // that really were successive: normal-to-normal pairs. A difference across a removed
+        // ectopic, or across a gap in the stream, compares two beats that were never
+        // neighbours and inflates RMSSD, which is the error the filter exists to prevent.
         var sumSquaredDiffs = 0.0
         var over50 = 0
-        for i in 1..<clean.count {
+        var pairs = 0
+        for i in 1..<kept.count
+        where kept[i] == kept[i - 1] + 1 && !breaksBefore.contains(kept[i]) {
             let diff = clean[i] - clean[i - 1]
             sumSquaredDiffs += diff * diff
             if abs(diff) > 50 { over50 += 1 }
+            pairs += 1
         }
-        let pairCount = Double(clean.count - 1)
+        guard pairs > 0 else { return nil }
+        let pairCount = Double(pairs)
         let rmssd = (sumSquaredDiffs / pairCount).squareRoot()
         let pnn50 = Double(over50) / pairCount * 100
 
@@ -304,7 +326,7 @@ struct HRVAccumulator {
     /// remains false until the full SDNN duration has actually been observed.
     mutating func emissionIfReady(at time: Date = .now) -> HRVEmission? {
         if let lastEmit, time.timeIntervalSince(lastEmit) < emitInterval { return nil }
-        guard let metrics = HRVCalculator.metrics(from: samples.map(\.interval)),
+        guard let metrics = HRVCalculator.metrics(from: samples.map(\.interval), breaksBefore: streamBreaks),
               metrics.isReliable,
               let first = samples.first,
               let last = samples.last
@@ -326,6 +348,22 @@ struct HRVAccumulator {
     /// `emissionIfReady` so it cannot invent a five-minute interval.
     mutating func emitIfReady(at time: Date = .now) -> HRVMetrics? {
         emissionIfReady(at: time)?.metrics
+    }
+
+    /// Positions where the buffered beats do not follow on from the one before.
+    ///
+    /// Each beat's time is when it ended, so a beat that directly follows the previous one
+    /// ends about one interval after it. More than half a beat (or half a second) of time
+    /// that no interval accounts for means beats were lost: a dropped notification, a
+    /// disconnection, or the phone's Bluetooth turning off.
+    var streamBreaks: Set<Int> {
+        var breaks: Set<Int> = []
+        for index in samples.indices.dropFirst() {
+            let elapsed = samples[index].time.timeIntervalSince(samples[index - 1].time)
+            let expected = max(0, samples[index].interval) / 1_000
+            if elapsed - expected > max(0.5, expected / 2) { breaks.insert(index) }
+        }
+        return breaks
     }
 
     /// Seconds of data currently buffered, for showing progress towards a first reading.

@@ -169,13 +169,19 @@ struct MetricDetailView: View {
             )
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }
-            let resolved = MetricDetailSnapshot(
-                store: model.store,
-                kind: kind,
-                period: period,
-                includeEstimates: showEstimates,
-                hrvQuality: isHRV ? model.bluetooth.hrvQuality : [:]
-            )
+            // Read and analysed off the main actor; only the result is published here.
+            let history = model.store.history
+            let kind = kind, period = period, showEstimates = showEstimates
+            let hrvQuality = isHRV ? model.bluetooth.hrvQuality : [:]
+            let resolved = await HealthHistory.offMain {
+                MetricDetailSnapshot(
+                    history: history,
+                    kind: kind,
+                    period: period,
+                    includeEstimates: showEstimates,
+                    hrvQuality: hrvQuality
+                )
+            }
             guard !Task.isCancelled, key == loadKey else { return }
             snapshot = resolved
             lastLoadedKey = key
@@ -405,6 +411,13 @@ struct MetricDetailView: View {
             }
             .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 12, trailing: 12))
             .accessibilityIdentifier("metric.chart")
+            if !chart.intervalSpans.isEmpty {
+                Text("Bars are averages over a night or a day, drawn across the time they describe. They are not compared with other devices, because one average cannot be paired with a single \(WindowLabel.length(kind.comparisonWindow)) window.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("metric.intervalAverages")
+            }
         }
     }
 
@@ -567,13 +580,17 @@ struct MetricDetailView: View {
         )
         try? await Task.sleep(for: .seconds(wait))
         guard !Task.isCancelled else { return }
-        let resolved = MetricZoomSnapshot(
-            store: model.store,
-            kind: kind,
-            viewport: key.viewport,
-            includeEstimates: key.showEstimates,
-            series: series
-        )
+        let history = model.store.history
+        let kind = kind
+        let resolved = await HealthHistory.offMain {
+            MetricZoomSnapshot(
+                history: history,
+                kind: kind,
+                viewport: key.viewport,
+                includeEstimates: key.showEstimates,
+                series: series
+            )
+        }
         guard !Task.isCancelled, key == zoomLoadKey else { return }
         zoomSnapshot = resolved
         zoomLoadedKey = key
@@ -691,7 +708,11 @@ struct MetricDetailView: View {
         )
         try? await Task.sleep(for: .seconds(wait))
         guard !Task.isCancelled else { return }
-        let resolved = MetricPeriodEvidence(store: model.store, kind: kind, interval: key.period)
+        let history = model.store.history
+        let kind = kind
+        let resolved = await HealthHistory.offMain {
+            MetricPeriodEvidence(history: history, kind: kind, interval: key.period)
+        }
         guard !Task.isCancelled, key == periodLoadKey else { return }
         periodEvidence = resolved
         periodLoadedKey = key

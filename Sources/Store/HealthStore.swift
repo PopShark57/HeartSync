@@ -129,6 +129,9 @@ final class HealthStore {
     private let archive: ReadingArchive
     private let configuredDatabaseURL: URL?
     private var database: HealthDatabase?
+    /// Read-only connections for every history read, on and off the main actor. Writes
+    /// stay on `database`.
+    private var readers: HealthDatabase.ReaderPool?
     private var needsLegacyMigration: Bool
     private var loadTask: Task<Void, Never>?
     private var compactionCursor: Date?
@@ -153,6 +156,7 @@ final class HealthStore {
             }
             let database = try HealthDatabase(url: url)
             self.database = database
+            self.readers = HealthDatabase.ReaderPool(writer: database)
             self.needsLegacyMigration = persistenceEnabled && database.requiresLegacyMigration
             self.loadState = persistenceEnabled ? .notLoaded : .loaded
         } catch {
@@ -161,6 +165,21 @@ final class HealthStore {
             self.loadState = persistenceEnabled ? .failed : .loaded
             self.lastPersistenceError = error.localizedDescription
         }
+    }
+
+    /// The source list, generations, and read connections as a value, for building a
+    /// snapshot off the main actor (`HealthHistory.offMain`). Reading this property
+    /// observes the same state the store's own queries observe.
+    var history: HealthHistory {
+        HealthHistory(
+            sources: sources,
+            changeToken: dataGeneration,
+            removalGeneration: removalGeneration,
+            loadState: loadState,
+            readers: readers,
+            pending: persistenceEnabled && loadState != .loaded ? unavailableBuffer : [],
+            unavailableDetail: lastPersistenceError
+        )
     }
 
     /// Compatibility access for tests and explicit whole-history export only. App screens
@@ -453,21 +472,35 @@ final class HealthStore {
             sources = sourcesBeforeCommit
             return BatchCommitResult(acceptedReadings: [], committed: false)
         }
-        valid.removeAll { reading in
-            (try? database.contains(readingID: compactedReadingID(for: reading))) == true
-                && reading.id != compactedReadingID(for: reading)
-        }
         do {
+            // An interval average is never folded into a window (see `compact`), so a
+            // compacted window at its midpoint says nothing about it, and Oura may still
+            // revise it. One lookup for the batch, not one per reading.
+            let aggregateIDs = Dictionary(
+                valid.filter { !$0.isIntervalAverage }.map { ($0.id, compactedReadingID(for: $0)) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let compacted = try database.existingIDs(Array(Set(aggregateIDs.values)))
+            if !compacted.isEmpty {
+                valid.removeAll { reading in
+                    guard let aggregate = aggregateIDs[reading.id] else { return false }
+                    return compacted.contains(aggregate) && reading.id != aggregate
+                }
+            }
             let changed = try database.changedReadings(valid, mode: mode)
             guard !changed.isEmpty || sourcesChanged || !removingReadingIDs.isEmpty else {
                 return BatchCommitResult(acceptedReadings: [], committed: true)
             }
             noteObserved(changed)
+            // Only rows that differ from what is stored. Every source used to be rewritten on
+            // every commit because one source's last-seen time had moved.
+            let previous = Dictionary(sourcesBeforeCommit.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let changedSources = sources.filter { previous[$0.id] != $0 }
             do {
                 let removed = try database.commit(
                     readings: changed,
                     mode: mode,
-                    sources: sources,
+                    sources: changedSources,
                     removingReadingIDs: removingReadingIDs
                 )
                 rewindCompactionIfNeeded(for: changed)
@@ -540,12 +573,15 @@ final class HealthStore {
     /// bodies while an immutable snapshot is being resolved, so recording the failure in
     /// observed state here would mutate the model during a view update. The failure
     /// travels back to the screen inside the snapshot that asked for it instead.
+    ///
+    /// Reads go through the read-only pool, never the writer connection, so a main-actor
+    /// read and an off-main snapshot read never share a connection.
     private func query<Value>(_ body: (HealthDatabase) throws -> Value) -> HealthStoreQueryOutcome<Value> {
-        guard let database else {
+        guard let readers else {
             return .failure(.storeUnavailable(lastPersistenceError ?? "No database handle is open."))
         }
         do {
-            return .success(try body(database))
+            return .success(try readers.read(body))
         } catch {
             logger.error("History query failed: \(error.localizedDescription, privacy: .public)")
             return .failure(.queryFailed(error.localizedDescription))
@@ -563,8 +599,7 @@ final class HealthStore {
             return .failure(.notLoaded)
         }
         let enabled = enabledOnly ? Set(enabledSources.map(\.id)) : nil
-        return query { try $0.readings(kind: kind, range: range) }
-            .map { rows in enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows }
+        return query { try $0.readings(kind: kind, range: range, sourceIDs: enabled) }
     }
 
     func readingsOutcome(in range: DateInterval, enabledOnly: Bool = true) -> HealthStoreQueryOutcome<[Reading]> {
@@ -574,8 +609,7 @@ final class HealthStore {
             return .failure(.notLoaded)
         }
         let enabled = enabledOnly ? Set(enabledSources.map(\.id)) : nil
-        return query { try $0.readings(range: range) }
-            .map { rows in enabled.map { ids in rows.filter { ids.contains($0.sourceID) } } ?? rows }
+        return query { try $0.readings(range: range, sourceIDs: enabled) }
     }
 
     /// Readings of every metric that end at or after `end`, limited to midpoints in `range`.
@@ -674,18 +708,7 @@ final class HealthStore {
         sourceIDs: Set<String>?,
         kind: MetricKind?
     ) -> HealthStoreQueryOutcome<PeriodReadingSummary> {
-        _ = dataGeneration
-        guard loadState == .loaded || !persistenceEnabled else { return .failure(.notLoaded) }
-        return query { database in
-            var count = 0
-            var fingerprint: Int64 = 0
-            for metric in kind.map({ [$0] }) ?? MetricKind.allCases {
-                let part = try database.readingSummary(kind: metric, sourceIDs: sourceIDs, range: interval)
-                count += part.count
-                fingerprint &+= part.fingerprint
-            }
-            return PeriodReadingSummary(count: count, fingerprint: fingerprint)
-        }
+        history.periodSummaryOutcome(interval: interval, sourceIDs: sourceIDs, kind: kind)
     }
 
     /// Whole-history read for the explicit export. Throws rather than returning an empty
@@ -810,9 +833,11 @@ final class HealthStore {
                 sources[index].lastSeenAt = now
                 clamped.append(sources[index])
             }
+            // A row may begin up to the accepted clock skew ahead; only one beyond it is
+            // impossible and goes.
             let removed = try database.prune(
                 cutoff: cutoff,
-                now: now,
+                now: now.addingTimeInterval(Self.maximumFutureSkew),
                 changedSources: clamped,
                 includingInvalidRows: includingInvalidRows
             )
@@ -861,7 +886,9 @@ final class HealthStore {
         var supersededIDs: Set<UUID> = []
         for (kind, group) in Dictionary(grouping: aged, by: \.kind) {
             var members: [CompactionBucket: [Reading]] = [:]
-            for reading in group where reading.isPlausible {
+            // An interval average stays a row of its own. Folded into the window at its
+            // midpoint, a night's mean would lose its span and be paired as one minute.
+            for reading in group where reading.isPlausible && !reading.isIntervalAverage {
                 let start = ComparisonEngine.floorToWindow(reading.midpoint, size: kind.comparisonWindow)
                 members[CompactionBucket(start: start, sourceID: reading.sourceID), default: []].append(reading)
             }
@@ -937,6 +964,7 @@ final class HealthStore {
                 let url = try configuredDatabaseURL ?? HealthDatabase.defaultURL()
                 let reopened = try HealthDatabase(url: url)
                 database = reopened
+                readers = HealthDatabase.ReaderPool(writer: reopened)
                 needsLegacyMigration = reopened.requiresLegacyMigration
                 lastPersistenceError = nil
             } catch {
@@ -1012,6 +1040,10 @@ final class HealthStore {
             else { break }
         }
         do {
+            // Rows written before schema 3 get their value column a bounded batch at a time.
+            // Until then they are read from their payload, so this is speed, not correctness.
+            let filled = try database.backfillValueColumns()
+            if filled > 0 { logger.info("Backfilled value columns for \(filled) readings") }
             try database.checkpoint()
             return true
         } catch {
@@ -1229,6 +1261,9 @@ final class HealthStore {
         String(format: "%.15g", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 
+    /// Write transactions committed since the database opened; see `HealthDatabase.commitCount`.
+    var commitCount: Int { database?.commitCount ?? 0 }
+
     func injectDatabaseFailureOnNextCommitForTesting() {
         database?.injectFailureOnNextCommitForTesting()
     }
@@ -1237,6 +1272,7 @@ final class HealthStore {
     /// "the read failed" can be asserted after a successful startup.
     func injectQueryFailureForTesting(_ failing: Bool = true) {
         database?.injectQueryFailureForTesting(failing)
+        readers?.injectQueryFailureForTesting(failing)
     }
 
     // MARK: - Helpers
@@ -1286,13 +1322,22 @@ final class HealthStore {
         return min(date, now)
     }
 
+    /// How far ahead of this phone's clock a device's timestamp may be and still be kept.
+    ///
+    /// The same allowance Bluetooth admission already gives
+    /// (`BluetoothIngestionPolicy.maximumFutureSkew`). A HealthKit sample written by a watch
+    /// whose clock runs a few seconds ahead used to be dropped here while its anchor moved
+    /// past it, so it was never imported at all.
+    nonisolated static let maximumFutureSkew: TimeInterval = 5 * 60
+
     private func isTemporallyValid(_ reading: Reading, now: Date) -> Bool {
+        let latestAcceptable = now.addingTimeInterval(Self.maximumFutureSkew)
         guard reading.start.timeIntervalSinceReferenceDate.isFinite,
               reading.end.timeIntervalSinceReferenceDate.isFinite,
               reading.start <= reading.end,
-              reading.start <= now
+              reading.start <= latestAcceptable
         else { return false }
-        guard reading.end > now else { return true }
+        guard reading.end > latestAcceptable else { return true }
         let aggregate = reading.provenance == .estimated || reading.sourceID == DataSource.ouraSourceID
         return aggregate && reading.end.timeIntervalSince(now) <= 86_400
     }

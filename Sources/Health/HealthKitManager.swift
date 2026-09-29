@@ -130,6 +130,17 @@ final class HealthKitManager {
     // Internal so HealthKitManager+Session can query authorization status.
     let healthStore = HKHealthStore()
     private var activeQueries: [HKQuery] = []
+    /// `HKObserverQuery`s for background delivery; see `HealthKitManager+Background`. Kept
+    /// apart from `activeQueries`, which `stopObserving` stops: these run for the process.
+    var backgroundObserverQueries: [HKObserverQuery] = []
+
+    /// True while the foreground anchored queries are installed.
+    var isObservingInForeground: Bool { !observerQueries.isEmpty }
+
+    /// Startup has loaded the history and restored the Health session.
+    var isReadyForBackgroundDrain: Bool {
+        availability == .authorized && store?.loadState == .loaded && !isResetting
+    }
     private(set) weak var store: HealthStore?
     /// Measured Bluetooth readings waiting for the next batched save; see
     /// `HealthKitManager+WriteBack`. Stored here because an extension cannot add state.
@@ -247,6 +258,15 @@ final class HealthKitManager {
             lock.unlock()
         }
     }
+
+    /// The one-shot drain running now, so a reset can wait for it (improvement 47).
+    private var syncTask: Task<Void, Never>?
+    /// Advanced by every data reset. A drain or observer remembers the value it started
+    /// under, and a page fetched before a reset is neither committed nor allowed to move an
+    /// anchor after it: that page belongs to the history the user just cleared.
+    private var importEpoch = 0
+    /// True between `beginDataReset` and `finishDataReset`; nothing starts syncing then.
+    private(set) var isResetting = false
 
     private var observerContinuations: [HKQuantityTypeIdentifier: AsyncStream<ObserverEvent>.Continuation] = [:]
     private var observerTasks: [HKQuantityTypeIdentifier: Task<Void, Never>] = [:]
@@ -395,6 +415,8 @@ final class HealthKitManager {
             availability = .authorized
             lastError = nil
             persistAuthorizationCompleted()
+            // A first Connect gets background delivery without waiting for a relaunch.
+            registerBackgroundObservers()
             await syncAll()
             await startObserving()
         } catch {
@@ -427,6 +449,22 @@ final class HealthKitManager {
     /// Pulls everything since the stored anchor for each type, then leaves a long-running
     /// anchored query in place so later samples arrive automatically.
     func syncAll() async {
+        // A second caller waits for the drain already running instead of starting another.
+        if let syncTask {
+            await syncTask.value
+            return
+        }
+        guard availability == .authorized, !isSyncing, !isResetting else { return }
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.performSyncAll()
+        }
+        syncTask = task
+        await task.value
+        if syncTask == task { syncTask = nil }
+    }
+
+    private func performSyncAll() async {
         guard availability == .authorized, !isSyncing else { return }
 
         // A foreground/manual sync and an observer callback must not race their anchors. The
@@ -454,6 +492,7 @@ final class HealthKitManager {
     private func sync(_ mapping: TypeMapping) async -> TypeSyncResult {
         let name = mapping.kind.title
         guard let type = mapping.quantityType else { return .complete(name) }
+        let epoch = importEpoch
         let predicate = Self.recentPredicate()
         var anchor = loadAnchor(for: mapping.identifier)
         var processedObjects = 0
@@ -479,7 +518,10 @@ final class HealthKitManager {
                 return .failed(name, detail)
             }
 
-            guard let nextAnchor = await commit(batch, for: mapping) else {
+            guard epoch == importEpoch else {
+                return .failed(name, "Stopped by a local data reset.")
+            }
+            guard let nextAnchor = await commit(batch, for: mapping, epoch: epoch) else {
                 return .failed(name, "Could not durably save the Health data page.")
             }
             processedObjects += batch.objectCount
@@ -541,7 +583,15 @@ final class HealthKitManager {
 
     /// Applies a page before committing its anchor. If the store cannot be durably used, the
     /// anchor is deliberately left unchanged so the page is replayed rather than lost.
-    private func commit(_ batch: AnchoredBatch, for mapping: TypeMapping) async -> HKQueryAnchor? {
+    ///
+    /// `epoch` is the reset epoch the page was fetched under. Checked here, on the main
+    /// actor with no suspension before the write, so a reset either happened before this
+    /// page (and it is dropped, anchor unmoved) or happens after it has fully committed.
+    private func commit(_ batch: AnchoredBatch, for mapping: TypeMapping, epoch: Int) async -> HKQueryAnchor? {
+        guard epoch == importEpoch else {
+            logger.info("Dropping a HealthKit page fetched before a local data reset")
+            return nil
+        }
         guard let anchorData = batch.anchorData,
               let anchor = Self.unarchiveAnchor(anchorData),
               let store
@@ -665,13 +715,16 @@ final class HealthKitManager {
     ///
     /// Internal (not private) so HealthKitManager+Session can restore observers on cold start.
     func startObserving() async {
-        guard availability == .authorized else { return }
+        // A drain that finishes during a reset would otherwise restart the observers the
+        // reset just stopped; `finishDataReset` starts them.
+        guard availability == .authorized, !isResetting else { return }
         stopObserving()
 
         for mapping in Self.mappings {
             guard let type = mapping.quantityType else { continue }
             let identifier = mapping.identifier
             let state = ObserverState()
+            let epoch = importEpoch
             var continuation: AsyncStream<ObserverEvent>.Continuation!
             let stream = AsyncStream<ObserverEvent>(
                 bufferingPolicy: .bufferingOldest(Self.observerBufferLimit)
@@ -685,7 +738,7 @@ final class HealthKitManager {
                     guard let self, !Task.isCancelled else { return }
                     if case let .batch(batch, generation) = event,
                        state.isCurrent(generation) {
-                        let committed = await self.commit(batch, for: mapping)
+                        let committed = await self.commit(batch, for: mapping, epoch: epoch)
                         guard !Task.isCancelled else { return }
                         if committed == nil { state.requestResync() }
                     }
@@ -905,6 +958,31 @@ final class HealthKitManager {
 
     nonisolated private static func unarchiveAnchor(_ data: Data) -> HKQueryAnchor? {
         try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: data)
+    }
+
+    // MARK: - Data reset
+
+    /// Stops every import before a local data reset: the observers, and the drain in
+    /// flight, which is awaited. Nothing fetched before this call commits after it, and no
+    /// observer can write its in-memory anchor back over a reset one.
+    func beginDataReset() async {
+        isResetting = true
+        importEpoch &+= 1
+        stopObserving()
+        if let syncTask { await syncTask.value }
+    }
+
+    /// Resumes imports after a reset.
+    ///
+    /// - Parameter rereadingHistory: true for "clear, then resync": the anchors are cleared
+    ///   so the drain re-reads the 30-day window. False for "forget": the committed anchors
+    ///   stay, so old history does not return and only samples after them arrive.
+    func finishDataReset(rereadingHistory: Bool) async {
+        if rereadingHistory { resetAnchors() }
+        isResetting = false
+        guard availability == .authorized else { return }
+        await syncAll()
+        await startObserving()
     }
 
     /// Clears anchors so the next sync re-reads the full retention window. Safe because

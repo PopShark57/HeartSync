@@ -197,12 +197,19 @@ struct CompareView: View {
             )
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }
-            let resolved = ComparisonSnapshot(
-                store: model.store,
-                period: period,
-                alertThreshold: model.settings.snapshot.discrepancyThreshold,
-                hiddenSourceIDs: model.settings.snapshot.comparisonHidden
-            )
+            // Read and analysed off the main actor; only the result is published here.
+            let history = model.store.history
+            let period = period
+            let threshold = model.settings.snapshot.discrepancyThreshold
+            let hidden = model.settings.snapshot.comparisonHidden
+            let resolved = await HealthHistory.offMain {
+                ComparisonSnapshot(
+                    history: history,
+                    period: period,
+                    alertThreshold: threshold,
+                    hiddenSourceIDs: hidden
+                )
+            }
             // Rejects a late result: the selection may have moved on while this ran.
             guard !Task.isCancelled, key == loadKey else { return }
             snapshot = resolved
@@ -494,7 +501,8 @@ struct CompareView: View {
 /// Building the metric list, the per-metric pairs, and the overview from a single read
 /// keeps the screen O(readings) instead of O(readings × metrics × subviews), and makes
 /// every row on screen describe the same instant.
-@MainActor
+///
+/// Built from a `HealthHistory`, off the main actor.
 private struct ComparisonSnapshot {
     let metrics: [MetricKind]
     /// Why `metrics` is empty. Only meaningful when it is.
@@ -524,7 +532,7 @@ private struct ComparisonSnapshot {
     private let sourceIDsByKind: [MetricKind: [String]]
 
     init(
-        store: HealthStore,
+        history store: HealthHistory,
         period: ComparisonPeriod,
         alertThreshold: DiscrepancySeverity,
         hiddenSourceIDs: Set<String>
@@ -538,12 +546,17 @@ private struct ComparisonSnapshot {
         // Estimates never participate in a device comparison, so they are dropped before
         // the metric list is built as well as inside the engine — otherwise a metric with
         // one real device plus the estimate source would look comparable.
-        let outcome = store.readingsOutcome(in: interval)
-        self.queryFailure = outcome.error
+        //
         // Comparison-only hiding. It filters this screen and nothing else: the source stays
-        // connected, keeps recording, and keeps its history.
+        // connected, keeps recording, and keeps its history. The filter is in the query, so
+        // a hidden or paused device's rows are never decoded.
+        let included = Set(store.enabledSources.map(\.id)).subtracting(hiddenSourceIDs)
+        let outcome = store.query { try $0.readings(range: interval, sourceIDs: included) }
+        self.queryFailure = outcome.error
+        // Interval averages (a night's mean) are never windowed either, so a device that
+        // offers only those for a metric does not make that metric look comparable.
         let readings = outcome.valueOrEmpty.filter {
-            $0.provenance != .estimated && !hiddenSourceIDs.contains($0.sourceID)
+            $0.provenance != .estimated && !$0.isIntervalAverage
         }
 
         var sourceIDs: [MetricKind: Set<String>] = [:]

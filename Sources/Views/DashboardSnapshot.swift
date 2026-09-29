@@ -199,7 +199,6 @@ enum SourceChipStatus: Equatable, Sendable {
 /// this screen decode up to two days of rows once a second. A card needs far less: its rows
 /// are the last `liveWindow`, and its verdict looks at the current and the previous aligned
 /// window only. Displayed values and verdicts are unchanged; see `lookback(for:)`.
-@MainActor
 struct DashboardSnapshot {
     let metrics: [MetricSummary]
     /// Trends by metric, handed to the next snapshot so a trend is re-read only when its
@@ -241,8 +240,19 @@ struct DashboardSnapshot {
 
     /// - Parameter lookback: per-metric window length; injectable so a test can compare the
     ///   bounded read against the previous two-day read at the same instant.
+    @MainActor
     init(
         store: HealthStore,
+        now: Date,
+        lookback: (MetricKind) -> TimeInterval = DashboardSnapshot.lookback(for:),
+        sparklineCache previousCache: [MetricKind: SparklineCacheEntry] = [:]
+    ) {
+        self.init(history: store.history, now: now, lookback: lookback, sparklineCache: previousCache)
+    }
+
+    /// Built from a `HealthHistory`, so Now can build it off the main actor.
+    init(
+        history store: HealthHistory,
         now: Date,
         lookback: (MetricKind) -> TimeInterval = DashboardSnapshot.lookback(for:),
         sparklineCache previousCache: [MetricKind: SparklineCacheEntry] = [:]
@@ -297,7 +307,7 @@ struct DashboardSnapshot {
     private static func sparklineEntry(
         kind: MetricKind,
         sourceIDs: [String],
-        store: HealthStore,
+        store: HealthHistory,
         now: Date,
         previous: SparklineCacheEntry?
     ) -> SparklineCacheEntry? {
@@ -337,7 +347,7 @@ struct DashboardSnapshot {
     private static func summary(
         kind: MetricKind,
         readings: [Reading],
-        store: HealthStore,
+        store: HealthHistory,
         now: Date
     ) -> MetricSummary? {
         let latest = ComparisonEngine.latestBySource(

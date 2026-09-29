@@ -28,7 +28,7 @@ HeartSyncApp
                                                                         -> SwiftUI views/export
 ```
 
-- `HeartSyncApp` owns the single root `AppModel` in `@State`, injects it with `.environment(model)`, starts it in `.task`, and forwards `scenePhase` changes.
+- `HeartSyncApp`'s `AppDelegate` (`@UIApplicationDelegateAdaptor`) owns the single root `AppModel`. `application(_:didFinishLaunchingWithOptions:)` calls `AppModel.launch()` — the Bluetooth central with its restoration identifier, HealthKit's `HKObserverQuery` background delivery, and the workout-mirroring handler — and starts `start()`, because a background relaunch runs no view `.task`. The scene injects the model with `.environment`, keeps a `.task { start() }` (idempotent), and forwards `scenePhase` changes.
 - `AppModel` is the concrete composition root. It creates `HealthStore`, `AppSettings`, `BluetoothManager`, `HealthKitManager`, and `OuraManager`, configures their callbacks, and owns periodic derived-metric and Oura-sync tasks.
 - `RootView` presents five tabs: Now, Oura, Compare, Devices, and Settings.
 - Transport managers convert framework/API-specific values into repository models. Views must not parse transport payloads or write alternate stores.
@@ -137,6 +137,7 @@ The XcodeGen settings enable Swift 6 with complete strict-concurrency checking.
 - UI-visible mutable state and transport orchestration stay on `MainActor`.
 - Domain values, DTOs, parser results, and analysis inputs are generally value types conforming to `Sendable` and, where useful, `Codable`/`Hashable`/`Identifiable`.
 - `ReadingArchive` is an actor and is the explicit off-main boundary for JSON file I/O.
+- History reads and analysis run off the main actor. `HealthStore.history` is a `Sendable` `HealthHistory` (sources, generations, and a pool of read-only SQLite connections, `HealthDatabase.ReaderPool`); snapshot builders take it and run inside `HealthHistory.offMain`, and only the finished snapshot is published on the main actor. Writes stay on the store's writer connection on the main actor.
 - Networking uses `async`/`await` and `URLSession.data(for:)`.
 - Authentication and HealthKit callback APIs are bridged to async continuations or explicit `Task { @MainActor in ... }` hops.
 - Repeating work uses cancellable `Task` loops. The derived-estimate loop runs every 300 seconds; Oura auto-sync has a 300-second minimum; BLE scanning has a 60-second timeout.
@@ -177,7 +178,9 @@ Readiness and diagnostics (`RingFix.md`):
 - `PeripheralConnectionState.resolving` keeps observed streaming state when a late discovery callback arrives.
 - The no-data watchdog follows `StreamCadence` (30 s to 10 min) and explains itself from `BluetoothDiagnostics`: silence, rejected packets (with the reason), or a stopped stream.
 - `BluetoothDiagnostics` counts packets per characteristic before any parser or admission guard and names every rejection. Record new rejection paths there. Raw packets are captured only during an explicit 60-second diagnostic session (`runDiagnostics`, which runs `discoverServices(nil)` once), bounded to 200, and leave the app only through the user's export. Never log them.
-- Reconnect is a fresh session: a connected link is cancelled and one connection starts from its disconnect callback, bypassing the backoff. A per-link `connectionSessions` counter invalidates delayed work. `connect` does not rediscover a link that already has discovery state, so a foreground refresh leaves a healthy session alone.
+- Reconnect is a fresh session: a connected link is cancelled and one connection starts from its disconnect callback, bypassing the backoff. Per-peripheral state is one `PeripheralLink` per connection session (discovery, metrics, cadence, watchdog, HRV accumulator, `RingLink`) and one `PeripheralRecord` per device (reconnect backoff, fresh-reconnect wait, device information), in `PeripheralState.swift`. Ending a session replaces the link; Forget removes both; a radio power-off ends every link like a disconnect. The link's globally unique `session` number invalidates delayed work. `connect` does not rediscover a link that already has a session, so a foreground refresh leaves a healthy session alone.
+- Restoration (`willRestoreState`) only adopts peripherals; discovery of restored, connected links runs once at `.poweredOn`. The central is created at launch, before history loads; values arriving earlier wait in the store's bounded pre-load buffer, and `resumeBluetoothAfterLoad` reconnects known devices once the source list exists.
+- Live values are batched by `AppModel` (`BluetoothIngestBuffer`): one transaction per two seconds or 240 values, flushed when a link ends (`onLinkEnded`), before a reset, and at background. A ring history import flushes first and commits as its own batch.
 
 Vendor ring candidate (`R11MRingSession`, `YCBTFrameCodec`):
 
@@ -193,7 +196,7 @@ The restoration identifier is `com.heartsync.central`. `UIBackgroundModes = blue
 
 ## HealthKit and Apple Watch Architecture
 
-The native watchOS companion records user-started workouts with `HKWorkoutSession` and `HKLiveWorkoutBuilder`. Its heart-rate samples arrive on iPhone through the existing HealthKit import after system sync. WatchConnectivity carries a display snapshot from iPhone and refresh requests from watch; it never ingests a second copy of workout samples. Do not add or imply direct Apple Watch BLE access.
+The native watchOS companion records user-started workouts with `HKWorkoutSession` and `HKLiveWorkoutBuilder`. Its heart-rate samples arrive on iPhone through the existing HealthKit import after system sync. If the user turns on "Show live on iPhone", the watch mirrors the session and sends a versioned `MirroredWorkoutPayload` per heart-rate update; `MirroredWorkoutMonitor` shows it on Now. It is display only: never stored, compared, exported, or written to Health. No Live Activity or iOS background mode exists for it, so it is reliable only while HeartSync runs. WatchConnectivity carries a display snapshot from iPhone and refresh requests from watch; it never ingests a second copy of workout samples. Do not add or imply direct Apple Watch BLE access.
 
 `HealthKitManager.TypeMapping` owns the HealthKit identifier, metric, unit, and scale. Current reads include heart rate, resting heart rate, SDNN HRV, oxygen saturation, respiratory rate, VO2 max, body temperature, and blood pressure. HealthKit oxygen saturation is a fraction and is multiplied by 100 on ingestion. There is no HealthKit RMSSD mapping.
 
@@ -204,7 +207,8 @@ Authorization and synchronization rules:
 - Share types are restricted to directly measurable BLE-compatible metrics: heart rate, oxygen saturation, SDNN, and body temperature.
 - Completion of the HealthKit authorization sheet does not prove that each read permission was granted. Do not make the UI claim otherwise.
 - Anchored queries request a recent 30-day window and then install update handlers. A page's anchor advances after its SQLite transaction commits, which is already durable; pruning, compaction, and the WAL checkpoint are maintenance (`HealthStore.saveNow`) and run on `AppModel`'s 15-minute timer and at background transitions, never per page. Local retention settings do not imply a one-year HealthKit backfill.
-- Background delivery is requested hourly. There are no `BGTaskScheduler` identifiers or task handlers.
+- Background delivery is requested hourly. One `HKObserverQuery` per type is registered at launch (`HealthKitManager+Background`) once Connect has completed; its handler returns at once while the foreground anchored queries run, otherwise waits up to 20 s for startup, drains through `syncAll`, and always calls HealthKit's completion handler. There are no `BGTaskScheduler` identifiers or task handlers.
+- A local data reset is exclusive with imports (`AppModel.resetLocalData`): HealthKit's observers stop and a running drain is awaited (`beginDataReset`), a running Oura sync is cancelled and awaited (`clearCachedData`), and only then is the store cleared; HealthKit resumes from cleared anchors for a resync or committed ones for "forget" (`finishDataReset`). Both managers carry a reset epoch, so a page or cycle that began before a reset writes neither the database, an anchor, nor the Oura cache after it. `syncAll` and `OuraManager.sync` join a run already in flight rather than returning at once.
 - The committed entitlements declare `com.apple.developer.healthkit.background-delivery`, and the code requests hourly delivery. The capability still needs to be enabled for the App ID/provisioning profile and exercised with a signed build on a physical device; do not describe background wake behavior as guaranteed until that validation succeeds.
 - Anchored queries apply HealthKit deletions: `HealthKitManager.deletedReadingIDs` maps each `HKDeletedObject.uuid` to a reading id (the same sample UUID used at ingest), and `AppModel.ingest` commits source updates, readings, and deletions from one anchor page through `HealthStore` in a single transaction. Unknown ids are a no-op. Remaining limits: an already-exported pairwise analysis is unchanged; after compaction, raw sample UUIDs are gone so an upstream deletion cannot remove the stable window median that replaced them.
 - Optional write-back is allowed only for `.measured` readings from Bluetooth sources. Estimated or HealthKit/Oura-originating values must never be written back. Accepted readings are queued (`enqueueWrites`) and saved in one batch every 30 seconds and at background transitions; each sample carries an `HKDevice` from the source and `HKMetadataKeySyncIdentifier` (`heartsync.<reading id>`) with sync version 1, so a retried save cannot duplicate it. Write permission is checked before each batch, and a refusal or a full queue is reported in `writeBackIssue`.
@@ -321,7 +325,7 @@ Permission handling is deliberately server-authoritative:
 - Reading and source mutations commit transactionally and incrementally. The database indexes stable ID, metric/time, source/time, and end time. Settings persistence remains one-second coalesced. Startup refuses to attach transports until the database and any pending legacy migration are conclusive; an unavailable protected file is retried rather than treated as empty.
 - Default reading retention is 30 days and can be configured by the existing settings model. A store that persists never prunes aged history until `confirmRetention(days:)` has run: the 30 days it starts with is a default, and so is what a failed, reset, or newer-schema settings file reports. `AppModel.applyRetentionSettings` confirms only from settings that loaded intact (or after the user chose a period in this session), and the last confirmed period is recorded in the database's `metadata` table, so a settings file lost and recreated with the default cannot shorten it: pruning is held (`retentionIsPaused`, a startup notice, and a Settings button) until the user chooses a period. Impossible-clock rows (`start > end`) are removed once at load. Before pruning, readings at least 14 days old are irreversibly compacted to one median per source/comparison window. New compacted rows preserve original count and standard deviation; migrated legacy medians represent unavailable facts as unknown. A compacted window is final: late rows and cloud revisions for it are rejected because the discarded distribution cannot be recombined without median-of-medians bias.
 
-`HealthDatabase` stores `health.sqlite3` plus its WAL/SHM companions under Application Support in the `HeartSync` directory. A durable metadata marker makes the version-1 JSON migration retry across process termination. `ReadingArchive` continues to serialize the small ISO-8601 JSON archives atomically and supplies the legacy migration inputs:
+`HealthDatabase` stores `health.sqlite3` plus its WAL/SHM companions under Application Support in the `HeartSync` directory. `PRAGMA user_version` is a migration ladder (`HealthDatabase.schemaVersion`, now 3; additive steps only, never lowered). Schema 3 added `value` and `has_metadata`, so a row without metadata is rebuilt from its columns instead of decoding JSON; older rows are decoded from the payload until maintenance backfills them in bounded batches. The payload stays authoritative. The connection keeps `synchronous = FULL` because HealthKit's anchor and Oura's cache advance on a returned commit. A store without persistence uses a private file in the temporary directory, not `:memory:`, so the reader pool can open it. A durable metadata marker makes the version-1 JSON migration retry across process termination. `ReadingArchive` continues to serialize the small ISO-8601 JSON archives atomically and supplies the legacy migration inputs:
 
 - `readings.json`
 - `sources.json`
@@ -362,12 +366,13 @@ Preserve these comparison rules:
 
 - Windows are aligned to Unix-epoch boundaries and use the per-source median.
 - Canonical source ordering determines A-minus-B sign and export stability.
-- Estimated readings are excluded from device comparison by default.
+- Estimated readings are excluded from device comparison by default. So are interval averages (`Reading.isIntervalAverage`: longer than the metric's comparison window, such as Oura's night heart rate or daily SpO₂); they are never compacted, and charts draw them as spans. If a caller includes them, their pairs are timed `intervalAverage` and kept out of the threshold and statistics.
+- RMSSD and pNN50 use adjacent normal-to-normal pairs only. Confidence intervals use a t quantile on an AR(1) effective sample size of touching windows; the limits of agreement stay at 1.96 SD.
 - At least five paired windows are required before drawing a conclusion.
 - Insufficient evidence and out-of-tolerance data can never be presented as green merely because an alert preference is disabled.
 - Bland-Altman limits use sample variance.
 - UI chart thinning is presentation-only; statistics and exports use the full paired set.
-- Compare, metric detail, the pair screen, and Now each resolve one immutable snapshot per load in `.task(id:)`: `ComparisonSnapshot`, `MetricDetailSnapshot`, `PairwiseSnapshot`, and `DashboardSnapshot`. All subviews share one resolved interval, gestures change only lightweight `@State`, and late results are rejected. Reloads caused only by new data are coalesced by `LiveReloadPolicy`: once a second on Now, and at most 30 per chart bucket elsewhere. A screen that trails ingest says so with `SnapshotLagNote`. Metric detail's zoomed span (`MetricZoomSnapshot`) and chosen period (`MetricPeriodEvidence`) load the same way, each under its own key. A selection is never part of a load key, so a scrub never reads the store.
+- Compare, metric detail, the pair screen, and Now each resolve one immutable snapshot per load in `.task(id:)`, built off the main actor from a `HealthStore.history` value: `ComparisonSnapshot`, `MetricDetailSnapshot`, `PairwiseSnapshot`, and `DashboardSnapshot`. All subviews share one resolved interval, gestures change only lightweight `@State`, and late results are rejected. Reloads caused only by new data are coalesced by `LiveReloadPolicy`: once a second on Now, and at most 30 per chart bucket elsewhere. A screen that trails ingest says so with `SnapshotLagNote`. Metric detail's zoomed span (`MetricZoomSnapshot`) and chosen period (`MetricPeriodEvidence`) load the same way, each under its own key. A selection is never part of a load key, so a scrub never reads the store.
 - A saved session's `ComparisonPeriod` travels with every drill-down. Screens opened from a session show `ComparisonSessionBanner`, never the rolling range picker.
 - Zoom changes only what a chart draws. `ChartViewport` re-reads the visible span at its own bucket, never finer than the metric's comparison window. Statistics, pairs, and the per-device table keep describing the whole analysed period.
 - A period brushed on the metric-detail chart is evidence for exactly those seconds. `MetricPeriodEvidence` uses the same read and engine call as metric detail does for a saved session over them. `ChartViewport.snappedPeriod` rounds both ends to whole seconds, because the sessions archive stores ISO-8601 dates without fractions; a saved period then reopens with identical bounds.
@@ -521,7 +526,7 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/HealthStoreTests.swift`: 38 tests covering validation, indexed queries, batch ingestion, deletion, persistence safety, retention, and bounded compaction.
 - `Tests/ReadingArchiveTests.swift`: 20 tests covering envelopes, legacy payloads, unique corrupt preservation, unreadable-file handling, and Oura cache compatibility.
 - `Tests/HealthKitConversionTests.swift`: 19 tests covering type mappings, minimal read scope, self-source rejection and cleanup, writer identity, scaling, and deletion conversion.
-- `Tests/OuraSyncTests.swift`: 34 tests covering endpoint isolation, pagination, scope failures, cache preservation, deletion reconciliation (including that aging out of the dashboard cache withdraws nothing), cache/database failure rollback, truncation, battery timestamps, rate-limit backoff and the early stop, the minimum interval, and Keychain reads that fail versus find nothing.
+- `Tests/OuraSyncTests.swift`: 35 tests covering endpoint isolation, pagination, scope failures, cache preservation, deletion reconciliation (including that aging out of the dashboard cache withdraws nothing), cache/database failure rollback, truncation, battery timestamps, rate-limit backoff and the early stop, the minimum interval, a clear during a running sync, and Keychain reads that fail versus find nothing.
 - `Tests/HRVFilterTests.swift`: 20 tests covering artefact filtering, body-location versus technology metadata, accumulator thresholds, and rate limiting.
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
 - `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
@@ -602,6 +607,11 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   single points, spans, spoken summary, per-window caching), chip status, and the
   `--chart-gallery` fixture.
 - `Tests/Watch/WorkoutTrendTests.swift`: 4 tests covering the workout trend buffer.
+- `Tests/Watch/MirroredWorkoutTests.swift`: 5 tests covering the mirrored-workout payload, its validation and freshness, and that it never reaches the store.
+- `Tests/ComparisonHonestyTests.swift`: 13 tests covering interval averages (no windowed pair, no compaction, never concluding), session titles across days, RMSSD adjacency, the t quantile and effective sample size, and clock skew.
+- `Tests/HistoryReaderTests.swift`: 9 tests covering off-main snapshots, reader visibility of commits, column and payload decoding, SQL source filters, failures and not-loaded history, temporary files, and the schema-3 migration and backfill.
+- `Tests/ResetAndIngestTests.swift`: 11 tests covering reset order and exclusivity, batched Bluetooth ingest, batched existence checks, changed-source persistence, and launch-time transport setup.
+- `Tests/PeripheralStateTests.swift`: 6 tests covering `PeripheralLink`, `RingLink`, and `PeripheralRecord`.
 - `Tests/ColourVisionTests.swift`: 11 tests. They pin the Machado/CAM02-UCS validator to
   published values and enforce ΔE ≥ 15 under protan, deutan, and tritan simulation:
   between source slots, against the reference-line ink, and between sleep stages. They
@@ -612,7 +622,8 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   - range changes during ingestion;
   - the paged export flow;
   - Now and a 30-day detail during 1 Hz ingest, against initial main-thread budgets that
-    are still to be confirmed on a device.
+    are still to be confirmed on a device;
+  - an hour of strap ingest, batched against per-value commits, reporting commits per minute.
 
 There is no snapshot-test target, live Oura test, Bluetooth hardware integration-test target, or HealthKit integration-test target.
 
@@ -635,7 +646,9 @@ and copy or symlink the real source files into it — `Sources/Store`, `Sources/
 projections also need the Foundation-only DTOs in `Sources/Oura/OuraClient.swift`. That closure builds for macOS and runs the store, analysis,
 export, presentation-projection and watch-lifecycle suites. Adding `BluetoothManager`,
 `HealthKitManager` (and its `+Session`/`+WriteBack` files), `OuraManager`, `OuraData`, `AppModel`,
-`WatchCompanionPublisher`, `WatchSnapshotBuilder`, `BackgroundWork`, and `Sources/Debug` lets the
+`WatchCompanionPublisher`, `WatchSnapshotBuilder`, `BackgroundWork`, `BluetoothIngestBuffer`,
+`PeripheralState`, `HealthHistory`, `DerivedEstimates`, `HealthKitManager+Background`,
+`MirroredWorkoutMonitor`, and `Sources/Debug` lets the
 `AppModel`, Oura orchestration, and HealthKit conversion suites run too, with two harness-only
 stand-ins: a `CompanionSession` stub (WatchConnectivity does not exist on macOS) and a copy of
 `Sources/Oura/OuraOAuth.swift` with its UIKit window lookup replaced. It cannot compile the SwiftUI

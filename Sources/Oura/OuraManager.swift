@@ -44,7 +44,20 @@ final class OuraManager {
         /// Oura asked HeartSync to wait and the client could not absorb the wait inline.
         /// The rest of the cycle is skipped, and what was fetched before it is still kept.
         case rateLimited
+        /// A clear cancelled this cycle. Nothing it fetched is written anywhere.
+        case superseded
     }
+
+    /// The cycle running now, so a clear can cancel it and wait for it to stop before it
+    /// deletes anything (improvement 47).
+    private var syncTask: Task<Void, Never>?
+    /// Advanced by every clear. A cycle remembers the value it started under and writes
+    /// neither the cache nor the database once it has moved: it worked on a copy of the
+    /// dashboard taken before the clear, and writing that copy back would restore history
+    /// the user just removed.
+    private var dataEpoch = 0
+    /// True while a clear runs. No cycle starts then.
+    private(set) var isClearing = false
 
     private(set) var status: Status = .notConnected
     private(set) var isSyncing = false
@@ -331,6 +344,10 @@ final class OuraManager {
     @discardableResult
     func disconnect() -> Bool {
         oauthSession.cancel()
+        // A cycle in flight belongs to the account being removed; it must not write its
+        // copy of the dashboard back afterwards.
+        dataEpoch &+= 1
+        syncTask?.cancel()
         let accessToken = credential?.accessToken ?? storedCredential()?.accessToken
         let cleared = clearStoredCredential()
         refreshCredentialCache()
@@ -354,6 +371,15 @@ final class OuraManager {
     /// makes this a resyncable cache clear; removing it is the explicit "forget imported
     /// history" path.
     func clearCachedData(keepingAuthorization: Bool) async -> Bool {
+        // A cycle that began before this clear must not finish after it. It is cancelled
+        // and awaited first; its own epoch check keeps it from writing on the way out.
+        isClearing = true
+        defer { isClearing = false }
+        dataEpoch &+= 1
+        if let syncTask {
+            syncTask.cancel()
+            await syncTask.value
+        }
         // Every Oura reading, not only those the 14-day dashboard cache still holds: stored
         // readings now outlive the cache, so its contents no longer name them all.
         _ = store?.removeReadings(forSource: DataSource.ouraSourceID)
@@ -407,7 +433,24 @@ final class OuraManager {
     /// cache by document id, never assigned over it, so a narrow fetch cannot erase the
     /// fortnight the screen is drawing.
     func sync(days: Int = 14) async {
-        guard !isSyncing else { return }
+        // A second caller waits for the cycle already running rather than starting another.
+        if let syncTask {
+            await syncTask.value
+            return
+        }
+        guard !isClearing else { return }
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.performSync(days: days)
+        }
+        syncTask = task
+        await task.value
+        if syncTask == task { syncTask = nil }
+    }
+
+    private func performSync(days: Int) async {
+        guard !isSyncing, !isClearing else { return }
+        let epoch = dataEpoch
         guard let credential = refreshCredentialCache() else {
             status = credentialReadIssue.map { .error($0) } ?? .notConnected
             return
@@ -714,6 +757,8 @@ final class OuraManager {
             }
         } catch SyncAbort.authorization {
             return
+        } catch SyncAbort.superseded {
+            return
         } catch SyncAbort.rateLimited {
             // Keep what earlier collections returned; the rest waits for the backoff.
             pausedByRateLimit = true
@@ -740,8 +785,12 @@ final class OuraManager {
             + Self.readings(fromVO2Max: next.vo2Max)
 
         next.fetchedAt = .now
+        // A clear since this cycle started: `next` is a copy from before it.
+        guard epoch == dataEpoch, !Task.isCancelled else { return }
         let previousSnapshot = snapshot
         let cacheWritten = await archive.write(next, to: ReadingArchive.File.ouraDashboard)
+        // The clear waits for this cycle, so it deletes the file after this write lands.
+        guard epoch == dataEpoch else { return }
         guard cacheWritten else {
             status = .error("Oura returned data, but HeartSync could not save the cache. The previous dashboard and comparison readings were kept.")
             lastSyncSummary = "Sync not committed: local Oura cache write failed"
@@ -835,6 +884,7 @@ final class OuraManager {
         // absent from the documented set) and it has answered a `spo2` request with
         // `spo2Daily`. A name this app fails to match must not hide data the user granted,
         // so Oura is asked and only Oura's answer marks a collection unavailable.
+        guard !Task.isCancelled else { throw SyncAbort.superseded }
         endpointStates[endpoint] = .syncing
         do {
             let result = try await operation()
@@ -857,6 +907,11 @@ final class OuraManager {
             }
             return result
         } catch {
+            // A cancelled request is a clear, not an endpoint failure.
+            if Task.isCancelled {
+                endpointStates[endpoint] = .idle
+                throw SyncAbort.superseded
+            }
             noteRateLimitIfNeeded(error)
             // Oura currently returns HTTP 401 (rather than 403) when a valid token lacks
             // newer scopes such as `heart_health`. That is an endpoint permission issue,

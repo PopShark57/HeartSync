@@ -2,7 +2,9 @@ import Foundation
 
 /// Builds the wrist projection using indexed latest/range queries and the real comparison
 /// engine. A row limit bounds transport size, never the inputs to comparison statistics.
-@MainActor
+///
+/// Works from a `HealthHistory`, so `WatchCompanionPublisher` builds it off the main actor:
+/// a month of a 1 Hz strap for four periods is far too much to read and window there.
 enum WatchSnapshotBuilder {
     /// About this many chart windows per source and period.
     static let targetChartPoints = 30
@@ -21,7 +23,12 @@ enum WatchSnapshotBuilder {
         return window * max(1, multiple)
     }
 
+    @MainActor
     static func make(store: HealthStore, now: Date = .now, cache: WatchChartCache? = nil) -> WatchSnapshot {
+        make(history: store.history, now: now, cache: cache)
+    }
+
+    static func make(history store: HealthHistory, now: Date = .now, cache: WatchChartCache? = nil) -> WatchSnapshot {
         guard store.loadState == .loaded else {
             return WatchSnapshot(generatedAt: now, availability: .unavailable, metrics: [])
         }
@@ -100,7 +107,7 @@ enum WatchSnapshotBuilder {
         range: WatchChartRange,
         now: Date,
         shown: [DataSource],
-        store: HealthStore
+        store: HealthHistory
     ) -> PeriodResult {
         let interval = DateInterval(start: now.addingTimeInterval(-range.duration), end: now)
         let readings = store.readings(kind: kind, in: interval)
@@ -136,7 +143,7 @@ enum WatchSnapshotBuilder {
         interval: DateInterval,
         analyses: [PairwiseAnalysis],
         shown: [DataSource],
-        store: HealthStore
+        store: HealthHistory
     ) -> WatchChart? {
         let bucket = chartBucket(for: kind, range: range)
         let start = Date(timeIntervalSince1970: (interval.start.timeIntervalSince1970 / bucket).rounded(.down) * bucket)
@@ -192,7 +199,7 @@ enum WatchSnapshotBuilder {
     static func pairAgreement(
         analyses: [PairwiseAnalysis],
         chartStart: Date,
-        store: HealthStore
+        store: HealthHistory
     ) -> WatchPairAgreement? {
         let ready = analyses.compactMap { analysis -> (PairwiseAnalysis, PairwiseSummaryStatistics)? in
             analysis.statistics.map { (analysis, $0) }
@@ -290,8 +297,10 @@ enum WatchSnapshotBuilder {
 /// (rename, hide, colour), or the store removes anything (`removalGeneration`: deletions,
 /// source removal, retention, reset, reload). New readings alone wait for the interval; each
 /// chart's `end` tells the wrist how current it is.
-@MainActor
-final class WatchChartCache {
+///
+/// Locked rather than main-actor isolated, because the builder runs off the main actor.
+/// Every access to `entries` holds `lock`.
+final class WatchChartCache: @unchecked Sendable {
     struct Key: Hashable, Sendable {
         var kind: MetricKind
         var range: WatchChartRange
@@ -305,6 +314,7 @@ final class WatchChartCache {
     }
 
     private var entries: [Key: Entry] = [:]
+    private let lock = NSLock()
 
     static func refreshInterval(for range: WatchChartRange) -> TimeInterval {
         switch range {
@@ -316,7 +326,7 @@ final class WatchChartCache {
     }
 
     func result(for key: Key, now: Date, fingerprint: String, removals: Int) -> WatchSnapshotBuilder.PeriodResult? {
-        guard let entry = entries[key],
+        guard let entry = lock.withLock({ entries[key] }),
               entry.fingerprint == fingerprint,
               entry.removals == removals,
               now >= entry.builtAt,
@@ -326,10 +336,12 @@ final class WatchChartCache {
     }
 
     func store(_ result: WatchSnapshotBuilder.PeriodResult, for key: Key, at now: Date, fingerprint: String, removals: Int) {
-        entries[key] = Entry(result: result, builtAt: now, fingerprint: fingerprint, removals: removals)
+        lock.withLock {
+            entries[key] = Entry(result: result, builtAt: now, fingerprint: fingerprint, removals: removals)
+        }
     }
 
     func removeAll() {
-        entries.removeAll()
+        lock.withLock { entries.removeAll() }
     }
 }

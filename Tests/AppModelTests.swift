@@ -223,14 +223,14 @@ struct AppModelDerivedMetricTests {
     }
 
     @Test("A ring's blood pressure survives reconciliation with the trend index off")
-    func ringBloodPressureSurvivesIndexOff() {
+    func ringBloodPressureSurvivesIndexOff() async {
         let model = makeModel()
         model.store.upsert(DataSource(id: "ring", displayName: "Ring", transport: .bluetooth))
         let stale = ringBloodPressure(at: Date.now.addingTimeInterval(-3 * day), id: "old")
         let live = ringBloodPressure(at: Date.now.addingTimeInterval(-120), id: "live")
         model.store.append(contentsOf: stale + live)
 
-        model.recomputeDerivedMetrics()
+        await model.recomputeDerivedMetrics()
 
         let kept = Set(model.store.readings(kind: .bloodPressureSystolic, enabledOnly: false).map(\.id))
         #expect(kept == Set([stale[0].id, live[0].id]))
@@ -238,7 +238,7 @@ struct AppModelDerivedMetricTests {
     }
 
     @Test("HeartSync's own stale estimates are still removed when the index is off")
-    func ownEstimatesAreStillReconciled() {
+    func ownEstimatesAreStillReconciled() async {
         let model = makeModel()
         model.ensureEstimateSourceExists()
         let ours = Reading(
@@ -248,13 +248,13 @@ struct AppModelDerivedMetricTests {
         )
         model.store.append(ours)
 
-        model.recomputeDerivedMetrics()
+        await model.recomputeDerivedMetrics()
 
         #expect(model.store.readings(kind: .bloodPressureSystolic, enabledOnly: false).isEmpty)
     }
 
     @Test("A ring's recent blood pressure survives with the trend index on and calibrated")
-    func ringBloodPressureSurvivesIndexOn() {
+    func ringBloodPressureSurvivesIndexOn() async {
         let model = makeModel()
         model.settings.snapshot.bloodPressureIndexEnabled = true
         model.settings.profile.bpCalibration = UserProfile.BPCalibration(
@@ -267,7 +267,7 @@ struct AppModelDerivedMetricTests {
         model.store.append(contentsOf: live)
         #expect(model.settings.canEstimateBloodPressure)
 
-        model.recomputeDerivedMetrics()
+        await model.recomputeDerivedMetrics()
 
         let systolic = model.store.readings(kind: .bloodPressureSystolic, enabledOnly: false)
         #expect(systolic.contains { $0.id == live[0].id })
@@ -277,7 +277,7 @@ struct AppModelDerivedMetricTests {
     }
 
     @Test("Estimates are marked as HeartSync's own")
-    func estimatesCarryTheirMarker() {
+    func estimatesCarryTheirMarker() async {
         let model = makeModel()
         model.settings.snapshot.vo2MaxEstimateEnabled = true
         model.settings.profile.birthDate = Calendar.current.date(byAdding: .year, value: -40, to: .now)
@@ -286,7 +286,7 @@ struct AppModelDerivedMetricTests {
             sourceID: "strap", kind: .restingHeartRate, value: 55, start: .now.addingTimeInterval(-3_600)
         ))
 
-        model.recomputeDerivedMetrics()
+        await model.recomputeDerivedMetrics()
 
         let estimate = model.store.readings(kind: .vo2Max, enabledOnly: false).first
         #expect(estimate?.provenance == .estimated)
