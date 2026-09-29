@@ -71,10 +71,20 @@ final class CompanionSession: NSObject, WCSessionDelegate {
 
     #if os(iOS)
     func publish(_ snapshot: WatchSnapshot) {
+        guard let data = try? snapshot.encoded() else {
+            status = String(localized: "companion.status.publishFailed", defaultValue: "Companion update could not be queued.", comment: "Watch connection status")
+            return
+        }
+        publish(encoded: data)
+    }
+
+    /// Publishes a snapshot already encoded by `WatchSnapshot.encoded()`, which validated it
+    /// and checked its size, so the main actor does not encode it a second time.
+    func publish(encoded data: Data) {
         guard let session, session.activationState == .activated,
               session.isPaired, session.isWatchAppInstalled else { return }
         do {
-            try session.updateApplicationContext([WatchSnapshot.contextKey: try snapshot.encoded()])
+            try session.updateApplicationContext([WatchSnapshot.contextKey: data])
         } catch {
             status = String(localized: "companion.status.publishFailed", defaultValue: "Companion update could not be queued.", comment: "Watch connection status")
         }

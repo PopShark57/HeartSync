@@ -198,6 +198,103 @@ struct WatchChartTests {
         #expect(WatchChartCache.refreshInterval(for: .month) == 3_600)
     }
 
+    @Test("A removal drops only the cached periods that would still show the removed rows")
+    func cacheRemovalReach() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        populate(store, sourceID: "a", value: 70)
+        populate(store, sourceID: "b", value: 74)
+        let tenDaysAgo = Reading(sourceID: "a", kind: .heartRate, value: 80, start: now.addingTimeInterval(-10 * 86_400))
+        #expect(store.append(tenDaysAgo))
+        let cache = WatchChartCache()
+        let first = try #require(WatchSnapshotBuilder.make(store: store, now: now, cache: cache).metrics.first)
+
+        #expect(store.remove(readingIDs: [tenDaysAgo.id]) == 1)
+        #expect(store.recentRemovals.last?.latestEnd == tenDaysAgo.end)
+        let second = try #require(WatchSnapshotBuilder.make(store: store, now: now.addingTimeInterval(60), cache: cache).metrics.first)
+        // Inside 30D only: that period is rebuilt; 7D and 24H stay as they were.
+        #expect(second.periodChart(.month)?.end == now.addingTimeInterval(60))
+        #expect(second.periodChart(.month)?.series.first { $0.sourceName == "Source a" }?.values.contains(80) == false)
+        #expect(second.periodChart(.week) == first.periodChart(.week))
+        #expect(second.periodChart(.day) == first.periodChart(.day))
+    }
+
+    @Test("Routine pruning keeps the cache; a shortened retention drops the periods it reaches")
+    func cacheSurvivesRoutinePruning() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        populate(store, sourceID: "a", value: 70)
+        populate(store, sourceID: "b", value: 74)
+        // Inside the 30-day period built now, and aged out by the prune below.
+        #expect(store.append(Reading(sourceID: "b", kind: .heartRate, value: 74, start: now.addingTimeInterval(-30 * 86_400 + 30))))
+        #expect(store.append(Reading(sourceID: "a", kind: .heartRate, value: 80, start: now.addingTimeInterval(-10 * 86_400))))
+        let cache = WatchChartCache()
+        let first = try #require(WatchSnapshotBuilder.make(store: store, now: now, cache: cache).metrics.first)
+
+        let generation = store.removalGeneration
+        #expect(store.prune(now: now.addingTimeInterval(60)))
+        #expect(store.removalGeneration == generation + 1)
+        let second = try #require(WatchSnapshotBuilder.make(store: store, now: now.addingTimeInterval(90), cache: cache).metrics.first)
+        #expect(second.periodChart(.month) == first.periodChart(.month))
+        #expect(second.periodChart(.week) == first.periodChart(.week))
+
+        store.retention = 7 * 86_400
+        #expect(store.prune(now: now.addingTimeInterval(120)))
+        let third = try #require(WatchSnapshotBuilder.make(store: store, now: now.addingTimeInterval(150), cache: cache).metrics.first)
+        #expect(third.periodChart(.month)?.end == now.addingTimeInterval(150))
+        #expect(third.periodChart(.week) == first.periodChart(.week))
+    }
+
+    @Test("A cache older than the removal record is treated as reached")
+    func removalRecordBounds() {
+        let ends: [Date] = [30, 10, 20].map { Date(timeIntervalSince1970: $0) }
+        let history = HealthHistory(
+            sources: [],
+            changeToken: 0,
+            removalGeneration: 5,
+            recentRemovals: zip(3...5, ends).map { HealthStore.RemovalRecord(generation: $0, latestEnd: $1) },
+            loadState: .loaded,
+            readers: nil,
+            pending: [],
+            unavailableDetail: nil
+        )
+        #expect(history.latestRemovedEnd(since: 5) == nil)
+        #expect(history.latestRemovedEnd(since: 3) == ends[2])
+        #expect(history.latestRemovedEnd(since: 2) == ends[0])
+        #expect(history.latestRemovedEnd(since: 1) == .distantFuture)
+        #expect(history.latestRemovedEnd(since: 6) == .distantFuture)
+
+        let store = HealthStore(persistenceEnabled: false)
+        store.upsert(DataSource(id: "a", displayName: "Source a", transport: .bluetooth))
+        for index in 0...HealthStore.removalRecordLimit {
+            let reading = Reading(sourceID: "a", kind: .heartRate, value: 70, start: now.addingTimeInterval(-Double(index) * 60))
+            #expect(store.append(reading))
+            #expect(store.remove(readingIDs: [reading.id]) == 1)
+        }
+        #expect(store.recentRemovals.count == HealthStore.removalRecordLimit)
+        #expect(store.history.latestRemovedEnd(since: 0) == .distantFuture)
+    }
+
+    @Test("Periods built from one read equal periods read one at a time")
+    func oneReadMatchesSeparateReads() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        populate(store, sourceID: "a", value: 70, minutes: 90)
+        populate(store, sourceID: "b", value: 74, minutes: 90)
+        for day in [2.0, 6.5, 12, 29] {
+            #expect(store.append(Reading(sourceID: "a", kind: .heartRate, value: 71, start: now.addingTimeInterval(-day * 86_400))))
+            #expect(store.append(Reading(sourceID: "b", kind: .heartRate, value: 75, start: now.addingTimeInterval(-day * 86_400))))
+        }
+        // Exactly on the 1H and 24H starts, which both reads include.
+        for offset in [3_600.0, 86_400] {
+            #expect(store.append(Reading(sourceID: "a", kind: .heartRate, value: 72, start: now.addingTimeInterval(-offset))))
+        }
+        let metric = try #require(WatchSnapshotBuilder.make(store: store, now: now).metrics.first { $0.kind == .heartRate })
+        let shown = [store.source(id: "a"), store.source(id: "b")].compactMap { $0 }
+        for range in WatchChartRange.allCases {
+            let separate = WatchSnapshotBuilder.period(kind: .heartRate, range: range, now: now, shown: shown, store: store.history)
+            #expect(metric.periodChart(range) == separate.chart)
+            #expect(metric.periodComparison(range) == separate.comparison)
+        }
+    }
+
     @Test("Two sources sharing a colour slot are told apart by shape, as on iPhone")
     func sharedSlotShapes() throws {
         let store = HealthStore(persistenceEnabled: false)
@@ -311,6 +408,59 @@ struct WatchChartTests {
         let pair = try #require(WatchSnapshotBuilder.make(store: store, now: now).metrics.first?.chart?.pair)
         #expect(!pair.withinTolerance)
         #expect(pair.sourceB == "Source c")
+    }
+
+    @Test("An oversized snapshot drops the same charts as a whole re-encode per drop, and is encoded once")
+    func fittedPayloadMatchesExactSearch() throws {
+        let kinds = MetricKind.allCases.filter { WatchChartRange.available(for: $0).count == WatchChartRange.allCases.count }
+        func chart(_ kind: MetricKind, _ range: WatchChartRange) -> WatchChart {
+            let bucket = range.duration / Double(WatchChart.maximumPoints)
+            let base = ((kind.plausibleRange.lowerBound + kind.plausibleRange.upperBound) / 2).rounded()
+            return WatchChart(
+                start: now.addingTimeInterval(-range.duration),
+                end: now,
+                bucket: bucket,
+                series: (0..<WatchSnapshot.maximumSourcesPerMetric).map { source in
+                    WatchChartSeries(
+                        id: "source-\(source)", sourceName: "Source \(source)",
+                        color: WatchColor(red: 0.4, green: 0.6, blue: 0.9), symbol: source, isEstimated: false,
+                        offsets: (0..<WatchChart.maximumPoints).map { Int(Double($0) * bucket) },
+                        values: (0..<WatchChart.maximumPoints).map { base + Double(($0 * 7 + source) % 10) / 10 }
+                    )
+                },
+                range: range
+            )
+        }
+        let metrics = kinds.map { kind in
+            WatchMetric(
+                kind: kind,
+                readings: [WatchSourceReading(id: "source-0", sourceName: "Source 0", value: kind.plausibleRange.lowerBound, timestamp: now, provenance: .measured, isCompacted: false)],
+                omittedSourceCount: 0,
+                comparison: WatchComparison(readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: 86_400),
+                chart: chart(kind, .day),
+                rangeCharts: [.hour, .week, .month].map { chart(kind, $0) },
+                availableRanges: WatchChartRange.allCases
+            )
+        }
+        let snapshot = WatchSnapshot(generatedAt: now, metrics: metrics)
+        #expect(throws: WatchSnapshot.PayloadError.tooLarge) { try snapshot.encoded() }
+
+        // The previous algorithm: encode the whole snapshot after every drop.
+        var exact = snapshot
+        search: for range in WatchSnapshotBuilder.dropOrder {
+            for index in exact.metrics.indices.reversed() where exact.metrics[index].periodChart(range) != nil {
+                WatchSnapshotBuilder.remove(range, from: &exact.metrics[index])
+                if (try? exact.encoded()) != nil { break search }
+            }
+        }
+        let payload = WatchSnapshotBuilder.fittedPayload(snapshot)
+        #expect(payload.snapshot == exact)
+        #expect(payload.snapshot.metrics.contains { $0.periodChart(.month) == nil })
+        #expect(payload.snapshot.metrics.allSatisfy { $0.chart != nil })
+        let data = try #require(payload.data)
+        // Key order in `JSONEncoder` output can vary between runs; the length cannot.
+        #expect(data.count == (try payload.snapshot.encoded()).count)
+        #expect(try WatchSnapshot.decode(data) == payload.snapshot)
     }
 
     @Test("A chart that cannot be sent is dropped; the readings and verdict still travel")

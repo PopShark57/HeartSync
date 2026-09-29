@@ -20,6 +20,8 @@ struct HealthHistory: Sendable {
     let changeToken: Int
     /// `HealthStore.removalGeneration` when this was taken.
     let removalGeneration: Int
+    /// `HealthStore.recentRemovals` when this was taken.
+    let recentRemovals: [HealthStore.RemovalRecord]
     let loadState: HealthStore.LoadState
     private let access: Access
 
@@ -37,6 +39,7 @@ struct HealthHistory: Sendable {
         sources: [DataSource],
         changeToken: Int,
         removalGeneration: Int,
+        recentRemovals: [HealthStore.RemovalRecord] = [],
         loadState: HealthStore.LoadState,
         readers: HealthDatabase.ReaderPool?,
         pending: [Reading],
@@ -45,6 +48,7 @@ struct HealthHistory: Sendable {
         self.sources = sources
         self.changeToken = changeToken
         self.removalGeneration = removalGeneration
+        self.recentRemovals = recentRemovals
         self.loadState = loadState
         if loadState != .loaded {
             access = .notLoaded(pending: pending)
@@ -65,6 +69,22 @@ struct HealthHistory: Sendable {
         _ work: @escaping @Sendable () -> T
     ) async -> T {
         await Task.detached(priority: priority, operation: work).value
+    }
+
+    // MARK: - Removals
+
+    /// The latest `end` of any row removed after `generation`, for a cache built at that
+    /// generation. Nil when nothing has been removed since; `.distantFuture` when the
+    /// removals since are not all on record, so the caller must assume they reached it.
+    func latestRemovedEnd(since generation: Int) -> Date? {
+        guard generation < removalGeneration else {
+            return generation == removalGeneration ? nil : .distantFuture
+        }
+        // Each advance appends one record, so the log is complete back to its first entry.
+        guard let first = recentRemovals.first, first.generation <= generation + 1 else {
+            return .distantFuture
+        }
+        return recentRemovals.filter { $0.generation > generation }.map(\.latestEnd).max() ?? .distantFuture
     }
 
     // MARK: - Sources
@@ -144,6 +164,68 @@ struct HealthHistory: Sendable {
     var readingCountOutcome: HealthStoreQueryOutcome<Int> {
         if case .notLoaded(let pending) = access { return .success(pending.count) }
         return query { try $0.readingCount() }
+    }
+
+    // MARK: - Export
+
+    /// Streams the whole history, or one source's rows, into `url` as the CSV that
+    /// `HealthStore.exportCSV` describes, and returns the number of data rows.
+    ///
+    /// For running off the main actor (`HealthHistory.offMain`). It holds one pooled read
+    /// connection for the whole file and reads it in keyset pages inside one read
+    /// transaction (`HealthDatabase.forEachExportPage`), so the file is one consistent
+    /// snapshot however long it takes. Source names come from this value's source list.
+    ///
+    /// On failure, or when `progress` is cancelled (`CancellationError`), the partial file is
+    /// deleted: a truncated CSV is indistinguishable from a complete one once shared.
+    @discardableResult
+    func writeExportCSV(
+        to url: URL,
+        sourceID: String? = nil,
+        pageSize: Int = 5_000,
+        progress: ExportProgress? = nil
+    ) throws -> Int {
+        let readers: HealthDatabase.ReaderPool
+        switch access {
+        case .notLoaded: throw HealthStoreQueryError.notLoaded
+        case .unavailable(let detail): throw HealthStoreQueryError.storeUnavailable(detail)
+        case .database(let pool): readers = pool
+        }
+
+        let manager = FileManager.default
+        if manager.fileExists(atPath: url.path) { try manager.removeItem(at: url) }
+        guard manager.createFile(atPath: url.path, contents: nil) else {
+            throw HealthStoreQueryError.queryFailed("Could not create the export file.")
+        }
+        var written = 0
+        var handle: FileHandle?
+        do {
+            let file = try FileHandle(forWritingTo: url)
+            handle = file
+            try file.write(contentsOf: Data((HealthStore.exportColumns.joined(separator: ",") + "\r\n").utf8))
+            try readers.read { database in
+                try database.forEachExportPage(
+                    sourceID: sourceID,
+                    pageSize: pageSize,
+                    onTotal: { progress?.begin(total: $0) }
+                ) { page in
+                    if progress?.isCancelled == true { throw CancellationError() }
+                    try file.write(contentsOf: Data(HealthStore.exportRows(readings: page, sources: sources).utf8))
+                    written += page.count
+                    progress?.advance(by: page.count)
+                    return true
+                }
+            }
+            // A Cancel after the last page still discards the file: the user asked for none.
+            if progress?.isCancelled == true { throw CancellationError() }
+            handle = nil
+            try file.close()
+            return written
+        } catch {
+            try? handle?.close()
+            try? manager.removeItem(at: url)
+            throw error
+        }
     }
 
     /// See `HealthStore.periodSummaryOutcome`.

@@ -43,6 +43,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // the central is created unconditionally, with its restoration identifier.
         model.launch()
         Task { await model.start() }
+        // Export files a crash or kill left in `tmp` while a share sheet was open. Only
+        // directories from before this launch, so an export started meanwhile is safe.
+        let launchedAt = Date.now
+        Task.detached(priority: .utility) { ExportDirectory.sweep(createdBefore: launchedAt) }
         return true
     }
 }

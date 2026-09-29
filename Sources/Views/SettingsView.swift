@@ -391,7 +391,7 @@ private struct RetentionConfirmationView: View {
 
     @State private var sharePayload: ReadingsExportPayload?
     @State private var exportError: String?
-    @State private var isExporting = false
+    @State private var export = ReadingsExportJob()
 
     var body: some View {
         NavigationStack {
@@ -414,16 +414,13 @@ private struct RetentionConfirmationView: View {
                     Button {
                         prepareExport()
                     } label: {
-                        HStack {
-                            Label("Export readings before changing", systemImage: "square.and.arrow.up")
-                            if isExporting {
-                                Spacer()
-                                ProgressView()
-                            }
-                        }
+                        Label("Export readings before changing", systemImage: "square.and.arrow.up")
                     }
-                    .disabled(isExporting)
+                    .disabled(export.isRunning)
                     .accessibilityIdentifier("retention.export")
+                    if export.isRunning {
+                        ExportProgressRow(job: export)
+                    }
                 } footer: {
                     Text("The export is a CSV of the rows currently stored, with units, device metadata, and the original sample count and spread retained for compacted windows. It is an analysis file, not a backup: HeartSync cannot import it, and rows already compacted no longer contain their original samples.")
                 }
@@ -442,6 +439,7 @@ private struct RetentionConfirmationView: View {
             } message: {
                 Text(exportError ?? "The export could not be prepared.")
             }
+            .onDisappear { export.cancel() }
             .navigationTitle("Confirm retention")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -461,25 +459,18 @@ private struct RetentionConfirmationView: View {
     /// was rendering, so opening this sheet materialized the entire history whether or not
     /// the user wanted a file — and a failed query produced a header-only CSV that looked
     /// like a genuinely empty history.
+    ///
+    /// The file is written off the main actor (`ReadingsExportJob`), so the progress bar
+    /// moves and Cancel works while a large history is written.
     private func prepareExport() {
         discardShareFile()
-        isExporting = true
-
-        Task { @MainActor in
-            defer { isExporting = false }
-            do {
-                guard let payload = try ReadingsExportPayload.prepare(
-                    store: model.store,
-                    sourceID: nil,
-                    filename: "HeartSync-readings.csv"
-                ) else {
-                    exportError = "There are no stored readings to export."
-                    return
-                }
+        export.start(history: model.store.history, sourceID: nil, filename: "HeartSync-readings.csv") { result in
+            switch result {
+            case .success(let payload?):
                 sharePayload = payload
-            } catch is CancellationError {
-                // Nothing to show: the export was cancelled and its partial file removed.
-            } catch {
+            case .success(nil):
+                exportError = "There are no stored readings to export."
+            case .failure(let error):
                 exportError = "HeartSync could not export the readings. \(error.localizedDescription) Nothing was deleted or changed."
             }
         }

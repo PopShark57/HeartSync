@@ -28,6 +28,7 @@ struct PairwiseAnalysisView: View {
     @State private var sharePayload: PairwiseSharePayload?
     @State private var shareDirectory: URL?
     @State private var exportError: String?
+    @State private var isExporting = false
 
     init(
         kind: MetricKind,
@@ -281,8 +282,15 @@ struct PairwiseAnalysisView: View {
             if !currentAnalysis.observations.isEmpty {
                 Section {
                     Button(action: { prepareExport(currentAnalysis) }) {
-                        Label("Export observations and summary", systemImage: "square.and.arrow.up")
+                        HStack {
+                            Label("Export observations and summary", systemImage: "square.and.arrow.up")
+                            if isExporting {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
                     }
+                    .disabled(isExporting)
                     .accessibilityHint("Creates a CSV and plain-text methodology summary, then opens the share sheet")
                 } footer: {
                     Text("The export contains only this metric, source pair, and selected range. When evidence is insufficient, the summary explicitly withholds an agreement conclusion.")
@@ -845,36 +853,39 @@ struct PairwiseAnalysisView: View {
 
     // MARK: - Export
 
+    /// Builds the CSV and summary and writes them off the main actor: a month of paired
+    /// windows is tens of thousands of rows to format.
     private func prepareExport(_ analysis: PairwiseAnalysis) {
         discardShareFiles()
-
-        do {
-            // A source record can be missing for an analysis that still has observations
-            // (a device removed mid-session). The exporter falls back to the stable source
-            // ID, so the export stays available rather than failing on cosmetic metadata.
-            let export = PairwiseExporter.makeExport(
-                analysis: analysis,
-                sources: [sourceA, sourceB].compactMap { $0 },
-                appVersion: appVersion,
-                generatedAt: .now
-            )
-            let directory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("HeartSync-Pairwise-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-
-            do {
-                let csvURL = directory.appendingPathComponent(export.csvFilename)
-                let summaryURL = directory.appendingPathComponent(export.summaryFilename)
-                try export.csvData.write(to: csvURL, options: .atomic)
-                try export.summaryData.write(to: summaryURL, options: .atomic)
-                shareDirectory = directory
-                sharePayload = PairwiseSharePayload(urls: [csvURL, summaryURL])
-            } catch {
-                try? FileManager.default.removeItem(at: directory)
-                throw error
+        isExporting = true
+        // A source record can be missing for an analysis that still has observations (a
+        // device removed mid-session). The exporter falls back to the stable source ID, so
+        // the export stays available rather than failing on cosmetic metadata.
+        let sources = [sourceA, sourceB].compactMap { $0 }
+        let appVersion = appVersion
+        Task { @MainActor in
+            let result = await HealthHistory.offMain {
+                Result {
+                    let export = PairwiseExporter.makeExport(
+                        analysis: analysis,
+                        sources: sources,
+                        appVersion: appVersion,
+                        generatedAt: .now
+                    )
+                    return try ExportDirectory.write(
+                        [(export.csvFilename, export.csvData), (export.summaryFilename, export.summaryData)],
+                        prefix: ExportDirectory.pairwisePrefix
+                    )
+                }
             }
-        } catch {
-            exportError = "HeartSync could not create the temporary export files. \(error.localizedDescription)"
+            isExporting = false
+            switch result {
+            case .success(let files):
+                shareDirectory = files.directory
+                sharePayload = PairwiseSharePayload(urls: files.urls)
+            case .failure(let error):
+                exportError = "HeartSync could not create the temporary export files. \(error.localizedDescription)"
+            }
         }
     }
 
