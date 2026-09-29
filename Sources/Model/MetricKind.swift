@@ -290,6 +290,10 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
     /// `format(_:)`'s `FormatStyle`, the symbol through the localized `unit`. It feeds
     /// interpretation sentences and accessibility labels, never an export. The exporter
     /// composes its own value and `exportUnit` so its bytes stay language-independent.
+    /// What sits between a value and its unit symbol: nothing for a percent sign, a space for
+    /// every other unit. Decided by metric, not by comparing the localised symbol.
+    var unitSeparator: String { self == .spo2 ? "" : " " }
+
     func formatWithUnit(_ value: Double) -> String {
         "\(format(value)) \(unit)"
     }

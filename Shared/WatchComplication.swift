@@ -9,15 +9,20 @@ struct WatchComplicationValue: Sendable {
     init(kind: MetricKind, snapshot: WatchSnapshot?) {
         self.kind = kind
         availability = snapshot?.availability
-        // Estimates need their full explanation in the app. Select deterministically from
-        // the same bounded set of enabled sources shown on the watch dashboard.
         reading = snapshot?.availability == .ready
-            ? snapshot?.metrics.first(where: { $0.kind == kind })?.readings
-                .filter { $0.provenance != .estimated }
-                .sorted {
-                    $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp > $1.timestamp
-                }.first
+            ? snapshot?.metrics.first(where: { $0.kind == kind }).flatMap(Self.displayedReading)
             : nil
+    }
+
+    /// The reading a complication draws for a metric. Estimates need their full explanation
+    /// in the app, so they are never shown. Selected deterministically from the same bounded
+    /// set of enabled sources shown on the watch dashboard: newest first, ties by source id.
+    static func displayedReading(in metric: WatchMetric) -> WatchSourceReading? {
+        metric.readings
+            .filter { $0.provenance != .estimated }
+            .sorted {
+                $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp > $1.timestamp
+            }.first
     }
 
     func isStale(at date: Date) -> Bool {
@@ -37,6 +42,41 @@ struct WatchComplicationValue: Sendable {
         case .unavailable: String(localized: "Open iPhone app")
         case .ready: String(localized: "No readings")
         }
+    }
+}
+
+extension WatchSnapshot {
+
+    /// The part of a snapshot a complication can draw: per metric, the one reading
+    /// `WatchComplicationValue` would show, and nothing else.
+    ///
+    /// A complication needs no charts, no comparison counts, and no other source. Storing this
+    /// instead of the full payload (up to 60 KB) keeps the extension's decode small, and it
+    /// gives the app something to compare: `generatedAt` changes with every iPhone
+    /// publication, and a chart or a comparison count changes far more often than any value a
+    /// complication shows, so comparing whole snapshots spent WidgetKit's reload budget on
+    /// deliveries that changed nothing on the wrist face.
+    var complicationProjection: WatchSnapshot {
+        guard availability == .ready else {
+            return WatchSnapshot(generatedAt: generatedAt, availability: availability, metrics: [])
+        }
+        let neutral = WatchComparison(readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: 3_600)
+        let projected = metrics.compactMap { metric -> WatchMetric? in
+            guard let reading = WatchComplicationValue.displayedReading(in: metric) else { return nil }
+            return WatchMetric(
+                kind: metric.kind,
+                readings: [reading],
+                omittedSourceCount: 0,
+                comparison: neutral
+            )
+        }
+        return WatchSnapshot(generatedAt: generatedAt, availability: availability, metrics: projected)
+    }
+
+    /// True when two projections draw the same thing on a complication. Delivery time is not
+    /// part of it; the measurement time inside each reading is.
+    func drawsSameComplications(as other: WatchSnapshot) -> Bool {
+        availability == other.availability && metrics == other.metrics
     }
 }
 

@@ -255,95 +255,6 @@ enum ComparisonEngine {
         }
     }
 
-    // MARK: - Discrepancies
-
-    /// Summarises how each pair of sources compares for one metric, using the
-    /// Bland\u{2013}Altman approach: mean signed difference (bias) plus the standard deviation
-    /// of the differences (which gives the limits of agreement).
-    ///
-    /// Bland\u{2013}Altman is the right tool here specifically because none of these devices is
-    /// a reference standard. Correlation would be misleading \u{2014} two devices can correlate
-    /// almost perfectly while one reads 10 bpm high all day.
-    static func discrepancies(
-        from readings: [Reading],
-        kind: MetricKind,
-        range: DateInterval? = nil,
-        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows
-    ) -> [Discrepancy] {
-        let windows = windows(from: readings, kind: kind, range: range)
-        return discrepancies(fromWindows: windows, kind: kind, minimumPairedWindows: minimumPairedWindows)
-    }
-
-    static func discrepancies(
-        fromWindows windows: [ComparisonWindow],
-        kind: MetricKind,
-        minimumPairedWindows: Int = ComparisonEngine.minimumPairedWindows
-    ) -> [Discrepancy] {
-        let multiSource = windows.filter { $0.values.count >= 2 }
-        guard !multiSource.isEmpty else { return [] }
-
-        // pairKey -> signed differences (A - B) plus the window times they came from
-        var pairs: [PairKey: [Double]] = [:]
-        var spans: [PairKey: (Date, Date)] = [:]
-
-        for window in multiSource {
-            let values = window.values
-            for i in values.indices {
-                for j in values.index(after: i)..<values.endIndex {
-                    let a = values[i], b = values[j]
-                    // Order the pair canonically so A\u{2013}B and B\u{2013}A do not become two entries.
-                    let key = PairKey(a: min(a.sourceID, b.sourceID), b: max(a.sourceID, b.sourceID))
-                    let signed = key.a == a.sourceID ? a.value - b.value : b.value - a.value
-                    pairs[key, default: []].append(signed)
-                    if let existing = spans[key] {
-                        spans[key] = (min(existing.0, window.start), max(existing.1, window.end))
-                    } else {
-                        spans[key] = (window.start, window.end)
-                    }
-                }
-            }
-        }
-
-        return pairs.compactMap { key, diffs -> Discrepancy? in
-            guard diffs.count >= minimumPairedWindows, let span = spans[key] else { return nil }
-            let n = Double(diffs.count)
-            let bias = diffs.reduce(0, +) / n
-            let meanAbs = diffs.reduce(0) { $0 + abs($1) } / n
-            // The observed windows are a sample of the devices' possible differences, so
-            // Bland–Altman uses sample variance rather than population variance here.
-            let variance = diffs.count > 1
-                ? diffs.reduce(0) { $0 + ($1 - bias) * ($1 - bias) } / Double(diffs.count - 1)
-                : 0
-            return Discrepancy(
-                kind: kind,
-                sourceA: key.a,
-                sourceB: key.b,
-                meanBias: bias,
-                meanAbsoluteDifference: meanAbs,
-                differenceSD: variance.squareRoot(),
-                windowCount: diffs.count,
-                span: DateInterval(start: span.0, end: max(span.1, span.0))
-            )
-        }
-        .sorted { lhs, rhs in
-            if lhs.severity != rhs.severity { return lhs.severity > rhs.severity }
-            return lhs.meanAbsoluteDifference > rhs.meanAbsoluteDifference
-        }
-    }
-
-    /// Every metric's discrepancies at once, ordered worst-first, for the summary screen.
-    static func allDiscrepancies(
-        from readings: [Reading],
-        range: DateInterval? = nil
-    ) -> [Discrepancy] {
-        MetricKind.allCases
-            .flatMap { discrepancies(from: readings, kind: $0, range: range) }
-            .sorted { lhs, rhs in
-                if lhs.severity != rhs.severity { return lhs.severity > rhs.severity }
-                return lhs.windowCount > rhs.windowCount
-            }
-    }
-
     // MARK: - Latest side-by-side
 
     /// The most recent value each source has for a metric, for the live dashboard.
@@ -509,8 +420,17 @@ enum ComparisonEngine {
         return total
     }
 
+    /// Whether `reading` is a window median written before rows carried aggregation metadata.
+    ///
+    /// Such a row was stored at the start of its window, so a row that does not start on a
+    /// window boundary cannot be one. That cheap test comes first because this runs for every
+    /// reading in every `windows()` call, and the identity check below formats a string and
+    /// hashes it with SHA-256; almost every raw reading now stops at the boundary test.
     private static func isLegacyCompactedMedian(_ reading: Reading) -> Bool {
-        let start = floorToWindow(reading.midpoint, size: reading.kind.comparisonWindow)
+        let window = reading.kind.comparisonWindow
+        let seconds = reading.start.timeIntervalSince1970
+        guard seconds == (seconds / window).rounded(.down) * window else { return false }
+        let start = floorToWindow(reading.midpoint, size: window)
         let expected = UUID(stableFrom: "compact.\(reading.sourceID).\(reading.kind.rawValue).\(Int(start.timeIntervalSince1970))")
         return reading.id == expected
     }
@@ -566,21 +486,41 @@ enum ComparisonEngine {
         }
 
         var reasons: [String] = []
-        if pairedWindowCount < minimumPairedWindows { reasons.append("Too few paired windows") }
-        if overlapPercentage < 60 { reasons.append("Low time overlap") }
-        if unknownDepth { reasons.append("Some compacted sample counts are unknown") }
-        if compacted > 0 { reasons.append("Includes fixed compacted window medians") }
-        if caveats > 0 { reasons.append("Includes signal-quality caveats") }
+        if pairedWindowCount < minimumPairedWindows {
+            reasons.append(String(localized: "evidence.reason.tooFewWindows", defaultValue: "Too few paired windows", comment: "Why a device comparison has a low evidence grade"))
+        }
+        if overlapPercentage < 60 {
+            reasons.append(String(localized: "evidence.reason.lowOverlap", defaultValue: "Low time overlap", comment: "Why a device comparison has a low evidence grade"))
+        }
+        if unknownDepth {
+            reasons.append(String(localized: "evidence.reason.unknownDepth", defaultValue: "Some compacted sample counts are unknown", comment: "Why a device comparison has a low evidence grade"))
+        }
+        if compacted > 0 {
+            reasons.append(String(localized: "evidence.reason.compacted", defaultValue: "Includes fixed compacted window medians", comment: "Why a device comparison has a low evidence grade"))
+        }
+        if caveats > 0 {
+            reasons.append(String(localized: "evidence.reason.qualityCaveats", defaultValue: "Includes signal-quality caveats", comment: "Why a device comparison has a low evidence grade"))
+        }
         if separated > 0 {
-            reasons.append("\(separated) paired \(separated == 1 ? "window pairs readings" : "windows pair readings") taken too far apart in time")
+            reasons.append(String(
+                localized: "evidence.reason.separated",
+                defaultValue: "\(separated) paired windows pair readings taken too far apart in time",
+                comment: "Why a device comparison has a low evidence grade. The argument is how many paired windows used readings taken too far apart."
+            ))
         }
         if unknownTiming > 0 {
-            reasons.append("\(unknownTiming) paired \(unknownTiming == 1 ? "window has" : "windows have") unknown measurement timing")
+            reasons.append(String(
+                localized: "evidence.reason.unknownTiming",
+                defaultValue: "\(unknownTiming) paired windows have unknown measurement timing",
+                comment: "Why a device comparison has a low evidence grade. The argument is how many paired windows have no timing information."
+            ))
         }
         if let coverageFraction, coverageFraction < 0.5 {
-            reasons.append("Paired windows cover only part of the analysed span")
+            reasons.append(String(localized: "evidence.reason.partialCoverage", defaultValue: "Paired windows cover only part of the analysed span", comment: "Why a device comparison has a low evidence grade"))
         }
-        if reasons.isEmpty { reasons.append("Window count, span, overlap, timing, and sample depth support this grade") }
+        if reasons.isEmpty {
+            reasons.append(String(localized: "evidence.reason.supported", defaultValue: "Window count, span, overlap, timing, and sample depth support this grade", comment: "Why a device comparison has a high evidence grade"))
+        }
 
         return PairwiseEvidenceAssessment(
             grade: grade,

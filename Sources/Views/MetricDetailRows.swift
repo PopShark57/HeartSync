@@ -54,10 +54,26 @@ struct PerSourceStatsRow: View {
     /// Spells out what each number is, because the shortened on-screen labels rely on
     /// column position that VoiceOver does not convey.
     private var accessibilityDescription: String {
-        let base = "\(entry.source.displayName), typical \(kind.formatWithUnit(entry.typicalWindowValue)) across \(entry.windowCount) \(entry.windowCount == 1 ? "window" : "windows"), lowest window median \(kind.format(entry.lowestWindowValue)), highest window median \(kind.format(entry.highestWindowValue))"
-        let depth = entry.originalSampleCount.map { ", from \($0) original \($0 == 1 ? "sample" : "samples")" }
-            ?? ", original sample count unknown"
-        let compaction = entry.includesCompactedWindows ? ", includes compacted window medians" : ""
+        let windows = String(
+            localized: "detail.spoken.windows",
+            defaultValue: "\(entry.windowCount) windows",
+            comment: "Spoken description of a device row. The argument is how many comparison windows it covers."
+        )
+        let base = String(
+            localized: "detail.spoken.base",
+            defaultValue: "\(entry.source.displayName), typical \(kind.formatWithUnit(entry.typicalWindowValue)) across \(windows), lowest window median \(kind.format(entry.lowestWindowValue)), highest window median \(kind.format(entry.highestWindowValue))",
+            comment: "Spoken description of a device row. Arguments: device name, typical value with unit, a phrase such as '3 windows', lowest median, highest median."
+        )
+        let depth = entry.originalSampleCount.map { count in
+            ", " + String(
+                localized: "detail.spoken.originalSamples",
+                defaultValue: "from \(count) original samples",
+                comment: "Spoken description fragment. The argument is how many raw samples the windows were built from."
+            )
+        } ?? ", " + String(localized: "detail.spoken.sampleCountUnknown", defaultValue: "original sample count unknown", comment: "Spoken description fragment: the raw sample count was discarded by compaction")
+        let compaction = entry.includesCompactedWindows
+            ? ", " + String(localized: "detail.spoken.compacted", defaultValue: "includes compacted window medians", comment: "Spoken description fragment: some windows are stored medians")
+            : ""
         return base + depth + compaction
     }
 

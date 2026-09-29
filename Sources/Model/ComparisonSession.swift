@@ -29,7 +29,11 @@ enum ComparisonPeriod: Hashable, Sendable {
         switch self {
         case .rolling(let range): range.title
         case .fixed(let interval):
-            "\(interval.start.formatted(date: .abbreviated, time: .shortened)) to \(interval.end.formatted(date: .omitted, time: .shortened))"
+            String(
+                localized: "comparisonPeriod.fixed",
+                defaultValue: "\(interval.start.formatted(date: .abbreviated, time: .shortened)) to \(interval.end.formatted(date: .omitted, time: .shortened))",
+                comment: "A saved comparison's exact span. The first argument is the start date and time, the second the end time."
+            )
         }
     }
 
@@ -83,6 +87,11 @@ struct ComparisonSession: Identifiable, Codable, Hashable, Sendable {
     /// say whether the result now includes data imported since. Nil for a session that has
     /// never been re-opened.
     var lastViewedReadingCount: Int?
+    /// Fingerprint of the readings behind `lastViewedReadingCount`. A count alone cannot tell
+    /// five readings added and five removed from "unchanged". Nil for a session last viewed
+    /// by a build that predates it, whose count also covered every source, not only the
+    /// session's own, so it is not comparable with a current summary.
+    var lastViewedFingerprint: Int64?
     var lastViewedAt: Date?
 
     init(
@@ -94,6 +103,7 @@ struct ComparisonSession: Identifiable, Codable, Hashable, Sendable {
         metric: MetricKind? = nil,
         createdAt: Date = .now,
         lastViewedReadingCount: Int? = nil,
+        lastViewedFingerprint: Int64? = nil,
         lastViewedAt: Date? = nil
     ) {
         self.id = id
@@ -104,6 +114,7 @@ struct ComparisonSession: Identifiable, Codable, Hashable, Sendable {
         self.metric = metric
         self.createdAt = createdAt
         self.lastViewedReadingCount = lastViewedReadingCount
+        self.lastViewedFingerprint = lastViewedFingerprint
         self.lastViewedAt = lastViewedAt
     }
 
@@ -128,15 +139,39 @@ struct ComparisonSession: Identifiable, Codable, Hashable, Sendable {
     ///
     /// Time zones do not enter into it: the interval is absolute, so a device that changes
     /// zone re-reads exactly the same seconds and only the rendered wall-clock text moves.
-    func revisitDisclosure(currentReadingCount: Int) -> String? {
+    ///
+    /// - Parameter currentFingerprint: identity summary of the readings now stored for the
+    ///   period. When supplied it is compared as well as the count, so a replacement that
+    ///   leaves the count unchanged is still disclosed.
+    func revisitDisclosure(currentReadingCount: Int, currentFingerprint: Int64? = nil) -> String? {
         guard let previous = lastViewedReadingCount else { return nil }
+        if let currentFingerprint {
+            // An older baseline counted other sources' readings too; comparing against it
+            // would report changes that never happened.
+            guard let previousFingerprint = lastViewedFingerprint else { return nil }
+            if currentReadingCount == previous, currentFingerprint != previousFingerprint {
+                return String(
+                    localized: "session.revisit.replaced",
+                    defaultValue: "The readings stored for this period are not the same ones you saw when you last opened it (some were replaced, corrected, or removed and others added), so this result may differ.",
+                    comment: "Shown when reopening a saved comparison whose period holds the same number of readings, but not the same readings."
+                )
+            }
+        }
         let difference = currentReadingCount - previous
         if difference > 0 {
-            return "\(difference) \(difference == 1 ? "reading has" : "readings have") been imported for this period since you last opened it, so this result may differ from what you saw."
+            return String(
+                localized: "session.revisit.added",
+                defaultValue: "\(difference) readings have been imported for this period since you last opened it, so this result may differ from what you saw.",
+                comment: "Shown when reopening a saved comparison whose period now holds more readings. The argument is how many were added."
+            )
         }
         if difference < 0 {
             let removed = -difference
-            return "\(removed) \(removed == 1 ? "reading is" : "readings are") no longer stored for this period — removed upstream, or compacted by retention."
+            return String(
+                localized: "session.revisit.removed",
+                defaultValue: "\(removed) readings are no longer stored for this period \u{2014} removed upstream, or compacted by retention.",
+                comment: "Shown when reopening a saved comparison whose period now holds fewer readings. The argument is how many are gone."
+            )
         }
         return nil
     }

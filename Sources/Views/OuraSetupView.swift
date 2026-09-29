@@ -309,7 +309,11 @@ struct OuraSetupView: View {
             case .invalidCharacters(let characters):
                 "A Client ID is letters and digits only. Remove \(characters)."
             case .tooShort(let count):
-                "That is only \(count) character\(count == 1 ? "" : "s"). Oura Client IDs are 32 \u{2014} check that the whole value was copied."
+                String(
+                    localized: "ouraSetup.clientID.tooShort",
+                    defaultValue: "That is only \(count) characters. Oura Client IDs are 32 \u{2014} check that the whole value was copied.",
+                    comment: "Oura Client ID validation. The argument is how many characters were entered."
+                )
             case .tooLong(let count):
                 "That is \(count) characters. Oura Client IDs are 32 \u{2014} make sure this is not the Client Secret or an access token."
             }

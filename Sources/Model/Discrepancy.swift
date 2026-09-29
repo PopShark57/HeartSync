@@ -54,10 +54,14 @@ enum PairTimingQuality: String, Hashable, Sendable, CaseIterable {
 
     var title: String {
         switch self {
-        case .simultaneous:  "Simultaneous"
-        case .separated:     "Separated in time"
-        case .unknown:       "Timing unknown"
-        case .notApplicable: "Interval summary"
+        case .simultaneous:
+            String(localized: "pairTiming.simultaneous", defaultValue: "Simultaneous", comment: "Pair timing: both devices reported within the metric's timing tolerance")
+        case .separated:
+            String(localized: "pairTiming.separated", defaultValue: "Separated in time", comment: "Pair timing: the two devices reported further apart than the metric allows")
+        case .unknown:
+            String(localized: "pairTiming.unknown", defaultValue: "Timing unknown", comment: "Pair timing: a timestamp needed to judge the separation is no longer available")
+        case .notApplicable:
+            String(localized: "pairTiming.notApplicable", defaultValue: "Interval summary", comment: "Pair timing: the metric summarises a long interval, so a separation figure would be meaningless")
         }
     }
 }
@@ -165,7 +169,18 @@ enum PairwiseEvidenceGrade: String, Hashable, Sendable {
     case moderate
     case strong
 
-    var title: String { rawValue.capitalized }
+    var title: String {
+        switch self {
+        case .limited:
+            String(localized: "evidenceGrade.limited", defaultValue: "Limited", comment: "Evidence grade for a device comparison: too little to conclude anything")
+        case .weak:
+            String(localized: "evidenceGrade.weak", defaultValue: "Weak", comment: "Evidence grade for a device comparison: enough windows, but with clear weaknesses")
+        case .moderate:
+            String(localized: "evidenceGrade.moderate", defaultValue: "Moderate", comment: "Evidence grade for a device comparison")
+        case .strong:
+            String(localized: "evidenceGrade.strong", defaultValue: "Strong", comment: "Evidence grade for a device comparison: many windows, good overlap and timing")
+        }
+    }
 }
 
 struct PairwiseEvidenceAssessment: Hashable, Sendable {
@@ -366,50 +381,5 @@ struct PairwiseEvidenceOverview: Hashable, Sendable {
                 }
                 .map(pairKey)
         )
-    }
-}
-
-/// A persistent disagreement between exactly two sources, summarised over a longer span.
-///
-/// Distinct from `ComparisonWindow`: a single window disagreeing is usually motion
-/// artefact, but the same pair disagreeing in the same direction for hours is a real
-/// calibration difference worth surfacing.
-struct Discrepancy: Identifiable, Hashable, Sendable {
-    var id: String { "\(kind.rawValue)-\(sourceA)-\(sourceB)" }
-
-    var kind: MetricKind
-    var sourceA: String
-    var sourceB: String
-    /// Mean signed difference, A minus B. Sign carries meaning: a consistent sign is bias,
-    /// an alternating sign is noise.
-    var meanBias: Double
-    /// Mean of the absolute differences.
-    var meanAbsoluteDifference: Double
-    /// Standard deviation of the signed differences \u{2014} the "limits of agreement" width
-    /// from a Bland\u{2013}Altman analysis, which is the standard way to compare two
-    /// measurement devices against each other when neither is a gold standard.
-    var differenceSD: Double
-    var windowCount: Int
-    var span: DateInterval
-
-    var severity: DiscrepancySeverity {
-        kind.agreement.severity(forDelta: meanAbsoluteDifference)
-    }
-
-    /// Bland\u{2013}Altman 95% limits of agreement.
-    var limitsOfAgreement: ClosedRange<Double> {
-        let lo = meanBias - 1.96 * differenceSD
-        let hi = meanBias + 1.96 * differenceSD
-        return lo...hi
-    }
-
-    /// True when the gap is consistently in one direction rather than scattering around
-    /// zero \u{2014} i.e. one device really does read higher than the other.
-    var isSystematicBias: Bool {
-        guard meanAbsoluteDifference > 0 else { return false }
-        // A zero spread with a non-zero bias is the most systematic case there is, so it
-        // must not fall through the `> differenceSD` comparison.
-        if differenceSD == 0 { return abs(meanBias) > 0 }
-        return abs(meanBias) > differenceSD
     }
 }

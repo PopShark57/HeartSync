@@ -5,6 +5,7 @@ struct SettingsView: View {
     @State private var showingCalibration = false
     @State private var retentionSelection = 30
     @State private var retentionProposal: RetentionProposal?
+    @State private var storedReadingCount: Int?
     @State private var resetProposal: ResetProposal?
     @State private var persistenceResult: String?
     @State private var mirrorWriteAlert: MirrorWriteAlert?
@@ -67,6 +68,14 @@ struct SettingsView: View {
                 Section {
                     Toggle("Auto-sync Oura", isOn: $settings.snapshot.autoSyncOura)
                     Toggle("Write Bluetooth data to Health", isOn: $settings.snapshot.mirrorBluetoothToHealthKit)
+                    if settings.snapshot.mirrorBluetoothToHealthKit, let issue = model.healthKit.writeBackIssue {
+                        // A refusal or a full queue would otherwise be invisible: the readings
+                        // simply never reach Health.
+                        Label(issue, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("settings.writeBackIssue")
+                    }
                 } header: {
                     Text("Syncing")
                 } footer: {
@@ -84,8 +93,17 @@ struct SettingsView: View {
                         Text("90 days").tag(90)
                         Text("1 year").tag(365)
                     }
+                    if model.retentionIsPaused {
+                        // The retention on record could not be confirmed (settings were lost
+                        // or reset), so nothing old is being deleted. Say so, and let the
+                        // user make the choice that resumes it.
+                        Button("Resume deleting readings older than \(retentionSelection) days") {
+                            proposeRetentionConfirmation()
+                        }
+                        .accessibilityIdentifier("data.confirmRetention")
+                    }
                     LabeledContent("Stored readings") {
-                        Text("\(model.store.readingCount)").foregroundStyle(.secondary)
+                        Text(storedReadingCount.map { "\($0)" } ?? "\u{2014}").foregroundStyle(.secondary)
                     }
                     .accessibilityElement(children: .combine)
                     .accessibilityIdentifier("data.storedReadings")
@@ -133,6 +151,7 @@ struct SettingsView: View {
                 set: { if !$0 { persistenceResult = nil } }
             )) { Button("OK", role: .cancel) {} } message: { Text(persistenceResult ?? "") }
             .onAppear { retentionSelection = settings.snapshot.retentionDays }
+            .task { await pollStoredReadingCount() }
             .onChange(of: settings.snapshot.mirrorBluetoothToHealthKit) { _, enabled in
                 guard enabled else { return }
                 Task {
@@ -179,16 +198,44 @@ struct SettingsView: View {
                 impact: model.store.retentionImpact(days: days)
             )
         } else {
-            applyRetention(RetentionProposal(days: days, impact: model.store.retentionImpact(days: days)))
+            // Keeping readings longer deletes nothing, so no impact is counted for it.
+            applyRetention(RetentionProposal(
+                days: days,
+                impact: HealthStore.RetentionImpact(
+                    cutoff: .now.addingTimeInterval(-TimeInterval(days) * 86_400),
+                    readingsDeleted: 0,
+                    readingsEligibleForCompaction: 0
+                )
+            ))
         }
     }
 
+    /// The chosen period is what the user wants to resume with, so it goes through the same
+    /// confirmation as a shortening: it will delete what is older than it.
+    private func proposeRetentionConfirmation() {
+        let days = retentionSelection
+        retentionProposal = RetentionProposal(days: days, impact: model.store.retentionImpact(days: days))
+    }
+
+    /// Refreshed on a timer while Settings is visible. The count is a `COUNT(*)`; reading it
+    /// from the view body re-ran it after every ingested reading.
+    private func pollStoredReadingCount() async {
+        while !Task.isCancelled {
+            refreshStoredReadingCount()
+            try? await Task.sleep(for: .seconds(5))
+        }
+    }
+
+    private func refreshStoredReadingCount() {
+        storedReadingCount = model.store.readingCountOutcome.value
+    }
+
     private func applyRetention(_ proposal: RetentionProposal) {
-        model.settings.snapshot.retentionDays = proposal.days
+        model.chooseRetention(days: proposal.days)
         retentionSelection = proposal.days
-        model.applyRetentionSettings()
         model.store.prune()
         retentionProposal = nil
+        refreshStoredReadingCount()
         Task {
             let storeSaved = await model.store.saveNow()
             let settingsSaved = await model.settings.saveNow()
@@ -203,6 +250,7 @@ struct SettingsView: View {
         resetProposal = nil
         Task {
             let saved = await model.resetLocalData(proposal.mode)
+            refreshStoredReadingCount()
             persistenceResult = saved
                 ? proposal.successMessage
                 : "The clear operation could not be fully confirmed on disk. No Apple Health data was deleted."
@@ -281,8 +329,12 @@ struct SettingsView: View {
 
     private var toleranceSummary: String {
         let examples: [MetricKind] = [.heartRate, .spo2, .hrvRMSSD]
-        let parts = examples.map { "\($0.shortTitle) \($0.format($0.agreement.warn))\($0.unit == "%" ? "%" : " \($0.unit)")" }
-        return "Tolerances are per metric \u{2014} \(parts.joined(separator: ", ")). They reflect each metric's real-world measurement error, so a gap only gets flagged when it exceeds what both devices' own accuracy would explain."
+        let parts = examples.map { "\($0.shortTitle) \($0.format($0.agreement.warn))\($0.unitSeparator)\($0.unit)" }
+        return String(
+            localized: "settings.tolerance.summary",
+            defaultValue: "Tolerances are per metric \u{2014} \(ListFormatter.localizedString(byJoining: parts)). They reflect each metric's real-world measurement error, so a gap only gets flagged when it exceeds what both devices' own accuracy would explain.",
+            comment: "Settings footer. The argument is a list of example tolerances such as 'Heart rate 5 bpm'."
+        )
     }
 }
 
@@ -305,28 +357,28 @@ private enum ResetProposal: Identifiable {
     }
     var title: String {
         switch self {
-        case .clearForResync: "Clear the resyncable cache?"
-        case .forgetImportedHistory: "Forget imported history?"
+        case .clearForResync: String(localized: "settings.reset.clear.title", defaultValue: "Clear the resyncable cache?", comment: "Confirmation title in Settings")
+        case .forgetImportedHistory: String(localized: "settings.reset.forget.title", defaultValue: "Forget imported history?", comment: "Confirmation title in Settings")
         }
     }
     var actionTitle: String {
         switch self {
-        case .clearForResync: "Clear cache"
-        case .forgetImportedHistory: "Forget history"
+        case .clearForResync: String(localized: "settings.reset.clear.action", defaultValue: "Clear cache", comment: "Destructive button in a Settings confirmation")
+        case .forgetImportedHistory: String(localized: "settings.reset.forget.action", defaultValue: "Forget history", comment: "Destructive button in a Settings confirmation")
         }
     }
     var message: String {
         switch self {
         case .clearForResync:
-            "Clears local readings and the Oura dashboard, resets HealthKit anchors, and keeps connections. Apple Health and Oura can repopulate their data on the next sync."
+            String(localized: "settings.reset.clear.message", defaultValue: "Clears local readings and the Oura dashboard, resets HealthKit anchors, and keeps connections. Apple Health and Oura can repopulate their data on the next sync.", comment: "Explanation in a Settings confirmation")
         case .forgetImportedHistory:
-            "Clears local readings, disconnects Oura, and keeps HealthKit anchors so older Health history does not immediately return. Future Bluetooth and Health samples can still appear. Apple Health itself is not deleted."
+            String(localized: "settings.reset.forget.message", defaultValue: "Clears local readings, disconnects Oura, and keeps HealthKit anchors so older Health history does not immediately return. Future Bluetooth and Health samples can still appear. Apple Health itself is not deleted.", comment: "Explanation in a Settings confirmation")
         }
     }
     var successMessage: String {
         switch self {
-        case .clearForResync: "The local cache was cleared and saved. Connected sources may resync."
-        case .forgetImportedHistory: "Imported history was forgotten and saved. Apple Health itself was not changed."
+        case .clearForResync: String(localized: "settings.reset.clear.success", defaultValue: "The local cache was cleared and saved. Connected sources may resync.", comment: "Result alert in Settings")
+        case .forgetImportedHistory: String(localized: "settings.reset.forget.success", defaultValue: "Imported history was forgotten and saved. Apple Health itself was not changed.", comment: "Result alert in Settings")
         }
     }
 }
@@ -337,7 +389,7 @@ private struct RetentionConfirmationView: View {
     let proposal: RetentionProposal
     let apply: () -> Void
 
-    @State private var sharePayload: RetentionSharePayload?
+    @State private var sharePayload: ReadingsExportPayload?
     @State private var exportError: String?
     @State private var isExporting = false
 
@@ -377,7 +429,7 @@ private struct RetentionConfirmationView: View {
                 }
             }
             .sheet(item: $sharePayload, onDismiss: discardShareFile) { payload in
-                RetentionActivityView(items: [payload.url])
+                ReadingsShareSheet(items: [payload.url])
             }
             .alert(
                 "Export failed",
@@ -412,25 +464,22 @@ private struct RetentionConfirmationView: View {
     private func prepareExport() {
         discardShareFile()
         isExporting = true
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("HeartSync-History-\(UUID().uuidString)", isDirectory: true)
-        let url = directory.appendingPathComponent("HeartSync-readings.csv")
 
         Task { @MainActor in
             defer { isExporting = false }
             do {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-                let rows = try model.store.writeExportCSV(to: url)
-                guard rows > 0 else {
-                    try? FileManager.default.removeItem(at: directory)
+                guard let payload = try ReadingsExportPayload.prepare(
+                    store: model.store,
+                    sourceID: nil,
+                    filename: "HeartSync-readings.csv"
+                ) else {
                     exportError = "There are no stored readings to export."
                     return
                 }
-                sharePayload = RetentionSharePayload(url: url, directory: directory)
+                sharePayload = payload
             } catch is CancellationError {
-                try? FileManager.default.removeItem(at: directory)
+                // Nothing to show: the export was cancelled and its partial file removed.
             } catch {
-                try? FileManager.default.removeItem(at: directory)
                 exportError = "HeartSync could not export the readings. \(error.localizedDescription) Nothing was deleted or changed."
             }
         }
@@ -442,22 +491,6 @@ private struct RetentionConfirmationView: View {
         }
         sharePayload = nil
     }
-}
-
-private struct RetentionSharePayload: Identifiable {
-    let id = UUID()
-    var url: URL
-    var directory: URL
-}
-
-private struct RetentionActivityView: UIViewControllerRepresentable {
-    var items: [URL]
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 /// Alert payload after the mirroring toggle asks for HealthKit write access.
@@ -477,22 +510,22 @@ private enum MirrorWriteAlert: Identifiable {
     var title: String {
         switch self {
         case .granted:
-            "Health writing enabled"
+            String(localized: "settings.mirror.granted.title", defaultValue: "Health writing enabled", comment: "Alert title after turning on writing to Apple Health")
         case .denied:
-            "Health writing not enabled"
+            String(localized: "settings.mirror.denied.title", defaultValue: "Health writing not enabled", comment: "Alert title after Apple Health refused write access")
         case .unavailable:
-            "Health unavailable"
+            String(localized: "settings.mirror.unavailable.title", defaultValue: "Health unavailable", comment: "Alert title when Apple Health is not available on this device")
         }
     }
 
     var message: String {
         switch self {
         case .granted:
-            "Bluetooth readings can be written to Apple Health."
+            String(localized: "settings.mirror.granted.message", defaultValue: "Bluetooth readings can be written to Apple Health.", comment: "Alert message after turning on writing to Apple Health")
         case .denied(let detail):
             detail
         case .unavailable:
-            "Health data is not available on this device."
+            String(localized: "settings.mirror.unavailable.message", defaultValue: "Health data is not available on this device.", comment: "Alert message when Apple Health is not available on this device")
         }
     }
 }

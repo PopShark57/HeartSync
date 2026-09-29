@@ -82,6 +82,50 @@ Suggested order:
    bundle before and after.
 6. 53 needs a signed device and the `RELEASE_CHECKLIST.md` background steps.
 
+### Implementation status (2026-09-29)
+
+**Implemented:** 42, 43, 44, 45, 48, 51, 54, 55, 56, 57, 58, 60, 61, 62, 63, 64, 65, 67, 68, 70,
+and 71. **Not implemented:** 46, 47, 49 (except the cache fingerprint that `WatchChartTests.cache()`
+needs), 50, 52, 53, 59, 66, 69, and 72. Where an item was done in part, the part left is named.
+
+How it was checked, and what was not:
+
+- The app, the watch app with its complication extension, and the unit and UI bundles build with
+  `build-for-testing` for the generic iOS Simulator, with no warnings.
+- The simulator runtimes were unusable on the machine used (Xcode-beta 27.2 reported every runtime
+  profile as not found), so **no hosted test and no UI test was run**. The pure logic and `AppModel`
+  ran in the scratch macOS SwiftPM harness AGENTS.md describes: 595 tests, all passing, including
+  the ones added here. `WatchWorkoutManager`, the SwiftUI screens, the UI tests, and the restored
+  workflow were compiled or parsed only. The one UI test that was failing
+  (`testRemovalAsksFirstAndDeletesOnlyThatDevice`) was changed to dismiss the dialog with Cancel
+  when it exists and by tapping outside otherwise, and has not been run.
+- The compiled string catalog was read back to confirm the plural variations, including ones with
+  two arguments, resolve as written.
+
+| Item | Done | Left |
+| --- | --- | --- |
+| 42 | `HealthStore` prunes aged history only after `confirmRetention`. `AppModel` confirms from settings that loaded intact or from the user's choice. The last period is recorded in `metadata`, so a lost settings file cannot shorten it. Startup notice and a Settings button while paused. | Nothing. |
+| 43 | Reconciliation reads and deletes only estimate rows in scope (blood pressure under `heartsync.estimate`; VO₂ max by `ReadingMetadata.modelledBy`, or unmarked). The estimate source is written in the same transaction. | Nothing. |
+| 44 | Withdrawal is computed per collection from records dated inside a complete full-window response. **Forget imported history** now removes every stored Oura reading, since the cache no longer names them all. | Nothing. |
+| 45 | Every declared PLX field, fast/slow pairs and amplitude index included, must be present. | Nothing. |
+| 48 | Remove, rename, pause, and source upserts write first and roll back on failure; Devices shows the failure; removal is refused before startup finishes and happens before the peripheral or credential is forgotten. | Battery/last-seen updates log a failure only. |
+| 51 | No prune, compaction, or checkpoint per HealthKit page. They run on a 15-minute timer and at background transitions under a background-task assertion. Compaction reads only the pass span plus one window, and a maintenance run takes up to five passes. Prune is two `end`-index ranges and rewrites only clamped sources. | Not measured on a device. |
+| 54 | Foreground and timer syncs go through the minimum interval and the backoff. A 429 that the client cannot absorb ends the cycle and keeps earlier collections. The deadline is lifted only by a clean cycle. A watch refresh pulls Health and republishes only. | Nothing. |
+| 55 | `.github/workflows/ios.yml` restored (unit, UI, iPad screenshots, watch build, warnings as errors, iOS 18 and newest runtimes). Both failing tests fixed and both compile warnings removed. Documents that describe CI are accurate again. | The workflow has not run. The catalog change is uncommitted, as before. |
+| 56 | Diagnostics are not observed and are built on export; connection state, HRV progress, and pulse-oximeter quality are published only when they change; `lastSeenAt` moves in 15-second steps; the stored-readings count is polled. | Volatile source status (battery, last seen) is still inside the observed `sources` array. |
+| 57 | Legacy compacted-median check starts with a window-boundary test. | Nothing. |
+| 58 | Retention impact and session revisit counts are SQL counts; sessions count only their own sources and metric, with a fingerprint that catches replacement. A baseline from before fingerprints is not compared. | Nothing. |
+| 60 | One `CSV` writer for both exporters; the whole-history and per-source exports neutralise source names and models. | Nothing. |
+| 61 | `HealthKitManager.dateOfBirth(from:)` uses a Gregorian calendar. | Nothing. |
+| 62 | Bluetooth write-back is queued and saved every 30 seconds and at background, with `HKDevice`, a sync identifier and version, a permission check per batch, a bounded queue, and a reported issue. | Nothing. The issue is shown under the Settings toggle. |
+| 63 | The App Group holds a per-metric projection, and timelines reload only when the projection changes. | Nothing. |
+| 64 | One `AsyncStream` per manager, applied by one main-actor task. | Not exercised on hardware. |
+| 65 | `AppModel.init` seams and `TransportActions`; refresh gated on startup; loops hold `self` weakly across sleeps; tests for 42, 43, and 54. | Derived-metric computation is still methods on `AppModel`, not a pure function over reads. Tests for 47 wait for that item. |
+| 67 | Payload dates keep milliseconds. Whole seconds are written exactly as before; both forms decode. | Nothing. |
+| 68 | The types and strings this item names, and every English plural ternary found, use `String(localized:)`; plurals are catalog variations. The tolerance summary no longer compares a localised unit with `"%"`. | Two interval-only strings (`Past N days/hours`) have no plural variation because N is at least 2. |
+| 70 | `Discrepancy` and its engine functions removed, with their four tests moved to the pairwise analysis. Documents corrected. Restore no longer syncs twice. A renamed source keeps its name across syncs. One share-sheet wrapper. | Nothing. |
+| 71 | Cached personal info holds only id and email. Keychain reads distinguish absent, undecodable, and unavailable; only the first two clear. | Nothing. |
+
 ### 42. Apply the saved retention before any prune; never prune on defaulted settings
 
 **Observed behavior**

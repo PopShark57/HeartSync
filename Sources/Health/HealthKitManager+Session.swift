@@ -82,10 +82,9 @@ extension HealthKitManager {
 
         var requestUnnecessary = false
         do {
-            // Local store: avoids needing access to the manager's private `healthStore`.
             // Read types only so a prior read-only Connect still restores; share types are
             // requested separately when mirroring is enabled.
-            let status = try await HKHealthStore().statusForAuthorizationRequest(
+            let status = try await healthStore.statusForAuthorizationRequest(
                 toShare: [],
                 read: Self.readTypes
             )

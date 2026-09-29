@@ -39,7 +39,12 @@ final class OuraManager {
         }
     }
 
-    private enum SyncAbort: Error { case authorization }
+    private enum SyncAbort: Error {
+        case authorization
+        /// Oura asked HeartSync to wait and the client could not absorb the wait inline.
+        /// The rest of the cycle is skipped, and what was fetched before it is still kept.
+        case rateLimited
+    }
 
     private(set) var status: Status = .notConnected
     private(set) var isSyncing = false
@@ -68,6 +73,9 @@ final class OuraManager {
     /// Set when Oura rate-limited this account, so scheduled syncs can wait instead of
     /// walking into the same 429 nineteen more times.
     private(set) var rateLimitedUntil: Date?
+    /// The deadline installed by the cycle running now, if it met a 429. A cycle lifts a
+    /// backoff only by finishing without one; starting a cycle does not.
+    private var cycleRateLimit: Date?
 
     private weak var store: HealthStore?
     private var onReadings: (@MainActor ([Reading], [DataSource], Set<UUID>) -> Bool)?
@@ -81,13 +89,40 @@ final class OuraManager {
     private enum CredentialStorage {
         case keychain
         case memory(OuraOAuthCredential?)
+        case scripted(ScriptedCredentialStore)
     }
     private var credentialStorage: CredentialStorage
+
+    /// A credential store whose reads a test scripts, to exercise the difference between
+    /// "nothing stored" and "Keychain could not be read right now" without a locked device.
+    final class ScriptedCredentialStore {
+        var load: OuraOAuthCredentialStore.Load
+        private(set) var clearCount = 0
+
+        init(_ load: OuraOAuthCredentialStore.Load) { self.load = load }
+
+        func noteCleared() {
+            clearCount += 1
+            load = .absent
+        }
+    }
+
+    /// Set while the stored credential could not be read, and nil once a read succeeds. The
+    /// credential may still exist, so this is never a reason to clear it or to report the
+    /// account as disconnected.
+    private(set) var credentialReadIssue: String?
 
     init(archive: ReadingArchive = .shared, urlSession: URLSession = .shared) {
         self.archive = archive
         self.urlSession = urlSession
         credentialStorage = .keychain
+    }
+
+    /// Narrow test seam for a Keychain that can be made to fail.
+    init(archive: ReadingArchive, urlSession: URLSession, scriptedCredentials: ScriptedCredentialStore) {
+        self.archive = archive
+        self.urlSession = urlSession
+        credentialStorage = .scripted(scriptedCredentials)
     }
 
     /// Narrow test seam for deterministic Oura orchestration tests.
@@ -123,6 +158,11 @@ final class OuraManager {
     /// the UI receives an actionable reconnect state.
     var hasAuthorization: Bool { credential != nil }
 
+    /// Whether an authorization may exist: one is cached, or the Keychain could not be read
+    /// and so cannot say. Schedulers use this, so a locked device does not stop syncing from
+    /// ever being retried.
+    var mayHaveAuthorization: Bool { credential != nil || credentialReadIssue != nil }
+
     var authorizationExpiresAt: Date? { credential?.expiresAt }
 
     /// Nil means Oura did not report scope metadata, not that every scope was denied.
@@ -151,18 +191,41 @@ final class OuraManager {
     /// manager on an unchanged credential.
     @discardableResult
     private func refreshCredentialCache() -> OuraOAuthCredential? {
-        let loaded = storedCredential()
-        if loaded != credential { credential = loaded }
-        return loaded
+        switch readStoredCredential() {
+        case .credential(let loaded):
+            if loaded != credential { credential = loaded }
+            credentialReadIssue = nil
+            return loaded
+        case .absent, .unusable:
+            if credential != nil { credential = nil }
+            credentialReadIssue = nil
+            return nil
+        case .unavailable:
+            // Keychain could not be read; the credential may exist. Keep what is cached and
+            // say why nothing newer is known, rather than treating a locked device as a
+            // signed-out account.
+            credentialReadIssue = Self.credentialUnavailableMessage
+            return credential
+        }
+    }
+
+    private static let credentialUnavailableMessage =
+        "HeartSync could not read your Oura authorization from Keychain just now, for example because the device is locked. It will try again."
+
+    private func readStoredCredential() -> OuraOAuthCredentialStore.Load {
+        switch credentialStorage {
+        case .keychain:
+            OuraOAuthCredentialStore.read()
+        case .memory(let credential):
+            credential.map { .credential($0) } ?? .absent
+        case .scripted(let scripted):
+            scripted.load
+        }
     }
 
     private func storedCredential() -> OuraOAuthCredential? {
-        switch credentialStorage {
-        case .keychain:
-            OuraOAuthCredentialStore.load()
-        case .memory(let credential):
-            credential
-        }
+        if case .credential(let credential) = readStoredCredential() { return credential }
+        return nil
     }
 
     @discardableResult
@@ -172,6 +235,9 @@ final class OuraManager {
             return OuraOAuthCredentialStore.save(credential)
         case .memory:
             credentialStorage = .memory(credential)
+            return true
+        case .scripted(let scripted):
+            scripted.load = .credential(credential)
             return true
         }
     }
@@ -183,6 +249,9 @@ final class OuraManager {
             return OuraOAuthCredentialStore.clear()
         case .memory:
             credentialStorage = .memory(nil)
+            return true
+        case .scripted(let scripted):
+            scripted.noteCleared()
             return true
         }
     }
@@ -202,9 +271,17 @@ final class OuraManager {
 
         // A personal access token from an older build cannot be migrated to OAuth.
         Keychain.delete(.ouraPersonalAccessToken)
-        if let credential = refreshCredentialCache(), credential.isValid() {
+        let stored = readStoredCredential()
+        refreshCredentialCache()
+        switch stored {
+        case .credential(let credential) where credential.isValid():
             status = .connected(email: snapshot.personalInfo?.email)
-        } else {
+        case .unavailable:
+            // Not a verdict on the credential. Clearing here would sign the user out of an
+            // account because the device happened to be locked; leave it alone and retry.
+            status = .error(Self.credentialUnavailableMessage)
+        case .credential, .absent, .unusable:
+            // Expired, absent, or undecodable: there is nothing usable to keep.
             clearStoredCredential()
             refreshCredentialCache()
             status = .notConnected
@@ -277,8 +354,9 @@ final class OuraManager {
     /// makes this a resyncable cache clear; removing it is the explicit "forget imported
     /// history" path.
     func clearCachedData(keepingAuthorization: Bool) async -> Bool {
-        let ids = Set(Self.scalarReadings(from: snapshot).map(\.id))
-        if !ids.isEmpty { _ = store?.remove(readingIDs: ids) }
+        // Every Oura reading, not only those the 14-day dashboard cache still holds: stored
+        // readings now outlive the cache, so its contents no longer name them all.
+        _ = store?.removeReadings(forSource: DataSource.ouraSourceID)
         snapshot = OuraSnapshot()
         endpointIssues.removeAll()
         truncationOutcomes.removeAll()
@@ -304,8 +382,16 @@ final class OuraManager {
     /// `sync()` itself stays unconditional so a user who pulls to refresh always gets a real
     /// attempt; this is the entry point for the repeating timer, where walking into the same
     /// 429 every quarter of an hour only deepens the limit.
-    func syncIfDue(days: Int = 14) async {
+    ///
+    /// - Parameter minimumInterval: skips when the last committed sync is more recent than
+    ///   this. Foreground returns pass the scheduled interval, so opening the app twice in a
+    ///   minute does not repeat a full cycle of requests.
+    func syncIfDue(days: Int = 14, minimumInterval: TimeInterval = 0) async {
         if let rateLimitedUntil, Date.now < rateLimitedUntil { return }
+        if minimumInterval > 0, let lastSyncedAt,
+           Date.now.timeIntervalSince(lastSyncedAt) < minimumInterval {
+            return
+        }
         await sync(days: days)
     }
 
@@ -323,7 +409,7 @@ final class OuraManager {
     func sync(days: Int = 14) async {
         guard !isSyncing else { return }
         guard let credential = refreshCredentialCache() else {
-            status = .notConnected
+            status = credentialReadIssue.map { .error($0) } ?? .notConnected
             return
         }
         guard credential.isValid() else {
@@ -338,11 +424,13 @@ final class OuraManager {
         isSyncing = true
         endpointIssues.removeAll()
         truncationOutcomes.removeAll()
-        // Cleared up front so a cycle that completes without a 429 lifts the backoff, and
-        // one that hits another sets a fresh deadline.
-        rateLimitedUntil = nil
+        // The backoff stays in force while the cycle runs. It is lifted when the cycle ends
+        // without meeting another 429, not when it starts: an explicit sync inside a backoff
+        // is still an attempt, but one that fails again must not have erased the deadline.
+        cycleRateLimit = nil
         defer {
             isSyncing = false
+            rateLimitedUntil = cycleRateLimit
             resetInterruptedEndpointStates()
         }
 
@@ -359,9 +447,15 @@ final class OuraManager {
         let client = OuraClient(accessToken: credential.accessToken, session: urlSession)
         var next = snapshot
         var recordCount = 0
+        var pausedByRateLimit = false
         let fullReconciliationWindow = wantsFullWindow
             ? DateInterval(start: fullStart, end: end)
             : nil
+        /// Readings whose documents Oura itself dropped: cached, dated inside the window that
+        /// a complete full-window response covered, and absent from that response. This is
+        /// the only evidence of withdrawal. A document that merely aged out of the 14-day
+        /// dashboard cache is not withdrawn, and its stored readings belong to retention.
+        var withdrawn: [Reading] = []
 
         /// The narrowest window that still covers everything this collection may not have.
         func start(_ endpoint: OuraEndpoint) -> Date {
@@ -380,6 +474,13 @@ final class OuraManager {
                 recordCount += 1
             }
             if let value = try await load(.heartRate, credential: credential, operation: { try await client.heartRate(from: start(.heartRate), to: end) }) {
+                withdrawn += Self.readings(fromHeartRate: Self.withdrawn(
+                    next.heartRates,
+                    fetched: value.records,
+                    id: { $0.timestamp },
+                    date: { OuraClient.parseTimestamp($0.timestamp) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
+                ))
                 next.heartRates = Self.merged(
                     next.heartRates,
                     with: value.records,
@@ -428,6 +529,13 @@ final class OuraManager {
                 recordCount += value.count
             }
             if let value = try await load(.detailedSleep, credential: credential, operation: { try await client.sleep(from: start(.detailedSleep), to: end) }) {
+                withdrawn += Self.readings(fromSleep: Self.withdrawn(
+                    next.sleeps,
+                    fetched: value.records,
+                    id: { $0.id },
+                    date: { OuraClient.parseTimestamp($0.bedtime_end) ?? OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
+                ))
                 next.sleeps = Self.merged(
                     next.sleeps,
                     with: value.records,
@@ -452,6 +560,13 @@ final class OuraManager {
                 recordCount += value.count
             }
             if let value = try await load(.dailySpO2, credential: credential, operation: { try await client.dailySpO2(from: start(.dailySpO2), to: end) }) {
+                withdrawn += Self.readings(fromSpO2: Self.withdrawn(
+                    next.oxygen,
+                    fetched: value.records,
+                    id: { $0.id },
+                    date: { OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
+                ))
                 next.oxygen = Self.merged(
                     next.oxygen,
                     with: value.records,
@@ -500,6 +615,13 @@ final class OuraManager {
                 recordCount += value.count
             }
             if let value = try await load(.vo2Max, credential: credential, operation: { try await client.vo2Max(from: start(.vo2Max), to: end) }) {
+                withdrawn += Self.readings(fromVO2Max: Self.withdrawn(
+                    next.vo2Max,
+                    fetched: value.records,
+                    id: { $0.id },
+                    date: { OuraClient.parseTimestamp($0.timestamp) ?? OuraClient.parseDay($0.day) },
+                    reconcileWindow: value.isTruncated ? nil : fullReconciliationWindow
+                ))
                 next.vo2Max = Self.merged(
                     next.vo2Max,
                     with: value.records,
@@ -592,6 +714,9 @@ final class OuraManager {
             }
         } catch SyncAbort.authorization {
             return
+        } catch SyncAbort.rateLimited {
+            // Keep what earlier collections returned; the rest waits for the backoff.
+            pausedByRateLimit = true
         } catch {
             logger.error("Unexpected Oura sync abort: \(error.localizedDescription, privacy: .public)")
             return
@@ -606,7 +731,8 @@ final class OuraManager {
                 next.truncatedCollections.remove(endpoint.rawValue)
             }
         }
-        if wantsFullWindow { next.lastFullBackfillAt = end }
+        // A cycle cut short by a rate limit did not cover the window, so it is not a backfill.
+        if wantsFullWindow, !pausedByRateLimit { next.lastFullBackfillAt = end }
 
         let readings = Self.readings(fromHeartRate: next.heartRates)
             + Self.readings(fromSleep: next.sleeps)
@@ -615,7 +741,6 @@ final class OuraManager {
 
         next.fetchedAt = .now
         let previousSnapshot = snapshot
-        let previousReadings = Self.scalarReadings(from: previousSnapshot)
         let cacheWritten = await archive.write(next, to: ReadingArchive.File.ouraDashboard)
         guard cacheWritten else {
             status = .error("Oura returned data, but HeartSync could not save the cache. The previous dashboard and comparison readings were kept.")
@@ -623,7 +748,7 @@ final class OuraManager {
             logger.error("Oura sync received data but the cache write failed")
             return
         }
-        let withdrawnIDs = Set(previousReadings.map(\.id)).subtracting(Set(readings.map(\.id)))
+        let withdrawnIDs = Set(withdrawn.map(\.id)).subtracting(Set(readings.map(\.id)))
         let source = sourceDescriptor(from: next, battery: next.latestBatteryLevel?.level)
         guard onReadings?(readings, [source], withdrawnIDs) == true else {
             let cacheRolledBack = await archive.write(
@@ -646,25 +771,57 @@ final class OuraManager {
         status = .connected(email: next.personalInfo?.email)
         // An incremental cycle fetches only what changed, so "0 records" there means
         // "nothing new", not "nothing held". Say which of the two the number is.
-        let noun = wantsFullWindow ? "Oura record" : "new Oura record"
+        let recordSummary = Self.recordSummary(count: recordCount, isFullWindow: wantsFullWindow)
         if endpointIssues.isEmpty {
-            lastSyncSummary = "\(recordCount) \(noun)\(recordCount == 1 ? "" : "s")"
+            lastSyncSummary = recordSummary
         } else {
             // A truncated collection returned data but not all of it, which is a different
             // claim from a collection that returned nothing. Each truncated endpoint raises
             // exactly one issue, so the two counts partition `endpointIssues`.
             let incomplete = truncationOutcomes.values.filter { $0 }.count
             let unavailable = endpointIssues.count - incomplete
-            var parts = ["\(recordCount) \(noun)\(recordCount == 1 ? "" : "s")"]
+            var parts = [recordSummary]
             if unavailable > 0 {
-                parts.append("\(unavailable) unavailable collection\(unavailable == 1 ? "" : "s")")
+                parts.append(String(
+                    localized: "oura.summary.unavailable",
+                    defaultValue: "\(unavailable) unavailable collections",
+                    comment: "Oura sync summary fragment. The argument is how many collections could not be read."
+                ))
             }
             if incomplete > 0 {
-                parts.append("\(incomplete) incomplete collection\(incomplete == 1 ? "" : "s")")
+                parts.append(String(
+                    localized: "oura.summary.incomplete",
+                    defaultValue: "\(incomplete) incomplete collections",
+                    comment: "Oura sync summary fragment. The argument is how many collections returned only part of their records."
+                ))
             }
-            lastSyncSummary = parts.joined(separator: ", ")
+            if pausedByRateLimit {
+                parts.append(String(
+                    localized: "oura.summary.rateLimited",
+                    defaultValue: "paused by an Oura rate limit",
+                    comment: "Oura sync summary fragment: Oura asked HeartSync to wait, so the rest of the sync was skipped"
+                ))
+            }
+            lastSyncSummary = ListFormatter.localizedString(byJoining: parts)
             logger.warning("Oura partial sync: \(self.endpointIssues.map(\.message).joined(separator: "; "), privacy: .public)")
         }
+    }
+
+    /// "12 Oura records" after a full-window sync, "3 new Oura records" after an incremental
+    /// one, where zero means "nothing new" rather than "nothing held".
+    nonisolated static func recordSummary(count: Int, isFullWindow: Bool) -> String {
+        if isFullWindow {
+            return String(
+                localized: "oura.summary.records.full",
+                defaultValue: "\(count) Oura records",
+                comment: "Oura sync summary after a full-window sync. The argument is how many records were received."
+            )
+        }
+        return String(
+            localized: "oura.summary.records.new",
+            defaultValue: "\(count) new Oura records",
+            comment: "Oura sync summary after an incremental sync. The argument is how many new records were received."
+        )
     }
 
     private func load<T: Sendable>(
@@ -747,6 +904,11 @@ final class OuraManager {
                 message: message,
                 isPermissionIssue: isPermissionIssue
             ))
+            // A 429 that reached this point could not be absorbed by the client. Each
+            // remaining endpoint would meet the same wall and retry inline, so stop.
+            if let failure = error as? OuraClient.Failure, case .rateLimited = failure {
+                throw SyncAbort.rateLimited
+            }
             return nil
         }
     }
@@ -764,7 +926,8 @@ final class OuraManager {
         let requested = retryAfter.map { TimeInterval($0) } ?? Self.defaultRateLimitBackoff
         let wait = min(max(requested, 0), Self.maximumRateLimitBackoff)
         let deadline = Date.now.addingTimeInterval(wait)
-        rateLimitedUntil = max(rateLimitedUntil ?? deadline, deadline)
+        cycleRateLimit = max(cycleRateLimit ?? deadline, deadline)
+        rateLimitedUntil = cycleRateLimit
     }
 
     /// Any endpoint still marked `.syncing` when the sync stops is not in flight — nothing
@@ -834,6 +997,27 @@ final class OuraManager {
                 return stamp >= keepAfter
             }
             .sorted { (date($0) ?? .distantPast) < (date($1) ?? .distantPast) }
+    }
+
+    /// Cached records that a complete full-window response no longer contains.
+    ///
+    /// The same test `merged` applies when it drops a record from the cache, kept apart so
+    /// the caller can name what left the cache because Oura withdrew it. Only a record dated
+    /// inside `reconcileWindow` qualifies; a record that fell out of the cache by age, or an
+    /// incremental or truncated response (`reconcileWindow` nil), withdraws nothing.
+    nonisolated static func withdrawn<T>(
+        _ cached: [T],
+        fetched: [T],
+        id: (T) -> String,
+        date: (T) -> Date?,
+        reconcileWindow: DateInterval?
+    ) -> [T] {
+        guard let reconcileWindow else { return [] }
+        let fetchedIDs = Set(fetched.map(id))
+        return cached.filter { record in
+            guard let stamp = date(record), reconcileWindow.contains(stamp) else { return false }
+            return !fetchedIDs.contains(id(record))
+        }
     }
 
     private static func describe(_ error: any Error, endpoint: String) -> String {
@@ -1151,12 +1335,5 @@ final class OuraManager {
                 provenance: .measured
             )
         }
-    }
-
-    nonisolated private static func scalarReadings(from snapshot: OuraSnapshot) -> [Reading] {
-        readings(fromHeartRate: snapshot.heartRates)
-            + readings(fromSleep: snapshot.sleeps)
-            + readings(fromSpO2: snapshot.oxygen)
-            + readings(fromVO2Max: snapshot.vo2Max)
     }
 }

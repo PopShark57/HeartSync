@@ -270,12 +270,25 @@ struct CompareView: View {
         activeSession = session
         revisitNotice = nil
         Task {
-            // Counted from the same fixed interval the analysis uses, so the disclosure
-            // describes the session's own period rather than the whole database.
-            let outcome = model.store.readingsOutcome(in: session.interval, enabledOnly: false)
-            guard let readings = outcome.value else { return }
-            revisitNotice = session.revisitDisclosure(currentReadingCount: readings.count)
-            await model.sessions.noteViewed(id: session.id, readingCount: readings.count)
+            // Counted from the same fixed interval the analysis uses, restricted to the
+            // session's own sources and metric, so the disclosure describes what the session
+            // compares rather than every device in the database. Counted in SQL: the
+            // readings themselves are not needed.
+            let outcome = model.store.periodSummaryOutcome(
+                interval: session.interval,
+                sourceIDs: Set(session.sourceIDs),
+                kind: session.metric
+            )
+            guard let summary = outcome.value else { return }
+            revisitNotice = session.revisitDisclosure(
+                currentReadingCount: summary.count,
+                currentFingerprint: summary.fingerprint
+            )
+            await model.sessions.noteViewed(
+                id: session.id,
+                readingCount: summary.count,
+                fingerprint: summary.fingerprint
+            )
         }
     }
 
@@ -369,11 +382,19 @@ struct CompareView: View {
                 .font(.subheadline.weight(.semibold))
                 // Names the span actually analysed: with a session open that is the saved
                 // period, not the rolling preset the picker would otherwise imply.
-                Text("\(snapshot.overview.readyCount) ready \(snapshot.overview.readyCount == 1 ? "pair" : "pairs") assessed across \(period.title.lowercased()).")
+                Text(String(
+                    localized: "compare.summary.ready",
+                    defaultValue: "\(snapshot.overview.readyCount) ready pairs assessed across \(period.title.lowercased()).",
+                    comment: "Compare summary. The first argument is how many device pairs have enough evidence, the second the analysed period in lower case."
+                ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if !snapshot.incomplete.isEmpty {
-                    Text("\(snapshot.incomplete.count) additional \(snapshot.incomplete.count == 1 ? "pair still needs" : "pairs still need") more overlap; no conclusion is made for those pairs.")
+                    Text(String(
+                        localized: "compare.summary.additionalIncomplete",
+                        defaultValue: "\(snapshot.incomplete.count) additional pairs still need more overlap; no conclusion is made for those pairs.",
+                        comment: "Compare summary. The argument is how many device pairs lack enough overlapping windows."
+                    ))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -388,7 +409,11 @@ struct CompareView: View {
             // it is counted here rather than being silently folded into a green result.
             if snapshot.overview.suppressedCount > 0 {
                 Label(
-                    "\(snapshot.overview.suppressedCount) further \(snapshot.overview.suppressedCount == 1 ? "pair is" : "pairs are") outside tolerance but below your alert level. Change “Flag disagreements at” in Settings to list \(snapshot.overview.suppressedCount == 1 ? "it" : "them").",
+                    String(
+                        localized: "compare.summary.suppressed",
+                        defaultValue: "\(snapshot.overview.suppressedCount) further pairs are outside tolerance but below your alert level. Change \u{201C}Flag disagreements at\u{201D} in Settings to list them.",
+                        comment: "Compare summary. The argument is how many pairs are outside tolerance but hidden by the alert-level setting. The quoted words are the name of a Settings control."
+                    ),
                     systemImage: "line.3.horizontal.decrease.circle"
                 )
                 .font(.caption)
@@ -412,10 +437,18 @@ struct CompareView: View {
         var extra: [String] = []
         if snapshot.overview.sameDevicePairCount > 0 {
             let count = snapshot.overview.sameDevicePairCount
-            extra.append("\(count) of these \(count == 1 ? "pairs is" : "pairs are") two paths to the same device rather than two independent devices; \(count == 1 ? "it is" : "they are") useful for spotting a sync problem but \(count == 1 ? "does" : "do") not corroborate a measurement.")
+            extra.append(String(
+                localized: "compare.footer.sameDevice",
+                defaultValue: "\(count) of these pairs are two paths to the same device rather than two independent devices; they are useful for spotting a sync problem but do not corroborate a measurement.",
+                comment: "Compare footer. The argument is how many listed pairs are the same physical device seen through two transports."
+            ))
         }
         if hiddenCount > 0 {
-            extra.append("\(hiddenCount) \(hiddenCount == 1 ? "device is" : "devices are") hidden from this comparison. \(hiddenCount == 1 ? "It is" : "They are") still connected and still recording.")
+            extra.append(String(
+                localized: "compare.footer.hidden",
+                defaultValue: "\(hiddenCount) devices are hidden from this comparison. They are still connected and still recording.",
+                comment: "Compare footer. The argument is how many devices the user hid from comparisons."
+            ))
         }
         return ([base] + extra).joined(separator: " ")
     }
@@ -427,10 +460,31 @@ struct CompareView: View {
         }.count
         let collecting = items.count - noOverlap
         switch (noOverlap, collecting) {
-        case (0, 0): return "No eligible device pairs are available."
-        case (0, let count): return "\(count) \(count == 1 ? "pair is" : "pairs are") collecting paired windows; none has reached the five-window minimum."
-        case (let count, 0): return "\(count) \(count == 1 ? "pair has" : "pairs have") no overlapping windows."
-        case (let noOverlap, let collecting): return "\(collecting) \(collecting == 1 ? "pair is" : "pairs are") collecting evidence, and \(noOverlap) \(noOverlap == 1 ? "pair has" : "pairs have") no overlapping windows."
+        case (0, 0):
+            return String(localized: "compare.incomplete.none", defaultValue: "No eligible device pairs are available.", comment: "Compare summary when no device pair can be assessed")
+        case (0, let count):
+            return String(
+                localized: "compare.incomplete.collecting",
+                defaultValue: "\(count) pairs are collecting paired windows; none has reached the five-window minimum.",
+                comment: "Compare summary. The argument is how many pairs are still collecting paired windows."
+            )
+        case (let count, 0):
+            return String(
+                localized: "compare.incomplete.noOverlap",
+                defaultValue: "\(count) pairs have no overlapping windows.",
+                comment: "Compare summary. The argument is how many pairs have no overlapping windows."
+            )
+        case (let noOverlap, let collecting):
+            // Two counts, each agreeing with its own noun, so two sentences rather than one.
+            return String(
+                localized: "compare.incomplete.collectingShort",
+                defaultValue: "\(collecting) pairs are collecting evidence.",
+                comment: "First half of a Compare summary. The argument is how many pairs are still collecting evidence."
+            ) + " " + String(
+                localized: "compare.incomplete.noOverlapShort",
+                defaultValue: "\(noOverlap) pairs have no overlapping windows.",
+                comment: "Second half of a Compare summary. The argument is how many pairs have no overlapping windows."
+            )
         }
     }
 }
@@ -561,7 +615,15 @@ private struct ComparisonSummaryRow: View {
                     ForEach(sourceIDs, id: \.self) { id in
                         SourceDot(color: model.store.source(id: id)?.color ?? .gray, size: 7)
                     }
-                    Text("\(sourceIDs.count) devices · \(analyses.count) \(analyses.count == 1 ? "pair" : "pairs")")
+                    Text(String(
+                        localized: "compare.row.devices",
+                        defaultValue: "\(sourceIDs.count) devices",
+                        comment: "Compare row subtitle, first half. The argument is how many devices report the metric."
+                    ) + " \u{00B7} " + String(
+                        localized: "compare.row.pairs",
+                        defaultValue: "\(analyses.count) pairs",
+                        comment: "Compare row subtitle, second half. The argument is how many device pairs they form."
+                    ))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

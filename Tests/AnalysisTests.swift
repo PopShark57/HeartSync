@@ -160,6 +160,17 @@ struct ComparisonEngineTests {
         #expect(ComparisonEngine.windows(from: readings, kind: .vo2Max, includeEstimated: true)[0].values.count == 2)
     }
 
+    /// The pairwise analysis over an hour that holds the fixtures below.
+    private func pairwise(_ readings: [Reading], _ a: String = "a", _ b: String = "b") -> PairwiseAnalysis {
+        ComparisonEngine.pairwiseAnalysis(
+            from: readings,
+            kind: .heartRate,
+            sourceA: a,
+            sourceB: b,
+            range: DateInterval(start: epoch.addingTimeInterval(-1), end: epoch.addingTimeInterval(3_600))
+        )
+    }
+
     @Test("A consistent offset is reported as systematic bias")
     func detectsSystematicBias() throws {
         // Six windows where a reads 8 bpm below b, every time.
@@ -169,15 +180,15 @@ struct ComparisonEngineTests {
             readings.append(reading("a", 70, offset: offset))
             readings.append(reading("b", 78, offset: offset + 5))
         }
-        let found = ComparisonEngine.discrepancies(from: readings, kind: .heartRate)
-        let discrepancy = try #require(found.first)
+        let analysis = pairwise(readings)
+        let statistics = try #require(analysis.statistics)
 
-        #expect(discrepancy.windowCount == 6)
-        #expect(abs(discrepancy.meanBias + 8) < 1e-9)          // a minus b
-        #expect(abs(discrepancy.meanAbsoluteDifference - 8) < 1e-9)
-        #expect(discrepancy.differenceSD == 0)
-        #expect(discrepancy.isSystematicBias)
-        #expect(discrepancy.severity == .notable)
+        #expect(analysis.pairedWindowCount == 6)
+        #expect(abs(statistics.meanBias + 8) < 1e-9)          // a minus b
+        #expect(abs(statistics.meanAbsoluteDifference - 8) < 1e-9)
+        #expect(statistics.differenceSD == 0)
+        #expect(statistics.classification == .systematicBias)
+        #expect(statistics.severity == .notable)
     }
 
     @Test("Alternating differences are reported as noise, not bias")
@@ -188,10 +199,10 @@ struct ComparisonEngineTests {
             readings.append(reading("a", 70, offset: offset))
             readings.append(reading("b", index.isMultiple(of: 2) ? 78 : 62, offset: offset + 5))
         }
-        let discrepancy = try #require(ComparisonEngine.discrepancies(from: readings, kind: .heartRate).first)
-        #expect(abs(discrepancy.meanBias) < 1e-9)              // cancels out
-        #expect(abs(discrepancy.meanAbsoluteDifference - 8) < 1e-9)
-        #expect(!discrepancy.isSystematicBias)
+        let statistics = try #require(pairwise(readings).statistics)
+        #expect(abs(statistics.meanBias) < 1e-9)              // cancels out
+        #expect(abs(statistics.meanAbsoluteDifference - 8) < 1e-9)
+        #expect(statistics.classification == .measurementNoise)
     }
 
     @Test("A pair needs enough overlapping windows before it is called a disagreement")
@@ -203,7 +214,7 @@ struct ComparisonEngineTests {
             readings.append(reading("b", 90, offset: offset + 5))
         }
         // Three coincidences are not a pattern.
-        #expect(ComparisonEngine.discrepancies(from: readings, kind: .heartRate).isEmpty)
+        #expect(pairwise(readings).statistics == nil)
     }
 
     @Test("Pair keys are canonical, so A\u{2013}B and B\u{2013}A are one relationship")
@@ -220,7 +231,11 @@ struct ComparisonEngineTests {
                 readings.append(reading("zulu", 78, offset: offset + 5))
             }
         }
-        let found = ComparisonEngine.discrepancies(from: readings, kind: .heartRate)
+        let found = ComparisonEngine.allPairwiseAnalyses(
+            from: readings,
+            kind: .heartRate,
+            range: DateInterval(start: epoch.addingTimeInterval(-1), end: epoch.addingTimeInterval(3_600))
+        )
         #expect(found.count == 1)
         #expect(found[0].sourceA == "alpha")
         #expect(found[0].sourceB == "zulu")

@@ -120,10 +120,14 @@ enum WatchChartProjection {
     static func periodText(_ lookback: TimeInterval) -> String {
         if lookback >= 86_400 {
             let days = Int((lookback / 86_400).rounded())
-            return days == 1 ? "Past day" : "Past \(days) days"
+            return days == 1
+                ? String(localized: "watch.period.pastDay", defaultValue: "Past day", comment: "Watch comparison period: one day")
+                : String(localized: "watch.period.pastDays", defaultValue: "Past \(days) days", comment: "Watch comparison period. The argument is the number of days, at least two.")
         }
         let hours = Int((lookback / 3_600).rounded())
-        return hours <= 1 ? "Past hour" : "Past \(hours) hours"
+        return hours <= 1
+            ? String(localized: "watch.period.pastHour", defaultValue: "Past hour", comment: "Watch comparison period: one hour")
+            : String(localized: "watch.period.pastHours", defaultValue: "Past \(hours) hours", comment: "Watch comparison period. The argument is the number of hours, at least two.")
     }
 
     /// A signed figure in the metric's precision plus one decimal, so small biases stay
@@ -141,7 +145,11 @@ enum WatchChartProjection {
             guard let latest = series.values.last,
                   let low = series.values.min(), let high = series.values.max()
             else { continue }
-            let windows = series.values.count == 1 ? "1 window" : "\(series.values.count) windows"
+            let windows = String(
+                localized: "watch.spoken.windows",
+                defaultValue: "\(series.values.count) windows",
+                comment: "Spoken description of a wrist chart series. The argument is how many comparison windows it holds."
+            )
             let range = low == high ? kind.formatWithUnit(low) : "\(kind.format(low)) to \(kind.formatWithUnit(high))"
             let estimate = series.isEstimated ? ", estimate" : ""
             parts.append("\(series.sourceName)\(estimate): \(windows), \(range), latest \(kind.formatWithUnit(latest)).")

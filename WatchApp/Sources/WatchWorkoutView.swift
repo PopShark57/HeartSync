@@ -21,7 +21,7 @@ struct WatchWorkoutView: View {
                 Section("Start a workout") {
                     Picker("Activity", selection: $activity) {
                         ForEach(WatchWorkoutActivity.allCases) { activity in
-                            Text(activity.rawValue).tag(activity)
+                            Text(activity.title).tag(activity)
                         }
                     }
                     if activity != .other { Toggle("Indoors", isOn: $indoors) }

@@ -131,14 +131,14 @@ enum PairwiseExporter {
         sourceB: SourceDescriptor,
         formatting: ExportFormatting
     ) -> String {
-        var rows = [csvColumns.map(csvEscape).joined(separator: ",")]
+        var rows = [csvColumns.map(CSV.escape).joined(separator: ",")]
         rows.reserveCapacity(analysis.observations.count + 1)
 
         for observation in analysis.observations {
-            let sourceAName = safeSpreadsheetMetadata(sourceA.name)
-            let sourceAModel = safeSpreadsheetMetadata(sourceA.model)
-            let sourceBName = safeSpreadsheetMetadata(sourceB.name)
-            let sourceBModel = safeSpreadsheetMetadata(sourceB.model)
+            let sourceAName = CSV.spreadsheetSafe(sourceA.name)
+            let sourceAModel = CSV.spreadsheetSafe(sourceA.model)
+            let sourceBName = CSV.spreadsheetSafe(sourceB.name)
+            let sourceBModel = CSV.spreadsheetSafe(sourceB.model)
             // Appended one at a time: a single 32-element heterogeneous literal
             // exceeds what the type checker will solve in reasonable time.
             var fields: [String] = []
@@ -177,52 +177,12 @@ enum PairwiseExporter {
             fields.append(observation.sourceB.observedInterval.map { formatting.iso8601UTC($0.end) } ?? "")
             fields.append(observation.timingSeparation.map(decimal) ?? "")
             fields.append(observation.timing.rawValue)
-            rows.append(fields.map(csvEscape).joined(separator: ","))
+            rows.append(fields.map(CSV.escape).joined(separator: ","))
         }
 
         // RFC 4180 uses CRLF records. A final record delimiter also makes command-line
         // tools handle the last row consistently.
         return rows.joined(separator: "\r\n") + "\r\n"
-    }
-
-    /// Quotes a field when RFC 4180 requires it.
-    ///
-    /// The scan is over unicode scalars rather than `Character`s: Swift merges CR LF into
-    /// one grapheme cluster, so `field.contains("\r")` is false for "a\r\nb" and the raw
-    /// line break would be written unquoted, splitting one record into two.
-    private static func csvEscape(_ field: String) -> String {
-        let needsQuoting = field.unicodeScalars.contains { scalar in
-            scalar == "," || scalar == "\"" || scalar == "\r" || scalar == "\n"
-        }
-        guard needsQuoting else { return field }
-        return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
-    }
-
-    /// Makes free-form source metadata literal in spreadsheet applications before RFC 4180
-    /// quoting runs. A leading apostrophe is the portable spreadsheet convention for text; it
-    /// remains part of the CSV cell rather than relying on a viewer-specific formula policy.
-    /// Non-record control characters are replaced with spaces so metadata cannot make the CSV
-    /// non-conforming even when a peripheral or HealthKit writer supplies a tab or C0/C1 byte.
-    private static func safeSpreadsheetMetadata(_ field: String) -> String {
-        let sanitized = field.unicodeScalars.map { scalar -> String in
-            if scalar == "\r" || scalar == "\n" {
-                return String(scalar)
-            }
-            return CharacterSet.controlCharacters.contains(scalar) ? " " : String(scalar)
-        }.joined()
-
-        for scalar in sanitized.unicodeScalars {
-            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
-                continue
-            }
-            switch scalar {
-            case "=", "+", "-", "@":
-                return "'" + sanitized
-            default:
-                return sanitized
-            }
-        }
-        return sanitized
     }
 
     // MARK: - Text summary

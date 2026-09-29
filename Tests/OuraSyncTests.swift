@@ -726,10 +726,14 @@ struct OuraSyncOrchestrationTests {
             #expect(deadline.timeIntervalSince(began) < 200)
             #expect(manager.nextAutomaticSyncAllowedAt == deadline)
 
-            // A 429 on one collection does not cascade: the remaining eighteen were still
-            // asked for, and one limited endpoint is not an excuse to stop syncing.
-            #expect(manager.state(for: .workouts).isComplete)
+            // A 429 the client could not absorb ends the cycle: every later endpoint would
+            // meet the same wall and retry inline. Collections fetched before it were kept
+            // and the ones after it were never asked for.
+            #expect(manager.state(for: .heartRate).isComplete)
             #expect(ouraIsFailed(manager.state(for: .dailyStress)))
+            #expect(manager.state(for: .workouts) == .idle)
+            let requestedPaths = OuraStubServer.shared.requests.compactMap { $0.url?.path }
+            #expect(!requestedPaths.contains { $0.hasSuffix("/workout") })
 
             // One cycle cannot spin: nineteen collections, at most three attempts each.
             #expect(OuraStubServer.shared.requests.count <= OuraEndpoint.allCases.count * 3)
@@ -773,6 +777,252 @@ struct OuraSyncOrchestrationTests {
             #expect(manager.nextAutomaticSyncAllowedAt == nil)
             #expect(manager.status.isConnected)
         }
+    }
+
+    @Test("A record that ages out of the dashboard cache keeps its stored readings")
+    func agedOutRecordsAreNotWithdrawn() async throws {
+        let now = Date.now
+        let twentyDaysAgo = now.addingTimeInterval(-20 * 86_400)
+        var seeded = OuraSnapshot()
+        seeded.fetchedAt = now.addingTimeInterval(-25 * 3_600)
+        seeded.lastFullBackfillAt = now.addingTimeInterval(-25 * 3_600)
+        seeded.sleeps = [
+            OuraClient.SleepDocument(
+                id: "aged-night", day: ouraUTCDayString(twentyDaysAgo),
+                bedtime_start: nil, bedtime_end: nil,
+                average_hrv: 41, average_heart_rate: nil, lowest_heart_rate: 52, average_breath: nil
+            ),
+        ]
+        let agedReadings = OuraManager.readings(fromSleep: seeded.sleeps)
+        #expect(agedReadings.count == 2)
+
+        // A full-window response that does not contain it, 20 days after it was stored.
+        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, store in
+            store.upsert(DataSource(id: DataSource.ouraSourceID, displayName: "Oura Ring", transport: .oura))
+            store.upsert(contentsOf: agedReadings)
+            await manager.sync(days: 14)
+
+            // It left the 14-day dashboard cache by age...
+            #expect(manager.snapshot.sleeps.isEmpty)
+            // ...which is not Oura withdrawing it. Retention alone decides when it goes.
+            #expect(Set(store.readings.map(\.id)) == Set(agedReadings.map(\.id)))
+        }
+    }
+
+    @Test("A record inside the window that a complete response omits is still withdrawn")
+    func withdrawalInsideTheWindowStillWorks() async throws {
+        let now = Date.now
+        var seeded = OuraSnapshot()
+        seeded.fetchedAt = now.addingTimeInterval(-25 * 3_600)
+        seeded.lastFullBackfillAt = now.addingTimeInterval(-25 * 3_600)
+        seeded.sleeps = [
+            OuraClient.SleepDocument(
+                id: "withdrawn-night", day: ouraUTCDayString(now.addingTimeInterval(-2 * 86_400)),
+                bedtime_start: nil, bedtime_end: nil,
+                average_hrv: 41, average_heart_rate: nil, lowest_heart_rate: 52, average_breath: nil
+            ),
+        ]
+        let readings = OuraManager.readings(fromSleep: seeded.sleeps)
+
+        try await withOuraSyncHarness(seeded: seeded, responding: ouraEmptyCollections) { manager, store in
+            store.upsert(DataSource(id: DataSource.ouraSourceID, displayName: "Oura Ring", transport: .oura))
+            store.upsert(contentsOf: readings)
+            await manager.sync(days: 14)
+
+            #expect(manager.snapshot.sleeps.isEmpty)
+            #expect(store.readings.isEmpty)
+        }
+    }
+
+    @Test("Withdrawal is only inferred from a full window: an incremental response removes nothing")
+    func incrementalResponsesWithdrawNothing() {
+        let window = DateInterval(start: Date(timeIntervalSince1970: 1_000), end: Date(timeIntervalSince1970: 2_000))
+        let cached = ["a", "b"]
+        let date: (String) -> Date? = { _ in Date(timeIntervalSince1970: 1_500) }
+        #expect(OuraManager.withdrawn(cached, fetched: ["a"], id: { $0 }, date: date, reconcileWindow: nil).isEmpty)
+        #expect(OuraManager.withdrawn(cached, fetched: ["a"], id: { $0 }, date: date, reconcileWindow: window) == ["b"])
+        // Dated outside the window: never withdrawn, whatever the response holds.
+        let old: (String) -> Date? = { _ in Date(timeIntervalSince1970: 100) }
+        #expect(OuraManager.withdrawn(cached, fetched: [], id: { $0 }, date: old, reconcileWindow: window).isEmpty)
+    }
+
+    @Test("A 429 ends the cycle but keeps what earlier collections returned")
+    func rateLimitKeepsEarlierCollections() async throws {
+        let now = Date.now
+        let stamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-600))
+        let handler: @Sendable (URLRequest) -> OuraStubReply = { request in
+            let path = request.url?.path ?? ""
+            if path.hasSuffix("/heartrate") {
+                return .json(#"{"data":[{"bpm":61,"source":"rest","timestamp":"\#(stamp)"}],"next_token":null}"#)
+            }
+            if path.hasSuffix("/daily_stress") {
+                return .json(#"{"status":429}"#, status: 429, headers: ["Retry-After": "600"])
+            }
+            return ouraEmptyCollections(request)
+        }
+
+        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager, store in
+            await manager.sync(days: 14)
+
+            #expect(manager.snapshot.heartRates.count == 1)
+            #expect(store.readings(kind: .heartRate, enabledOnly: false).count == 1)
+            #expect(manager.state(for: .workouts) == .idle)
+            // Not a backfill: the window was not fully covered.
+            #expect(manager.snapshot.lastFullBackfillAt == nil)
+            #expect(manager.lastSyncSummary?.contains("rate limit") == true)
+            #expect(manager.rateLimitedUntil != nil)
+        }
+    }
+
+    @Test("An explicit sync inside a backoff that meets another 429 keeps a deadline")
+    func startingACycleDoesNotEraseTheBackoff() async throws {
+        let handler: @Sendable (URLRequest) -> OuraStubReply = { request in
+            if request.url?.path.hasSuffix("/heartrate") == true {
+                return .json(#"{"status":429}"#, status: 429, headers: ["Retry-After": "900"])
+            }
+            return ouraEmptyCollections(request)
+        }
+        try await withOuraSyncHarness(seeded: nil, responding: handler) { manager, _ in
+            await manager.sync(days: 14)
+            let first = try #require(manager.rateLimitedUntil)
+
+            await manager.sync(days: 14)
+            let second = try #require(manager.rateLimitedUntil)
+            #expect(second >= first)
+        }
+    }
+
+    @Test("An unattended sync inside the minimum interval makes no requests")
+    func minimumIntervalSkipsUnattendedSyncs() async throws {
+        try await withOuraSyncHarness(seeded: nil, responding: ouraEmptyCollections) { manager, _ in
+            await manager.sync(days: 14)
+            let afterFirst = OuraStubServer.shared.requests.count
+            #expect(afterFirst > 0)
+
+            await manager.syncIfDue(minimumInterval: 900)
+            #expect(OuraStubServer.shared.requests.count == afterFirst)
+
+            // No interval asked for: it runs.
+            await manager.syncIfDue(minimumInterval: 0)
+            #expect(OuraStubServer.shared.requests.count > afterFirst)
+        }
+    }
+
+    @Test("Forgetting imported history removes every stored Oura reading, not only the cached ones")
+    func clearRemovesReadingsOlderThanTheCache() async throws {
+        let now = Date.now
+        try await withOuraSyncHarness(seeded: nil, responding: ouraEmptyCollections) { manager, store in
+            store.upsert(DataSource(id: DataSource.ouraSourceID, displayName: "Oura Ring", transport: .oura))
+            store.upsert(DataSource(id: "strap", displayName: "Strap", transport: .bluetooth))
+            // Neither is in the (empty) dashboard cache, as after aging out.
+            store.upsert(contentsOf: [Reading(
+                sourceID: DataSource.ouraSourceID, kind: .restingHeartRate, value: 50,
+                start: now.addingTimeInterval(-25 * 86_400)
+            )])
+            store.append(Reading(sourceID: "strap", kind: .heartRate, value: 60, start: now.addingTimeInterval(-60)))
+
+            #expect(await manager.clearCachedData(keepingAuthorization: true))
+
+            #expect(store.readings.map(\.sourceID) == ["strap"])
+        }
+    }
+}
+
+// MARK: - Keychain reads
+
+@Suite("Oura credential reads distinguish absent from unavailable")
+@MainActor
+struct OuraCredentialReadTests {
+
+    private func makeManager(_ scripted: OuraManager.ScriptedCredentialStore) -> OuraManager {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("oura-cred-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return OuraManager(
+            archive: ReadingArchive(directory: folder),
+            urlSession: .shared,
+            scriptedCredentials: scripted
+        )
+    }
+
+    private var valid: OuraOAuthCredential {
+        OuraOAuthCredential(
+            accessToken: "scripted-token",
+            expiresAt: Date.now.addingTimeInterval(86_400),
+            grantedScopes: Set(OuraOAuthSession.requestedScopes),
+            scopeFieldWasReturned: true
+        )
+    }
+
+    private func configure(_ manager: OuraManager) async {
+        await manager.configure(store: HealthStore(persistenceEnabled: false), onReadings: { _, _, _ in true })
+    }
+
+    @Test("A Keychain that cannot be read does not clear the credential or sign the user out")
+    func unavailableKeychainKeepsTheAccount() async {
+        let scripted = OuraManager.ScriptedCredentialStore(.unavailable(-25308))
+        let manager = makeManager(scripted)
+        await configure(manager)
+
+        #expect(scripted.clearCount == 0)
+        #expect(manager.mayHaveAuthorization)
+        #expect(manager.credentialReadIssue != nil)
+        if case .error(let message) = manager.status {
+            #expect(message.contains("Keychain"))
+        } else {
+            Issue.record("Expected a retryable error, not \(manager.status)")
+        }
+
+        // The device unlocks; the same manager recovers without re-authorizing.
+        scripted.load = .credential(valid)
+        await configure(manager)
+        #expect(manager.hasAuthorization)
+        #expect(manager.credentialReadIssue == nil)
+        #expect(manager.status.isConnected)
+        #expect(scripted.clearCount == 0)
+    }
+
+    @Test("An unavailable read after a good one keeps the cached credential")
+    func cachedCredentialSurvivesATransientFailure() async {
+        let scripted = OuraManager.ScriptedCredentialStore(.credential(valid))
+        let manager = makeManager(scripted)
+        await configure(manager)
+        #expect(manager.hasAuthorization)
+
+        scripted.load = .unavailable(-25308)
+        await configure(manager)
+
+        #expect(manager.hasAuthorization)
+        #expect(scripted.clearCount == 0)
+    }
+
+    @Test("Nothing stored, an undecodable item, and an expired token are cleared as before")
+    func definitiveAnswersStillClear() async {
+        for load in [
+            OuraOAuthCredentialStore.Load.absent,
+            .unusable,
+            .credential(OuraOAuthCredential(
+                accessToken: "old", expiresAt: Date.now.addingTimeInterval(-60),
+                grantedScopes: [], scopeFieldWasReturned: false
+            )),
+        ] {
+            let scripted = OuraManager.ScriptedCredentialStore(load)
+            let manager = makeManager(scripted)
+            await configure(manager)
+            #expect(scripted.clearCount == 1, "\(load)")
+            #expect(manager.status == .notConnected)
+            #expect(!manager.hasAuthorization)
+        }
+    }
+
+    @Test("Cached account data no longer includes body measurements")
+    func personalInfoIsMinimal() throws {
+        let response = Data(#"{"id":"u1","age":41,"weight":72.5,"height":1.8,"biological_sex":"male","email":"a@example.com"}"#.utf8)
+        let decoded = try JSONDecoder().decode(OuraClient.PersonalInfo.self, from: response)
+        #expect(decoded.email == "a@example.com")
+        let stored = try #require(String(data: JSONEncoder().encode(decoded), encoding: .utf8))
+        #expect(!stored.contains("weight"))
+        #expect(!stored.contains("height"))
+        #expect(!stored.contains("age"))
     }
 }
 

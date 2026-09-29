@@ -38,7 +38,17 @@ enum Keychain {
         return false
     }
 
-    static func get(_ key: Key) -> String? {
+    /// What a Keychain read found. "Nothing there" and "could not look" are different facts:
+    /// the second is transient (the device is locked, or Keychain is briefly unavailable), and
+    /// treating it as the first signs a user out of an account they are still signed in to.
+    enum Lookup: Equatable, Sendable {
+        case found(String)
+        case notFound
+        /// The read failed with this `OSStatus`. The item may well exist.
+        case unavailable(OSStatus)
+    }
+
+    static func lookup(_ key: Key) -> Lookup {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -47,10 +57,26 @@ enum Keychain {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data
-        else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data, let text = String(data: data, encoding: .utf8) else {
+                // Present but not text: corrupt, not merely unreadable right now.
+                return .notFound
+            }
+            return .found(text)
+        case errSecItemNotFound:
+            return .notFound
+        default:
+            return .unavailable(status)
+        }
+    }
+
+    /// The stored value, or nil for every failure. Only for callers that cannot act on the
+    /// difference; anything that clears state on nil must use `lookup`.
+    static func get(_ key: Key) -> String? {
+        if case .found(let value) = lookup(key) { return value }
+        return nil
     }
 
     @discardableResult

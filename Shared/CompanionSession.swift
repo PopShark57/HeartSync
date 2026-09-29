@@ -13,7 +13,7 @@ final class CompanionSession: NSObject, WCSessionDelegate {
     private(set) var isReachable = false
     private(set) var isInstalled = false
     private(set) var isRequesting = false
-    private(set) var status = "Connecting to iPhone…"
+    private(set) var status = String(localized: "companion.status.connecting", defaultValue: "Connecting to iPhone\u{2026}", comment: "Watch connection status")
 
     @ObservationIgnored var onRefresh: (@MainActor () -> Void)?
     @ObservationIgnored var onActivation: (@MainActor () -> Void)?
@@ -30,7 +30,7 @@ final class CompanionSession: NSObject, WCSessionDelegate {
             return
         }
         guard WCSession.isSupported() else {
-            status = "Companion sync is unavailable on this device."
+            status = String(localized: "companion.status.unsupported", defaultValue: "Companion sync is unavailable on this device.", comment: "Watch connection status")
             return
         }
         let session = WCSession.default
@@ -61,11 +61,11 @@ final class CompanionSession: NSObject, WCSessionDelegate {
         isInstalled = session.isCompanionAppInstalled
         #endif
         if !isInstalled {
-            status = "Install HeartSync on the paired device."
+            status = String(localized: "companion.status.notInstalled", defaultValue: "Install HeartSync on the paired device.", comment: "Watch connection status")
         } else if isReachable {
-            status = "iPhone available"
+            status = String(localized: "companion.status.available", defaultValue: "iPhone available", comment: "Watch connection status: the iPhone can be reached")
         } else {
-            status = "Open HeartSync on iPhone to refresh."
+            status = String(localized: "companion.status.unreachable", defaultValue: "Open HeartSync on iPhone to refresh.", comment: "Watch connection status")
         }
     }
 
@@ -76,7 +76,7 @@ final class CompanionSession: NSObject, WCSessionDelegate {
         do {
             try session.updateApplicationContext([WatchSnapshot.contextKey: try snapshot.encoded()])
         } catch {
-            status = "Companion update could not be queued."
+            status = String(localized: "companion.status.publishFailed", defaultValue: "Companion update could not be queued.", comment: "Watch connection status")
         }
     }
     #endif
@@ -96,19 +96,19 @@ final class CompanionSession: NSObject, WCSessionDelegate {
         updateConnection()
         guard let session, isReachable, !isRequesting else { return }
         isRequesting = true
-        status = "Requesting iPhone update…"
+        status = String(localized: "companion.status.requesting", defaultValue: "Requesting iPhone update\u{2026}", comment: "Watch connection status")
         requestTimeout?.cancel()
         requestTimeout = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(20)) } catch { return }
             guard let self else { return }
             self.isRequesting = false
-            self.status = "No update yet. Open HeartSync on iPhone and try again."
+            self.status = String(localized: "companion.status.noUpdate", defaultValue: "No update yet. Open HeartSync on iPhone and try again.", comment: "Watch connection status")
         }
         session.sendMessage([WatchSnapshot.refreshKey: true], replyHandler: nil) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.requestTimeout?.cancel()
                 self?.isRequesting = false
-                self?.status = "iPhone could not be reached. Try again when connected."
+                self?.status = String(localized: "companion.status.sendFailed", defaultValue: "iPhone could not be reached. Try again when connected.", comment: "Watch connection status")
             }
         }
     }
@@ -121,11 +121,13 @@ final class CompanionSession: NSObject, WCSessionDelegate {
             onSnapshotReceived?(incoming)
             isRequesting = false
             requestTimeout?.cancel()
-            status = incoming.availability == .ready ? "Updated from iPhone" : "Unlock iPhone and open HeartSync."
+            status = incoming.availability == .ready
+                ? String(localized: "companion.status.updated", defaultValue: "Updated from iPhone", comment: "Watch connection status: a snapshot arrived")
+                : String(localized: "companion.status.locked", defaultValue: "Unlock iPhone and open HeartSync.", comment: "Watch connection status: the iPhone could not build a snapshot")
         } catch {
             isRequesting = false
             requestTimeout?.cancel()
-            status = "Update both HeartSync apps to sync. The last readable snapshot is shown."
+            status = String(localized: "companion.status.incompatible", defaultValue: "Update both HeartSync apps to sync. The last readable snapshot is shown.", comment: "Watch connection status")
         }
     }
 

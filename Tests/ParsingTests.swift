@@ -138,6 +138,67 @@ struct ParsingTests {
         #expect(measurement.quality(for: .continuous) == .invalid([.sensorDisconnected]))
     }
 
+    @Test("A continuous PLX frame cut off inside any flagged field is rejected")
+    func plxContinuousTruncatedFlaggedFields() throws {
+        let base: [UInt8] = [0x61, 0x00, 0x48, 0x00]
+        // Each row: the flags, the bytes the flags declare, and that a frame missing the
+        // last byte of them is malformed while the complete frame still parses.
+        let vectors: [(name: String, flags: UInt8, fields: [UInt8])] = [
+            ("fast pair", 0x01, [0x62, 0x00, 0x4A, 0x00]),
+            ("slow pair", 0x02, [0x62, 0x00, 0x4A, 0x00]),
+            ("measurement status", 0x04, [0x00, 0x00]),
+            ("device and sensor status", 0x08, [0x00, 0x00, 0x00]),
+            ("pulse amplitude index", 0x10, [0x0A, 0x00]),
+        ]
+        for vector in vectors {
+            let complete = Data([vector.flags] + base + vector.fields)
+            #expect(PulseOximeterMeasurement.continuous(data: complete) != nil, "\(vector.name) complete")
+            for cut in 1...vector.fields.count {
+                let truncated = Data([vector.flags] + base + vector.fields.dropLast(cut))
+                #expect(
+                    PulseOximeterMeasurement.continuous(data: truncated) == nil,
+                    "\(vector.name) missing \(cut) byte(s)"
+                )
+            }
+        }
+    }
+
+    @Test("A spot-check PLX frame cut off inside any flagged field is rejected")
+    func plxSpotCheckTruncatedFlaggedFields() throws {
+        let base: [UInt8] = [0x61, 0x00, 0x48, 0x00]
+        let vectors: [(name: String, flags: UInt8, fields: [UInt8])] = [
+            ("timestamp", 0x01, [0xE8, 0x07, 0x03, 0x05, 0x0E, 0x1E, 0x00]),
+            ("measurement status", 0x02, [0x00, 0x00]),
+            ("device and sensor status", 0x04, [0x00, 0x00, 0x00]),
+            ("pulse amplitude index", 0x08, [0x0A, 0x00]),
+        ]
+        for vector in vectors {
+            let complete = Data([vector.flags] + base + vector.fields)
+            #expect(PulseOximeterMeasurement.spotCheck(data: complete) != nil, "\(vector.name) complete")
+            for cut in 1...vector.fields.count {
+                let truncated = Data([vector.flags] + base + vector.fields.dropLast(cut))
+                #expect(
+                    PulseOximeterMeasurement.spotCheck(data: truncated) == nil,
+                    "\(vector.name) missing \(cut) byte(s)"
+                )
+            }
+        }
+    }
+
+    @Test("A clear PLX flag leaves its field absent without rejecting the frame")
+    func plxAbsentFieldsStayValid() throws {
+        let continuous = try #require(PulseOximeterMeasurement.continuous(
+            data: Data([0x00, 0x61, 0x00, 0x48, 0x00])
+        ))
+        #expect(continuous.measurementStatus == nil)
+        #expect(continuous.deviceAndSensorStatus == nil)
+        // A reserved SFLOAT value (NaN, 0x07FF) in a declared amplitude field is present data.
+        let nanAmplitude = try #require(PulseOximeterMeasurement.continuous(
+            data: Data([0x10, 0x61, 0x00, 0x48, 0x00, 0xFF, 0x07])
+        ))
+        #expect(nanAmplitude.pulseAmplitudeIndex == nil)
+    }
+
     @Test("Spot-check PLX parses a device timestamp")
     func plxSpotCheckTimestamp() throws {
         // flags 0x01 -> timestamp present. 2024-03-05 14:30:00.

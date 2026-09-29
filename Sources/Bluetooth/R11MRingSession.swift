@@ -634,8 +634,12 @@ struct R11MRingSession: Equatable, Sendable {
                 "The request could not be sent: \(error)"
             case .timedOut(let packets):
                 packets == 0
-                    ? "No measurement packets received after starting measurement."
-                    : "The ring sent \(packets) live value\(packets == 1 ? "" : "s") but never finished the measurement."
+                    ? String(localized: "ring.timeout.silent", defaultValue: "No measurement packets received after starting measurement.", comment: "Ring measurement failure: the ring sent nothing")
+                    : String(
+                        localized: "ring.timeout.unfinished",
+                        defaultValue: "The ring sent \(packets) live values but never finished the measurement.",
+                        comment: "Ring measurement failure. The argument is how many live values arrived."
+                    )
             case .unrecognizedResult(let result):
                 "The ring finished with an unrecognized result (\(String(format: "%02X", result)))."
             case .cancelled:
@@ -660,11 +664,19 @@ struct R11MRingSession: Equatable, Sendable {
     /// change what the user should do.
     private static func historyText(_ summary: HistorySummary) -> String {
         var parts = [summary.imported == 0
-            ? "The ring had no stored readings to import."
+            ? String(localized: "ring.history.none", defaultValue: "The ring had no stored readings to import.", comment: "Ring history import result: nothing was stored")
             // Counted before the store drops ones already imported, so "read", not "added".
-            : "Read \(summary.imported) stored value\(summary.imported == 1 ? "" : "s")."]
+            : String(
+                localized: "ring.history.read",
+                defaultValue: "Read \(summary.imported) stored values.",
+                comment: "Ring history import result. The argument is how many stored values were read."
+            )]
         if summary.skipped > 0 {
-            parts.append("\(summary.skipped) skipped (old, future, or clock not set).")
+            parts.append(String(
+                localized: "ring.history.skipped",
+                defaultValue: "\(summary.skipped) skipped (old, future, or clock not set).",
+                comment: "Ring history import result. The argument is how many stored values were skipped."
+            ))
         }
         if !summary.failed.isEmpty {
             parts.append("Not read: \(summary.failed.map(\.title).joined(separator: ", ")).")

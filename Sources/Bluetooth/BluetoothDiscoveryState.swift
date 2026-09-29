@@ -123,14 +123,22 @@ enum PeripheralConnectionState: Equatable, Sendable {
             String(localized: "peripheral.state.discoveringServices", defaultValue: "Reading services\u{2026}", comment: "Bluetooth device status: discovering GATT services after connecting")
         case .enablingNotifications(let kinds):
             kinds.isEmpty
-                ? "Enabling notifications\u{2026}"
-                : "Enabling \(kinds.count) metric\(kinds.count == 1 ? "" : "s")\u{2026}"
+                ? String(localized: "peripheral.state.enablingNotifications", defaultValue: "Enabling notifications\u{2026}", comment: "Bluetooth device status: subscribing to measurement notifications")
+                : String(
+                    localized: "peripheral.state.enablingMetrics",
+                    defaultValue: "Enabling \(kinds.count) metrics\u{2026}",
+                    comment: "Bluetooth device status. The argument is how many metrics are being enabled."
+                )
         case .ready(let kinds, let warning):
             // The count is subscription capability, not received values. Heart rate counts
             // once: HRV is derived and appears only after real R\u{2013}R intervals arrive.
             warning ?? (kinds.isEmpty
-                ? "Connected; waiting for measurement\u{2026}"
-                : "Ready for \(kinds.count) metric\(kinds.count == 1 ? "" : "s"); waiting for data\u{2026}")
+                ? String(localized: "peripheral.state.waitingForMeasurement", defaultValue: "Connected; waiting for measurement\u{2026}", comment: "Bluetooth device status: connected to a device that measures on request")
+                : String(
+                    localized: "peripheral.state.readyMetrics",
+                    defaultValue: "Ready for \(kinds.count) metrics; waiting for data\u{2026}",
+                    comment: "Bluetooth device status. The argument is how many metrics the device can report."
+                ))
         case .streaming(let kinds):
             if kinds.isEmpty {
                 String(localized: "peripheral.state.connected", defaultValue: "Connected", comment: "Bluetooth device status: connected but not yet receiving any metric")

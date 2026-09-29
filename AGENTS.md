@@ -78,7 +78,7 @@ HeartSyncApp
 | `HeartSyncCheckerUITests` | iOS UI-test bundle | All of `UITests` | Drives deterministic Debug-only launch scenarios; targets `HeartSyncChecker` |
 | `HeartSyncCheckerPerformanceTests` | Hosted iOS unit-test bundle | All of `PerformanceTests` | Manual physical-device release workload; explicit host is `HeartSync.app/HeartSync` |
 
-The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI. Debug and Release configurations are generated.
+The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI, which is `.github/workflows/ios.yml` (unit, UI, iPad screenshots, and the watch build on the iOS 18 and newest runtimes, warnings as errors). Debug and Release configurations are generated.
 
 The target/product/module naming difference is intentional and fragile: the target, scheme, and module are `HeartSyncChecker`, but the installed bundle and executable are `HeartSync`. Preserve `PRODUCT_NAME`, `PRODUCT_MODULE_NAME`, `TEST_HOST`, and `BUNDLE_LOADER` together.
 
@@ -126,7 +126,9 @@ There is no protocol registry or dependency-injection container. `AppModel` cons
 
 Do not introduce a broad DI framework for a local change. Add a small constructor or configuration seam only when it is needed for testability or a real alternate implementation.
 
-`AppModel.dataVersion` is incremented during ingest, but no current view reads it. Do not assume that it drives invalidation; Observation on the actual store/managers is the active mechanism.
+Invalidation is Observation on the actual store and managers. `HealthStore.changeToken` and `removalGeneration` are the tokens external projections (the watch publisher and its chart cache) key on.
+
+`AppModel.init` accepts the store, settings, sessions, managers, and an `AppModel.TransportActions` value: the handful of calls the model makes on Bluetooth, HealthKit, and Oura, as closures. Production forwards them unchanged (`.live`); tests pass `.inert` or a recording copy, so startup order, retention, derived metrics, and refresh run without any transport.
 
 ## Concurrency Conventions
 
@@ -145,7 +147,7 @@ CoreBluetooth has an important actor assumption. `BluetoothManager` creates `CBC
 
 HealthKit callbacks convert framework samples into Sendable value data inside the callback and then hop to `MainActor`. Keep non-Sendable `HKSample` objects out of unconstrained tasks.
 
-Oura endpoint requests currently run sequentially. Do not casually convert them to a task group: endpoint status, token invalidation, partial-permission behavior, cached-data preservation, and API rate behavior are coupled to the current flow. `OuraClient` also has shared `nonisolated(unsafe)` ISO-8601 formatters that must be re-audited before concurrent use is expanded.
+Oura endpoint requests currently run sequentially. Do not casually convert them to a task group: endpoint status, token invalidation, partial-permission behavior, cached-data preservation, and API rate behavior are coupled to the current flow. A 429 that `OuraClient` cannot absorb inline ends the cycle (`SyncAbort.rateLimited`): collections fetched before it are committed, the rest are not asked for, the cycle is not counted as a full backfill, and the deadline is kept until a cycle finishes without another 429. Foreground returns and the timer are unattended and go through `syncIfDue(minimumInterval:)` (the scheduled interval, floor five minutes); pull-to-refresh and **Sync now** call `sync()`. A watch's refresh request pulls Health and republishes; it never reconnects Bluetooth or asks Oura. `OuraClient` also has shared `nonisolated(unsafe)` ISO-8601 formatters that must be re-audited before concurrent use is expanded.
 
 ## Bluetooth Architecture
 
@@ -201,11 +203,12 @@ Authorization and synchronization rules:
   requested or retained because no current feature uses it.
 - Share types are restricted to directly measurable BLE-compatible metrics: heart rate, oxygen saturation, SDNN, and body temperature.
 - Completion of the HealthKit authorization sheet does not prove that each read permission was granted. Do not make the UI claim otherwise.
-- Anchored queries request a recent 30-day window and then install update handlers. Local retention settings do not imply a one-year HealthKit backfill.
+- Anchored queries request a recent 30-day window and then install update handlers. A page's anchor advances after its SQLite transaction commits, which is already durable; pruning, compaction, and the WAL checkpoint are maintenance (`HealthStore.saveNow`) and run on `AppModel`'s 15-minute timer and at background transitions, never per page. Local retention settings do not imply a one-year HealthKit backfill.
 - Background delivery is requested hourly. There are no `BGTaskScheduler` identifiers or task handlers.
 - The committed entitlements declare `com.apple.developer.healthkit.background-delivery`, and the code requests hourly delivery. The capability still needs to be enabled for the App ID/provisioning profile and exercised with a signed build on a physical device; do not describe background wake behavior as guaranteed until that validation succeeds.
 - Anchored queries apply HealthKit deletions: `HealthKitManager.deletedReadingIDs` maps each `HKDeletedObject.uuid` to a reading id (the same sample UUID used at ingest), and `AppModel.ingest` commits source updates, readings, and deletions from one anchor page through `HealthStore` in a single transaction. Unknown ids are a no-op. Remaining limits: an already-exported pairwise analysis is unchanged; after compaction, raw sample UUIDs are gone so an upstream deletion cannot remove the stable window median that replaced them.
-- Optional write-back is allowed only for `.measured` readings from Bluetooth sources. Estimated or HealthKit/Oura-originating values must never be written back.
+- Optional write-back is allowed only for `.measured` readings from Bluetooth sources. Estimated or HealthKit/Oura-originating values must never be written back. Accepted readings are queued (`enqueueWrites`) and saved in one batch every 30 seconds and at background transitions; each sample carries an `HKDevice` from the source and `HKMetadataKeySyncIdentifier` (`heartsync.<reading id>`) with sync version 1, so a retried save cannot duplicate it. Write permission is checked before each batch, and a refusal or a full queue is reported in `writeBackIssue`.
+- `dateOfBirthComponents()` is Gregorian; `HealthKitManager.dateOfBirth(from:)` converts it with a Gregorian calendar, never `Calendar.current`.
 
 HealthKit readings currently use `hk.<source bundle identifier>` as the source ID and keep the device model as metadata. A nearby model comment describes a more specific identity than the implementation supplies. Treat the implemented ID formula as migration-sensitive; changing it can split or duplicate historical sources.
 
@@ -244,6 +247,7 @@ snapshot from the paired iPhone and always labels measurement time separately fr
   rejects malformed data, and ignores older contexts after newer resets. The watch restores
   the OS-managed received context. `WatchComplicationStore` caches one replaceable display
   snapshot for the extension; there is no second health history database.
+- The App Group holds `WatchSnapshot.complicationProjection`, not the whole payload: per metric, the one reading a complication draws. `WatchComplicationStore.save` returns true, and timelines reload, only when that projection differs (`drawsSameComplications`); a new delivery time, chart, or comparison count reloads nothing.
 - Complications share `group.com.heartsync.HeartSyncChecker.watch` between the watch app and
   extension only. Both profiles must include App Groups. The cache is validated, bounded to
   60 KB, atomic, protected until first unlock, and excluded from backup. Cache writes and
@@ -256,6 +260,7 @@ snapshot from the paired iPhone and always labels measurement time separately fr
   Schedule a future stale entry; WidgetKit reload timing remains system-controlled. Mark
   measurement views privacy-sensitive. `heartsync-watch` links open metric details or workout
   controls and must never start a workout. Preview fixtures must not enter the shared cache.
+- `WatchWorkoutManager` receives every session and builder callback through one `AsyncStream` applied by a single main-actor task, so events apply in the order HealthKit reported them.
 - `WatchWorkoutManager` requests only Workouts/Heart Rate, collects heart rate in a genuine
   user-started workout, supports pause/resume and review/save/discard, retains a failed save
   for retry, and reconnects a recovered session through `WKApplicationDelegate`.
@@ -293,7 +298,8 @@ Oura is the repository's only Internet API.
 - Callback scheme, host/path, and state are validated before accepting a token.
 - The exact callback is `com.heartsync.heartsyncchecker://oauth/oura`.
 - The callback declaration must stay synchronized in `OuraOAuthSession`, `project.yml`, `Resources/Info.plist`, and OAuth tests.
-- The bearer credential is stored in the device-only Keychain, not UserDefaults or the JSON archive.
+- The bearer credential is stored in the device-only Keychain, not UserDefaults or the JSON archive. Reads distinguish absent, undecodable, and unavailable (`Keychain.lookup`, `OuraOAuthCredentialStore.read`): only the first two may clear the credential. An unavailable read (a locked device) keeps the cached credential, reports a retryable message, and lets scheduling retry (`mayHaveAuthorization`).
+- The cached `OuraClient.PersonalInfo` holds only the id and email. The unused body measurements Oura returns are neither decoded nor kept, because `oura-dashboard-v1.json` is included in backups.
 
 Oura sync intentionally starts with the cached snapshot and handles each collection independently. A successful collection replaces its cached field; an unavailable/failed collection retains prior cached data. Do not erase the entire dashboard because one endpoint fails.
 
@@ -310,10 +316,10 @@ Permission handling is deliberately server-authoritative:
 `HealthStore` is the single observed repository boundary. It keeps the small source list in memory and stores readings in one local SQLite database. It rejects implausible values, de-duplicates known reading IDs, updates observed source metrics, and offers indexed, range-shaped and paged read APIs.
 
 - Bluetooth and HealthKit records are appended idempotently.
-- Oura records are upserted because a stable cloud record can be corrected.
+- Oura records are upserted because a stable cloud record can be corrected. Stored Oura readings outlive the 14-day dashboard cache: only a document dated inside a complete full-window response and absent from it is withdrawn (`OuraManager.withdrawn`); aging out of the cache withdraws nothing, and retention decides when they go.
 - Stable identity comes from framework sample IDs or `UUID(stableFrom:)` recipes. Identity changes require migration analysis; otherwise a refresh can duplicate or orphan history.
 - Reading and source mutations commit transactionally and incrementally. The database indexes stable ID, metric/time, source/time, and end time. Settings persistence remains one-second coalesced. Startup refuses to attach transports until the database and any pending legacy migration are conclusive; an unavailable protected file is retried rather than treated as empty.
-- Default reading retention is 30 days and can be configured by the existing settings model. Before pruning, readings at least 14 days old are irreversibly compacted to one median per source/comparison window. New compacted rows preserve original count and standard deviation; migrated legacy medians represent unavailable facts as unknown. A compacted window is final: late rows and cloud revisions for it are rejected because the discarded distribution cannot be recombined without median-of-medians bias.
+- Default reading retention is 30 days and can be configured by the existing settings model. A store that persists never prunes aged history until `confirmRetention(days:)` has run: the 30 days it starts with is a default, and so is what a failed, reset, or newer-schema settings file reports. `AppModel.applyRetentionSettings` confirms only from settings that loaded intact (or after the user chose a period in this session), and the last confirmed period is recorded in the database's `metadata` table, so a settings file lost and recreated with the default cannot shorten it: pruning is held (`retentionIsPaused`, a startup notice, and a Settings button) until the user chooses a period. Impossible-clock rows (`start > end`) are removed once at load. Before pruning, readings at least 14 days old are irreversibly compacted to one median per source/comparison window. New compacted rows preserve original count and standard deviation; migrated legacy medians represent unavailable facts as unknown. A compacted window is final: late rows and cloud revisions for it are rejected because the discarded distribution cannot be recombined without median-of-medians bias.
 
 `HealthDatabase` stores `health.sqlite3` plus its WAL/SHM companions under Application Support in the `HeartSync` directory. A durable metadata marker makes the version-1 JSON migration retry across process termination. `ReadingArchive` continues to serialize the small ISO-8601 JSON archives atomically and supplies the legacy migration inputs:
 
@@ -346,7 +352,8 @@ These abstractions encode product correctness and should be reused rather than r
 - `UUID(stableFrom:)`: deterministic import identity.
 - `HealthStore`: ingestion, validation, de-duplication, querying, pruning, and persistence seam.
 - `ComparisonEngine`: epoch-aligned windows, per-source medians, pairing, evidence state, discrepancies, and Bland-Altman statistics.
-- `PairwiseExporter`: stable CSV and summary semantics, RFC 4180 escaping, UTC formatting, and explicit source metadata.
+- `PairwiseExporter`: stable CSV and summary semantics, UTC formatting, and explicit source metadata. `CSV.escape` (RFC 4180) and `CSV.spreadsheetSafe` (leading `=`, `+`, `-`, `@` made literal) are the only CSV writers; the whole-history and per-source exports use them for source names and models too.
+- Estimates HeartSync computes carry `ReadingMetadata.modelledBy`, and `HealthStore.reconcileEstimates` deletes only within its scope: blood-pressure estimates under `AppModel.estimateSourceID`, VO₂ max estimates that are HeartSync's own. A ring's estimated blood pressure and temperature are never candidates.
 - `HRVCalculator`/`HRVAccumulator`: RR filtering and HRV derivation.
 - `Estimators`: estimated VO2 max and blood-pressure trend rules/provenance.
 - `Components.swift`: `SourceDot`, `SourceValueRow`, `AgreementBadge`, `EmptyStateView`, `EstimateDisclaimer`, `BatteryBadge`, `SignalBars`, and `metricCard()`.
@@ -507,14 +514,14 @@ The repository currently pins development team `7RLDYXQTNX`. Do not silently rep
 The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@Suite`, `@Test`, `#expect`, and `#require`). Watch payload, projection, freshness, and companion HealthKit identity regressions are in `Tests/Watch` and `Tests/HealthKitConversionTests.swift`; count declarations from the current source rather than relying on an older total. The UI bundle uses XCTest/XCUIAutomation, and the separate performance bundle uses Swift Testing:
 
 - `Tests/AnalysisTests.swift`: 53 tests covering HRV, comparison/windowing/statistics/evidence, chart thinning, estimators, Oura mapping, debug fixtures, and stable identifiers.
-- `Tests/ParsingTests.swift`: 22 tests covering binary reads and GATT measurement parsing, including units, optional fields, PLX status fields, and invalid frames.
+- `Tests/ParsingTests.swift`: 25 tests covering binary reads and GATT measurement parsing, including units, optional fields, PLX status fields, and invalid frames.
 - `Tests/OuraOAuthTests.swift`: 13 tests covering exact authorization URL/scopes, callback/state/token metadata, scope-related 401 behavior, expiry, and compatibility behavior.
 - `Tests/OuraDataTests.swift`: 14 tests covering decoding, snapshot/upsert behavior, injected-`URLProtocol` request/error behavior, and the Oura heart-rate chart series (window anchoring, unparseable timestamps, and plot thinning).
 - `Tests/PairwiseExportTests.swift`: 10 tests covering stable schemas, canonical A/B semantics, aggregation evidence, RFC escaping, evidence language, metadata isolation, UTC, and fallback output.
 - `Tests/HealthStoreTests.swift`: 38 tests covering validation, indexed queries, batch ingestion, deletion, persistence safety, retention, and bounded compaction.
 - `Tests/ReadingArchiveTests.swift`: 20 tests covering envelopes, legacy payloads, unique corrupt preservation, unreadable-file handling, and Oura cache compatibility.
 - `Tests/HealthKitConversionTests.swift`: 19 tests covering type mappings, minimal read scope, self-source rejection and cleanup, writer identity, scaling, and deletion conversion.
-- `Tests/OuraSyncTests.swift`: 23 tests covering endpoint isolation, pagination, scope failures, cache preservation, deletion reconciliation, cache/database failure rollback, truncation, and battery timestamps.
+- `Tests/OuraSyncTests.swift`: 34 tests covering endpoint isolation, pagination, scope failures, cache preservation, deletion reconciliation (including that aging out of the dashboard cache withdraws nothing), cache/database failure rollback, truncation, battery timestamps, rate-limit backoff and the early stop, the minimum interval, and Keychain reads that fail versus find nothing.
 - `Tests/HRVFilterTests.swift`: 20 tests covering artefact filtering, body-location versus technology metadata, accumulator thresholds, and rate limiting.
 - `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
 - `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
@@ -542,7 +549,10 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/PairTimingTests.swift`: 10 tests covering the pair timing policy — near/far samples
   inside one bucket, close samples across a boundary, bursty delivery, interval summaries,
   unknown timing from compacted rows, evidence grading, and sparse coverage.
-- `Tests/Watch/WorkoutLifecycleTests.swift`: 17 tests covering the watch workout transition
+- `Tests/AppModelTests.swift`: 15 tests over temporary files and inert transports covering saved retention across relaunch, unreadable/corrupt/newer-schema settings deleting nothing, a lost settings file not shortening a longer period, the user's choice lifting the hold, refresh gating, Oura throttling, ring blood pressure surviving reconciliation, and a failed removal reporting.
+- `Tests/StoreMaintenanceTests.swift`: 22 tests covering source mutations that roll back, estimate reconciliation scope, ingest not pruning, compaction across a pass boundary, SQL-counted retention impact and session summaries, sub-second payload dates, coarse last-seen updates, and CSV formula neutralisation.
+- `Tests/HealthKitWriteBackTests.swift`: 7 tests covering the Gregorian date of birth and the write plan (sync identifier, device, scaling, refusals), the bounded queue, and refusal classification.
+- `Tests/Watch/WorkoutLifecycleTests.swift`: 19 tests covering the watch workout transition
   rules in `Shared/WorkoutLifecycle.swift` — duplicate Start/Stop taps, stale callbacks,
   interruption, save failure and retry, double-save refusal, discard, and recovery.
 - `Tests/ComparisonSourceSelectionTests.swift`: 6 tests covering comparison-only source
@@ -609,7 +619,7 @@ There is no snapshot-test target, live Oura test, Bluetooth hardware integration
 Do not use `swift test` on this project; it is a hosted Xcode unit-test bundle in an
 XcodeGen iOS project, not a SwiftPM package.
 
-When no iOS simulator runtime is installed, `build-for-testing` proves compilation only. To
+When no iOS simulator runtime is usable (check `xcrun simctl list runtimes`; a runtime can be listed as unavailable when its profile does not match the installed Xcode), `build-for-testing` proves compilation only. To
 actually execute the pure logic, build a **scratch** SwiftPM package outside the repository
 and copy or symlink the real source files into it — `Sources/Store`, `Sources/Model`,
 `Sources/Analysis`, `Sources/Views/MetricDetailSnapshot.swift`,
@@ -618,14 +628,20 @@ and copy or symlink the real source files into it — `Sources/Store`, `Sources/
 `SourceRemovalConsequence`, `WindowLabel`, `ChartLookup`, `ChartViewport`,
 `MetricChartProjection`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
 `Oura/OuraMovementClass`, `Oura/OuraDailyTrend`), `Shared`, plus
-`Sources/Bluetooth/GATT.swift` for `BodySensorLocation` (which needs a `CBUUID` shim, and
+`Sources/Bluetooth/GATT.swift` for `BodySensorLocation` (CoreBluetooth exists on macOS, so it needs no shim, and
 `R11MRingSession`), the Foundation-only Bluetooth files (`BluetoothDiagnostics`,
 `BluetoothDiscoveryState`, `YCBTFrameCodec`, `YCBTHistory`, `R11MRingSession`, `Measurements`,
 `BinaryReader`, `BluetoothIngestionPolicy`), and `Sources/Debug`'s `DebugChartGallery`. The Oura timeline and trend
 projections also need the Foundation-only DTOs in `Sources/Oura/OuraClient.swift`. That closure builds for macOS and runs the store, analysis,
-export, presentation-projection and watch-lifecycle suites. It cannot compile the SwiftUI
-screens (they import UIKit), the Oura stack (AuthenticationServices), or `WatchApp`. Never
-add `Package.swift` to the repository itself.
+export, presentation-projection and watch-lifecycle suites. Adding `BluetoothManager`,
+`HealthKitManager` (and its `+Session`/`+WriteBack` files), `OuraManager`, `OuraData`, `AppModel`,
+`WatchCompanionPublisher`, `WatchSnapshotBuilder`, `BackgroundWork`, and `Sources/Debug` lets the
+`AppModel`, Oura orchestration, and HealthKit conversion suites run too, with two harness-only
+stand-ins: a `CompanionSession` stub (WatchConnectivity does not exist on macOS) and a copy of
+`Sources/Oura/OuraOAuth.swift` with its UIKit window lookup replaced. It cannot compile the SwiftUI
+screens (they import UIKit), the UI tests, or `WatchApp`, and it has no string catalog, so
+plural-dependent wording resolves to each `defaultValue`. Never add `Package.swift` to the
+repository itself.
 
 Run all tests against an installed simulator. Do not hard-code a model that may not exist on the current machine; discover a destination first and prefer its ID:
 

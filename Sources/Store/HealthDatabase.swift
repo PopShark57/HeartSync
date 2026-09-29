@@ -31,15 +31,62 @@ final class HealthDatabase {
     private var failQueries = false
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
+        encoder.dateEncodingStrategy = .custom(PayloadDates.encode)
         encoder.outputFormatting = [.sortedKeys]
         return encoder
     }()
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .custom(PayloadDates.decode)
         return decoder
     }()
+
+    /// Date spelling for stored payloads.
+    ///
+    /// The `start`, `end`, and `midpoint` columns keep full precision, while the payload
+    /// used to be written with `.iso8601`, which drops fractions. Analysis bins the decoded
+    /// dates, so a one-second reading from 59.7 s to 60.7 s came back as 59.0 s to 60.0 s and
+    /// landed in the previous window, and HRV observation intervals and pair-timing
+    /// separations lost their fractions. Millisecond precision is kept now.
+    ///
+    /// A whole-second date is still written without a fraction, byte for byte as before, so
+    /// existing rows and the upsert comparison against them are unaffected, and rows written
+    /// by an earlier build decode unchanged.
+    enum PayloadDates {
+        private static let plain = Date.ISO8601FormatStyle()
+        private static let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+
+        static func string(from date: Date) -> String {
+            let milliseconds = (date.timeIntervalSince1970 * 1_000).rounded()
+            // Half a millisecond up: the format style truncates, and a value like
+            // 1709649000.731 is stored as ...730999 in binary, which would print as .730.
+            let nudged = Date(timeIntervalSince1970: (milliseconds + 0.5) / 1_000)
+            let isWholeSecond = milliseconds.truncatingRemainder(dividingBy: 1_000) == 0
+            return nudged.formatted(isWholeSecond ? plain : fractional)
+        }
+
+        static func date(from string: String) -> Date? {
+            if string.contains(".") { return try? fractional.parse(string) }
+            return try? plain.parse(string)
+        }
+
+        static func encode(_ date: Date, to encoder: any Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(string(from: date))
+        }
+
+        static func decode(from decoder: any Decoder) throws -> Date {
+            let container = try decoder.singleValueContainer()
+            let text = try container.decode(String.self)
+            guard let date = date(from: text) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Invalid ISO 8601 date: \(text)"
+                )
+            }
+            return date
+        }
+    }
 
     init(url: URL?) throws {
         fileURL = url
@@ -298,30 +345,97 @@ final class HealthDatabase {
         }
     }
 
+    /// Stored estimates of the given kinds, read through the `(kind, midpoint)` index.
+    ///
+    /// Candidates only: this decodes estimate rows, never the whole table. `sourceID` scopes
+    /// the read to the source HeartSync writes its own model output under; `since` bounds it
+    /// to rows that end at or after that instant.
+    func estimateReadings(kinds: Set<MetricKind>, sourceID: String?, since: Date?) throws -> [Reading] {
+        guard !kinds.isEmpty else { return [] }
+        let ordered = kinds.map(\.rawValue).sorted()
+        var clauses = [
+            "kind IN (\(Array(repeating: "?", count: ordered.count).joined(separator: ", ")))",
+            "provenance = ?",
+        ]
+        var bindings: [Binding] = ordered.map { .text($0) }
+        bindings.append(.text(Provenance.estimated.rawValue))
+        if let sourceID {
+            clauses.append("source_id = ?")
+            bindings.append(.text(sourceID))
+        }
+        if let since {
+            clauses.append("end >= ?")
+            bindings.append(.double(since.timeIntervalSince1970))
+        }
+        return try decodedRows(
+            "SELECT payload FROM readings WHERE \(clauses.joined(separator: " AND ")) ORDER BY end, rowid",
+            bindings: bindings,
+            as: Reading.self
+        )
+    }
+
+    /// Deletes estimates of `kinds` that are no longer current.
+    ///
+    /// Reads and deletes only estimate rows in the requested scope. The earlier form read the
+    /// whole table, twice, and matched on provenance alone, so it also deleted a ring's
+    /// blood-pressure readings, which are stored as estimates under the ring's own source.
+    /// `sourceID` is the positive identification: the synthetic estimate source for blood
+    /// pressure. VO\u{2082} max estimates are written under each device's own source ID, so
+    /// they carry `ReadingMetadata.modelledBy` instead; a row with no marker predates it and
+    /// is HeartSync's own, since no transport reports an estimated VO\u{2082} max.
     @discardableResult
     func removeEstimates(
         kinds: Set<MetricKind>,
         keeping ids: Set<UUID>,
-        currentSince: Date?
+        currentSince: Date?,
+        sourceID: String? = nil
     ) throws -> Int {
-        let candidates = try readings().filter { reading in
-            guard reading.provenance == .estimated, kinds.contains(reading.kind) else { return false }
-            if let currentSince, reading.end < currentSince { return false }
-            return !ids.contains(reading.id)
-        }
+        let candidates = try estimateReadings(kinds: kinds, sourceID: sourceID, since: currentSince)
+            .filter { reading in
+                if ids.contains(reading.id) { return false }
+                guard let marker = reading.metadata?.modelledBy else { return true }
+                return marker == ReadingMetadata.heartSyncModel
+            }
         return try removeReadingIDs(Set(candidates.map(\.id)))
     }
 
+    /// Deletes every stored reading of one source and leaves the source row itself.
     @discardableResult
-    func prune(cutoff: Date, now: Date, sources: [DataSource]) throws -> Int {
+    func removeReadings(sourceID: String) throws -> Int {
         try transaction {
-            let sql = "DELETE FROM readings WHERE end < ? OR start > end OR start > ?"
-            try execute(sql, bindings: [
-                .double(cutoff.timeIntervalSince1970),
-                .double(now.timeIntervalSince1970),
-            ])
-            let removed = Int(sqlite3_changes(handle))
-            for source in sources { try write(source) }
+            try execute("DELETE FROM readings WHERE source_id = ?", bindings: [.text(sourceID)])
+            return Int(sqlite3_changes(handle))
+        }
+    }
+
+    /// Removes rows that ended before `cutoff` and rows that begin in the future, and
+    /// optionally rows whose interval runs backwards, and writes only the source rows the
+    /// caller changed.
+    ///
+    /// Both routine deletes are ranges on the `end` index: a row that starts after `now` also
+    /// ends after it, so the future check reads only the newest rows. The `start > end` check
+    /// cannot use an index, and joining it to the others with `OR` turned every prune into a
+    /// table scan, so callers ask for it once, at load.
+    @discardableResult
+    func prune(
+        cutoff: Date,
+        now: Date,
+        changedSources: [DataSource],
+        includingInvalidRows: Bool = false
+    ) throws -> Int {
+        try transaction {
+            try execute("DELETE FROM readings WHERE end < ?", bindings: [.double(cutoff.timeIntervalSince1970)])
+            var removed = Int(sqlite3_changes(handle))
+            try execute(
+                "DELETE FROM readings WHERE end > ? AND start > ?",
+                bindings: [.double(now.timeIntervalSince1970), .double(now.timeIntervalSince1970)]
+            )
+            removed += Int(sqlite3_changes(handle))
+            if includingInvalidRows {
+                try execute("DELETE FROM readings WHERE start > end")
+                removed += Int(sqlite3_changes(handle))
+            }
+            for source in changedSources { try write(source) }
             return removed
         }
     }
@@ -340,6 +454,109 @@ final class HealthDatabase {
             try execute("DELETE FROM readings")
             for source in sources { try write(source) }
         }
+    }
+
+    // MARK: - Metadata and counts
+
+    func metadataValue(_ key: String) throws -> String? {
+        let statement = try prepare("SELECT value FROM metadata WHERE key = ?")
+        defer { sqlite3_finalize(statement) }
+        try bind([.text(key)], to: statement)
+        let result = sqlite3_step(statement)
+        guard result == SQLITE_ROW else {
+            if result == SQLITE_DONE { return nil }
+            throw error("read metadata")
+        }
+        guard let value = sqlite3_column_text(statement, 0) else { return nil }
+        return String(cString: value)
+    }
+
+    func setMetadata(_ value: String, forKey key: String) throws {
+        try transaction {
+            try execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+                bindings: [.text(key), .text(value)]
+            )
+        }
+    }
+
+    /// Rows that ended before `date`: what a shorter retention would delete.
+    func readingCount(endingBefore date: Date) throws -> Int {
+        try count("SELECT COUNT(*) FROM readings WHERE end < ?", [.double(date.timeIntervalSince1970)])
+    }
+
+    /// Raw rows that ended in `[start, end)`: what compaction would still fold into window
+    /// medians. A compacted row is recognised by the `aggregation` object in its payload, so
+    /// the count decodes no rows.
+    func rawReadingCount(endingFrom start: Date, before end: Date) throws -> Int {
+        try count(
+            """
+            SELECT COUNT(*) FROM readings WHERE end >= ? AND end < ?
+            AND instr(CAST(payload AS TEXT), '"aggregation"') = 0
+            """,
+            [.double(start.timeIntervalSince1970), .double(end.timeIntervalSince1970)]
+        )
+    }
+
+    /// Rows of one metric whose midpoint lies in `range`, optionally limited to some
+    /// sources, from the `(kind, midpoint)` index, with a fingerprint of their identities.
+    ///
+    /// The fingerprint sums a stable hash of each ID, so five rows added and five removed
+    /// differ from "unchanged" even though the count does not move. No payload is decoded.
+    func readingSummary(
+        kind: MetricKind,
+        sourceIDs: Set<String>?,
+        range: DateInterval
+    ) throws -> (count: Int, fingerprint: Int64) {
+        try checkInjectedQueryFailure("summarise readings")
+        let statement = try prepare(
+            "SELECT id, source_id FROM readings WHERE kind = ? AND midpoint >= ? AND midpoint <= ?"
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind([
+            .text(kind.rawValue),
+            .double(range.start.timeIntervalSince1970),
+            .double(range.end.timeIntervalSince1970),
+        ], to: statement)
+        var count = 0
+        var fingerprint: Int64 = 0
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                if let sourceIDs {
+                    guard let raw = sqlite3_column_text(statement, 1),
+                          sourceIDs.contains(String(cString: raw))
+                    else { continue }
+                }
+                count += 1
+                if let raw = sqlite3_column_text(statement, 0) {
+                    fingerprint &+= Self.stableHash(String(cString: raw))
+                }
+            case SQLITE_DONE:
+                return (count, fingerprint)
+            default:
+                throw error("summarise readings")
+            }
+        }
+    }
+
+    /// FNV-1a: stable across launches, unlike `Hasher`.
+    private static func stableHash(_ text: String) -> Int64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return Int64(bitPattern: hash)
+    }
+
+    private func count(_ sql: String, _ bindings: [Binding]) throws -> Int {
+        try checkInjectedQueryFailure("count readings")
+        let statement = try prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        try bind(bindings, to: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw error("count readings") }
+        return Int(sqlite3_column_int64(statement, 0))
     }
 
     func checkpoint() throws {
