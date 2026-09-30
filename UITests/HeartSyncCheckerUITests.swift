@@ -339,15 +339,19 @@ final class HeartSyncCheckerUITests: XCTestCase {
         let useSpan = element("metric.useVisibleSpan", in: application)
         XCTAssertTrue(useSpan.waitForExistence(timeout: 5))
         useSpan.tap()
+        // A whole-span period draws no visible band, so the list brings its evidence up.
         let save = element("metric.savePeriod", in: application)
+        XCTAssertTrue(save.waitForExistence(timeout: 5))
         XCTAssertTrue(scrollToElement(save, in: application))
         save.tap()
         XCTAssertTrue(application.navigationBars["Save session"].waitForExistence(timeout: 5))
         application.buttons["Cancel"].tap()
 
-        // Zooming back out ends at the whole range, drawn at its own bucket.
+        // Zooming back out ends at the whole range, drawn at its own bucket. The chosen
+        // period is named beside the chart too.
         let zoomOut = element("metric.zoomOut", in: application)
         XCTAssertTrue(scrollUpToElement(zoomOut, in: application))
+        XCTAssertTrue(element("metric.periodSummary", in: application).exists)
         zoomOut.tap()
         zoomOut.tap()
         XCTAssertTrue(waitForLabel(of: bucket, containing: "Showing 15-minute medians"), bucket.label)
