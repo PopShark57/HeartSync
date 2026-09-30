@@ -32,6 +32,19 @@ records outside the last 30 days, in the future, or with a repeated timestamp. B
 and temperature are stored as estimates. Vendor HRV, stress, and sleep are not imported. All
 of this remains unverified on hardware; see `RELEASE_CHECKLIST.md`.
 
+### Follow-up (2026-09-29): temperature and a stress check
+
+At the owner's request the Measure menu also offers temperature and a stress level.
+Temperature starts mode `04` (`03 2F 01 04`), the code PulseLoop's mode table gives and
+checks against the vendor app's measure screens. The ring sends no live temperature, so a
+completed measurement is read back from the temperature (`05 1E`) and combined (`05 09`)
+records, as the vendor app does. The vitals capture decoded an R11M's capability bitmap with
+body temperature, HRV, and stress all absent, so this ring is expected to refuse the start
+with a non-zero status; the rejection is reported and nothing is stored. The stress level is
+HeartSync's own estimate (`StressModel`), not the vendor's: the menu item measures heart
+rate on the ring and scores stress with it and with other sources' HRV. Vendor HRV (`0A`) and
+stress (`0C`) modes are not requested. Unverified on hardware.
+
 Where the framing came from: the frame layout (`group | command | length LE | payload | CRC
 LE`, CRC-16/CCITT-FALSE, total length including header and CRC) and the `04 0E` completion
 event are from independent public write-ups of R11M-reporting and YCBT rings

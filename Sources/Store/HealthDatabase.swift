@@ -478,6 +478,75 @@ final class HealthDatabase {
         )
     }
 
+    /// The newest row of one metric from one source whose midpoint lies in `range`.
+    ///
+    /// Walks the `(source_id, midpoint)` index backwards from the range's end and stops at the
+    /// first row of `kind`, so its cost is this source's own newer rows of other metrics.
+    /// `+kind` keeps the planner off the metric index: walking that one would step over every
+    /// row another device wrote since, which next to a 1 Hz strap is a day's worth of rows
+    /// for a ring last measured yesterday.
+    func latest(kind: MetricKind, sourceID: String, midpointIn range: DateInterval) throws -> Reading? {
+        try readingRows(
+            "SELECT \(Self.readingColumns) FROM readings WHERE source_id = ? AND midpoint >= ? AND midpoint <= ? AND +kind = ? ORDER BY midpoint DESC, rowid DESC LIMIT 1",
+            bindings: [
+                .text(sourceID),
+                .double(range.start.timeIntervalSince1970),
+                .double(range.end.timeIntervalSince1970),
+                .text(kind.rawValue),
+            ]
+        ).first
+    }
+
+    /// Count, sum, and sum of squares of one metric's stored values by local hour of day,
+    /// in one aggregate pass that decodes no rows.
+    ///
+    /// Only rows with the schema-3 `value` column, provenance other than estimated, and a
+    /// duration of at most `maximumDuration` count: an estimate or a night's average is not
+    /// what a heart rate at that hour looks like. Rows not yet backfilled are left out rather
+    /// than decoded, which only thins an old baseline.
+    ///
+    /// - Parameter utcOffset: seconds east of UTC, so hour 0 is local midnight.
+    func hourOfDayMoments(
+        kind: MetricKind,
+        range: DateInterval,
+        utcOffset: Int,
+        maximumDuration: TimeInterval
+    ) throws -> [Int: HourMoments] {
+        try checkInjectedQueryFailure("summarise hours")
+        let statement = try prepare("""
+            SELECT ((CAST(midpoint AS INTEGER) + ?) % 86400 + 86400) % 86400 / 3600 AS hour,
+                   COUNT(value), SUM(value), SUM(value * value)
+            FROM readings
+            WHERE kind = ? AND midpoint >= ? AND midpoint <= ?
+              AND value IS NOT NULL AND provenance != 'estimated' AND end - start <= ?
+            GROUP BY hour
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind([
+            .int(utcOffset),
+            .text(kind.rawValue),
+            .double(range.start.timeIntervalSince1970),
+            .double(range.end.timeIntervalSince1970),
+            .double(maximumDuration),
+        ], to: statement)
+        var result: [Int: HourMoments] = [:]
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                let hour = Int(sqlite3_column_int64(statement, 0))
+                result[hour] = HourMoments(
+                    count: Int(sqlite3_column_int64(statement, 1)),
+                    sum: sqlite3_column_double(statement, 2),
+                    sumOfSquares: sqlite3_column_double(statement, 3)
+                )
+            case SQLITE_DONE:
+                return result
+            default:
+                throw error("summarise hours")
+            }
+        }
+    }
+
     func latest(kind: MetricKind, sourceID: String) throws -> Reading? {
         try readingRows(
             "SELECT \(Self.readingColumns) FROM readings WHERE kind = ? AND source_id = ? ORDER BY end DESC, rowid DESC LIMIT 1",

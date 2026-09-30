@@ -28,6 +28,12 @@ until the ring answers it correctly. After that, and only when you tap them:
 
 - **Measure heart rate**, **Measure blood oxygen**, and **Measure blood pressure** each start
   one on-demand measurement. Only the value the ring reports when it finishes is saved.
+- **Measure temperature** starts the ring's temperature mode and, when it finishes, reads the
+  value from the ring's memory (the ring sends none live). A published capture of an R11M
+  shows no temperature sensor in its capability list, so such a ring is expected to decline;
+  nothing is saved when it does.
+- **Stress level** measures heart rate on the ring and then computes HeartSync's own stress
+  estimate with it (see below).
 - **Import stored readings** reads what the ring recorded on its own schedule (the values its
   vendor app, SmartHealth, shows): heart rate, blood pressure, SpO₂, respiratory rate, and
   temperature. Reading does not delete anything from the ring. Each transfer must pass its
@@ -38,7 +44,7 @@ Ring blood pressure is a cuffless optical model and ring temperature is a vendor
 finger reading, so both are stored as **estimates**: excluded from device agreement by
 default and never written to Apple Health. The vendor's HRV, stress ("pressure"), and sleep
 values are not imported: the public protocol notes do not say whether its HRV is RMSSD or
-SDNN, and HeartSync has no stress or sleep-stage metric. This path has not been verified on
+SDNN, and neither its stress nor its sleep records have a decoder. This path has not been verified on
 hardware; no specific model or firmware is claimed as supported.
 
 The ring's **battery** comes from the same read-only identity reply (the battery percent and
@@ -51,7 +57,19 @@ service and characteristic, counts packets before parsing, and names why any wer
 Its report leaves the phone only through **Export diagnostics**.
 
 Metrics tracked: heart rate, resting heart rate, HRV (RMSSD and SDNN), SpO₂, respiratory
-rate, body temperature, VO₂ max, and blood pressure.
+rate, body temperature, VO₂ max, blood pressure, and HeartSync's estimated stress level.
+
+**Stress level** (0–100) is always an estimate. HeartSync compares your current HRV (each
+device against its own 30-day history), heart rate (against your own heart rate at the same
+time of day), and, when available, breathing, temperature, and SpO₂ with your baseline,
+weights them by how fresh and well supported they are, and declines to score when heart rate
+suggests exercise. It is recomputed every five minutes and never written to Apple Health.
+
+**Now** shows each device's latest reading of every metric from the last week (a month for
+daily summaries), so spot measurements such as blood pressure or SpO₂ stay visible with
+their age; only readings from the last 15 minutes are live and compared. On iOS 26 with
+Apple Intelligence, a short summary at the top is written on the device from those cards and
+shown only if every number, estimate label, and age in it matches them.
 
 ## The comparison
 

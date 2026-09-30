@@ -95,6 +95,13 @@ final class AppModel {
         /// Starts Import stored on every connected, identified, idle ring, as the Devices
         /// tab's button does for one, and returns how many started.
         var importRingHistories: @MainActor () -> Int = { 0 }
+        /// Starts one on-demand heart-rate measurement on a ring, for a stress check, and
+        /// reports whether it started.
+        var measureRingHeartRate: @MainActor (_ sourceID: String) -> Bool = { _ in false }
+        /// Installs the handler for a ring's completed on-demand measurement.
+        var observeRingMeasurements: @MainActor (
+            _ handler: @escaping @MainActor (_ sourceID: String, R11MRingSession.RingValue) -> Void
+        ) -> Void = { _ in }
         /// How the Health sync that ended at or after `since` went, for a wrist sync.
         var healthKitSyncOutcome: @MainActor (_ since: Date) -> WatchSyncReport.Outcome = { _ in .synced }
         /// How the Oura cycle that ended at or after `since` went, for a wrist sync.
@@ -142,6 +149,11 @@ final class AppModel {
                 clearOura: { await oura.clearCachedData(keepingAuthorization: $0) },
                 isBluetoothPoweredOn: { bluetooth.isPoweredOn },
                 importRingHistories: { bluetooth.importStoredReadingsFromReadyRings() },
+                measureRingHeartRate: { sourceID in
+                    bluetooth.measure(.heartRate, sourceID: sourceID)
+                    return bluetooth.ringSession(forSource: sourceID)?.activeMeasurement == .heartRate
+                },
+                observeRingMeasurements: { bluetooth.onRingMeasurement = $0 },
                 healthKitSyncOutcome: { since in
                     WatchSyncOutcomes.healthKit(healthKit.syncSummary, since: since)
                 },
@@ -182,6 +194,24 @@ final class AppModel {
 
     private(set) var startupState: StartupState = .loading
     private(set) var startupNotice: String?
+
+    /// The latest stress assessment, or why there is none. Nil until the first estimate pass.
+    private(set) var stress: Result<StressModel.Assessment, StressModel.Unavailable>?
+
+    /// A stress check the user started from a ring's Devices row.
+    enum StressCheck: Equatable, Sendable {
+        /// The ring is measuring heart rate for it.
+        case measuring
+        case scored(StressModel.Assessment)
+        case unavailable(StressModel.Unavailable)
+    }
+
+    /// Stress checks by ring source ID.
+    private(set) var stressChecks: [String: StressCheck] = [:]
+    /// The summary of the user's own history the stress index compares with, reused for
+    /// `StressModel.Baseline.lifetime`. Tied to `dataEpoch`, so a reset discards it.
+    private var stressBaseline: StressModel.Baseline?
+    private var stressBaselineEpoch = -1
 
     /// Live Bluetooth values waiting to commit as one transaction (improvement 52).
     private var bluetoothBuffer = BluetoothIngestBuffer()
@@ -233,6 +263,9 @@ final class AppModel {
             },
             { [weak self] in self?.flushBluetoothBuffer() }
         )
+        transports.observeRingMeasurements { [weak self] sourceID, value in
+            self?.ringMeasured(sourceID: sourceID, value: value)
+        }
         transports.registerHealthKitBackgroundDelivery()
     }
 
@@ -749,7 +782,8 @@ final class AppModel {
             vo2MaxEnabled: settings.snapshot.vo2MaxEstimateEnabled,
             estimatedMaxHeartRate: settings.profile.estimatedMaxHeartRate,
             bloodPressureCalibration: settings.canEstimateBloodPressure ? settings.profile.bpCalibration : nil,
-            estimateSourceID: Self.estimateSourceID
+            estimateSourceID: Self.estimateSourceID,
+            stressBaseline: stressBaselineEpoch == dataEpoch ? stressBaseline : nil
         )
         let now = Date.now
         let epoch = dataEpoch
@@ -759,7 +793,45 @@ final class AppModel {
         // Computed from a read taken before a reset: writing it would restore estimates of
         // history that no longer exists.
         guard epoch == dataEpoch else { return }
+        stressBaseline = result.stressBaseline
+        stressBaselineEpoch = epoch
+        stress = result.stressAssessment
         applyDerivedEstimates(result, now: now)
+    }
+
+    // MARK: - Stress check
+
+    /// Measures heart rate on a ring and then scores stress with it: the ring's firmware has
+    /// no stress sensor of its own, so a fresh heart rate is what it can add. The score also
+    /// uses whatever HRV, breathing, temperature, and SpO\u{2082} other sources reported.
+    func checkStress(ringSourceID sourceID: String) {
+        guard transports.measureRingHeartRate(sourceID) else { return }
+        stressChecks[sourceID] = .measuring
+    }
+
+    /// A ring finished an on-demand measurement. Completes a stress check waiting on it.
+    private func ringMeasured(sourceID: String, value: R11MRingSession.RingValue) {
+        guard stressChecks[sourceID] == .measuring, value.measurement == .heartRate else { return }
+        // The value is still in the two-second Bluetooth batch; the estimate must read it.
+        flushBluetoothBuffer()
+        Task { [weak self] in
+            guard let self else { return }
+            await self.recomputeDerivedMetrics()
+            guard self.stressChecks[sourceID] == .measuring else { return }
+            switch self.stress {
+            case .success(let assessment):
+                self.stressChecks[sourceID] = .scored(assessment)
+            case .failure(let reason):
+                self.stressChecks[sourceID] = .unavailable(reason)
+            case nil:
+                self.stressChecks[sourceID] = .unavailable(.noCurrentSignal)
+            }
+        }
+    }
+
+    /// Forgets a finished check, for example when the ring starts another measurement.
+    func clearStressCheck(ringSourceID sourceID: String) {
+        stressChecks[sourceID] = nil
     }
 
     private func applyDerivedEstimates(_ result: DerivedEstimates.Result, now: Date) {
@@ -777,6 +849,14 @@ final class AppModel {
             currentSince: settings.canEstimateBloodPressure ? now.addingTimeInterval(-300) : nil,
             sourceID: Self.estimateSourceID
         )
+        // The stress index for this five-minute slot: withdrawn when it can no longer be
+        // computed (exercise, or the signals went stale), so it never outlives its evidence.
+        store.reconcileEstimates(
+            kinds: [.stress],
+            keeping: Set(result.stress.map(\.id)),
+            currentSince: now.addingTimeInterval(-300),
+            sourceID: Self.estimateSourceID
+        )
         let produced = result.all
         guard !produced.isEmpty else { return }
         // Estimates are revisable documents, not append-only measurements. Stable IDs make
@@ -785,7 +865,7 @@ final class AppModel {
         // leave the readings filed under "Unknown device".
         _ = store.upsertBatch(
             readings: produced,
-            updatingSources: result.bloodPressure.isEmpty ? [] : [Self.estimateSourceDescriptor]
+            updatingSources: result.bloodPressure.isEmpty && result.stress.isEmpty ? [] : [Self.estimateSourceDescriptor]
         )
     }
 

@@ -245,6 +245,7 @@ struct DevicesView: View {
                     .accessibilityIdentifier("source.\(source.id)")
                     if source.isEnabled, let ring = model.bluetooth.ringSession(forSource: source.id) {
                         ringControls(ring, source: source)
+                        stressCheckResult(ring, source: source)
                     }
                 }
                 // No full swipe: with it, one long gesture performed Remove and deleted the
@@ -316,7 +317,7 @@ struct DevicesView: View {
         } header: {
             Text("Bluetooth sensors")
         } footer: {
-            Text("Works with devices using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles, such as most chest straps and standards-compliant pulse oximeters. Some rings only measure on request through a vendor protocol. HeartSync has candidate support for one such protocol (YCBT): once the ring has identified itself, it offers heart-rate, blood-oxygen, and blood-pressure measurements, and can import the readings the ring stored on its own. Ring blood pressure and temperature are saved as estimates. Use Run Bluetooth diagnostics from a device's menu to see what it sends.")
+            Text("Works with devices using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles, such as most chest straps and standards-compliant pulse oximeters. Some rings only measure on request through a vendor protocol. HeartSync has candidate support for one such protocol (YCBT): once the ring has identified itself, it offers heart-rate, blood-oxygen, blood-pressure, and temperature measurements and a stress check, and can import the readings the ring stored on its own. The stress level is HeartSync's own estimate: the ring measures heart rate for it. Ring blood pressure and temperature are saved as estimates. Use Run Bluetooth diagnostics from a device's menu to see what it sends.")
         }
     }
 
@@ -343,12 +344,20 @@ struct DevicesView: View {
                 Menu {
                     ForEach(R11MRingSession.Measurement.allCases, id: \.self) { measurement in
                         Button {
+                            model.clearStressCheck(ringSourceID: source.id)
                             model.bluetooth.measure(measurement, sourceID: source.id)
                         } label: {
                             Label(measurement.menuTitle, systemImage: measurement.systemImage)
                         }
                         .accessibilityHint(measurementHint(measurement))
                     }
+                    Divider()
+                    Button {
+                        model.checkStress(ringSourceID: source.id)
+                    } label: {
+                        Label("Stress level (estimate)", systemImage: MetricKind.stress.systemImage)
+                    }
+                    .accessibilityHint("Measures your heart rate on the ring, then estimates your stress level from it and from your recent HRV, breathing, temperature, and blood oxygen, compared with your own baseline.")
                 } label: {
                     Label("Measure", systemImage: "waveform.path.ecg")
                         .font(.caption.weight(.medium))
@@ -356,7 +365,7 @@ struct DevicesView: View {
                 }
                 // Takes the row's borderless button style, so only its label is a tap target.
                 .menuStyle(.button)
-                .accessibilityHint("Choose heart rate, blood oxygen, or blood pressure for one on-demand measurement.")
+                .accessibilityHint("Choose heart rate, blood oxygen, blood pressure, temperature, or a stress check for one on-demand measurement.")
                 Button {
                     model.bluetooth.importRingHistory(sourceID: source.id)
                 } label: {
@@ -380,6 +389,45 @@ struct DevicesView: View {
             "Asks the ring for one blood-oxygen measurement. Keep your hand still for about a minute."
         case .bloodPressure:
             "Asks the ring for one blood-pressure value. A ring's value is a modelled estimate, not a cuff measurement."
+        case .temperature:
+            "Asks the ring for one temperature reading, then reads it from the ring's memory. A ring's finger temperature is saved as an estimate. Some rings have no temperature sensor and decline."
+        }
+    }
+
+    /// The outcome of a stress check started from this ring, once the ring has measured.
+    /// While the ring measures, its own status line already says so.
+    @ViewBuilder
+    private func stressCheckResult(_ ring: R11MRingSession, source: DataSource) -> some View {
+        switch model.stressChecks[source.id] {
+        case .measuring where ring.activeMeasurement == .heartRate:
+            Label("Stress check: measuring heart rate first\u{2026}", systemImage: MetricKind.stress.systemImage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .scored(let assessment):
+            VStack(alignment: .leading, spacing: 2) {
+                Label {
+                    Text("Stress level \(MetricKind.stress.formatWithUnit(assessment.score)) \u{00B7} \(assessment.band.title)")
+                } icon: {
+                    Image(systemName: MetricKind.stress.systemImage)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(MetricKind.stress.tint)
+                if let drivers = assessment.driverSummary {
+                    Text(drivers)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Estimate, not a measurement. See Now for details.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .combine)
+        case .unavailable(let reason):
+            Label(StressModel.explanation(reason), systemImage: MetricKind.stress.systemImage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .measuring, nil:
+            EmptyView()
         }
     }
 

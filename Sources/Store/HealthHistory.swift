@@ -157,6 +157,28 @@ struct HealthHistory: Sendable {
         return readingsOutcome(in: range, enabledOnly: enabledOnly).valueOrEmpty
     }
 
+    /// The newest reading of `kind` from `sourceID` with its midpoint in `range`, or nil when
+    /// there is none. See `HealthDatabase.latest(kind:sourceID:midpointIn:)`.
+    func latestOutcome(kind: MetricKind, sourceID: String, midpointIn range: DateInterval) -> HealthStoreQueryOutcome<Reading?> {
+        if case .notLoaded(let pending) = access {
+            return .success(pending
+                .filter { $0.kind == kind && $0.sourceID == sourceID && range.contains($0.midpoint) }
+                .max { $0.midpoint < $1.midpoint })
+        }
+        return query { try $0.latest(kind: kind, sourceID: sourceID, midpointIn: range) }
+    }
+
+    /// Stored values of `kind` summarised by local hour of day. See
+    /// `HealthDatabase.hourOfDayMoments(kind:range:utcOffset:maximumDuration:)`.
+    func hourOfDayMomentsOutcome(
+        kind: MetricKind,
+        range: DateInterval,
+        utcOffset: Int,
+        maximumDuration: TimeInterval
+    ) -> HealthStoreQueryOutcome<[Int: HourMoments]> {
+        query { try $0.hourOfDayMoments(kind: kind, range: range, utcOffset: utcOffset, maximumDuration: maximumDuration) }
+    }
+
     func latest(kind: MetricKind, sourceID: String) -> Reading? {
         query { try $0.latest(kind: kind, sourceID: sourceID) }.value ?? nil
     }

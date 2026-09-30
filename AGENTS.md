@@ -88,7 +88,7 @@ There are no:
 - iOS widget extensions, notification extensions, or reusable framework targets;
 - `Package.swift`, `Package.resolved`, SwiftPM package dependencies, CocoaPods, or Carthage dependencies.
 
-The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, CryptoKit, Accessibility (Audio Graph descriptors), WatchConnectivity, WatchKit, WidgetKit, AppIntents, and SQLite3. Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
+The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, CryptoKit, Accessibility (Audio Graph descriptors), WatchConnectivity, WatchKit, WidgetKit, AppIntents, SQLite3, and FoundationModels (the Now brief only; iOS 26+, weak-linked, behind `#if canImport(FoundationModels)` so an SDK without it builds). Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
 
 ## Shared Versus Platform-Specific Code
 
@@ -184,11 +184,13 @@ Readiness and diagnostics (`RingFix.md`):
 Vendor ring candidate (`R11MRingSession`, `YCBTFrameCodec`):
 
 - It is selected only from GATT topology: the YCBT service with a writable, subscribable command characteristic and a subscribable event characteristic. Never select it from the advertised name.
-- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query, which is repeated every 15 minutes while the session is idle (`refreshBattery`, `RingLink.batteryTask`, purpose `.batteryQuery`) and never during a measurement or import. A measurement or history import starts only after a CRC-valid identity reply, and only from the user's Measure heart rate / blood oxygen / blood pressure or Import stored readings action, or the watch's Sync all sources request, which starts Import stored only on a connected, enabled ring whose session is identified and idle (`importStoredReadingsFromReadyRings`).
+- Nothing is written until both channels confirm their subscription. The only unprompted write is the read-only identity query, which is repeated every 15 minutes while the session is idle (`refreshBattery`, `RingLink.batteryTask`, purpose `.batteryQuery`) and never during a measurement or import. A measurement or history import starts only after a CRC-valid identity reply, and only from the user's Measure heart rate / blood oxygen / blood pressure / temperature, Stress level (a heart-rate measurement), or Import stored readings action, or the watch's Sync all sources request, which starts Import stored only on a connected, enabled ring whose session is identified and idle (`importStoredReadingsFromReadyRings`).
 - Live values are provisional. Only the ring's completion event for the running sensor emits a reading (the last live value, through `emit`). Zero, no-contact, rejection, timeout, and another sensor's frames store nothing.
+- Temperature (`03 2F 01 04`, PulseLoop's mode table) has no live frame. Its successful completion starts a read-only import of the temperature and combined records (`Measurement.storedIn`), and the outcome is `.readFromMemory` with the newest record no older than `storedResultTolerance` before completion, or none. The vitals capture shows an R11M whose capability bitmap lacks temperature, HRV, and stress, so such a ring is expected to reject the start; a rejection stores nothing. Unverified on hardware. HRV (`0A`) and stress (`0C`) modes are never requested.
+- The Measure menu's Stress level runs the ring's heart-rate measurement (`AppModel.checkStress`, `TransportActions.measureRingHeartRate`); when that value arrives (`BluetoothManager.onRingMeasurement`), `AppModel` flushes the Bluetooth batch, recomputes estimates, and records the result in `stressChecks`. The ring contributes heart rate only; the stress index is HeartSync's.
 - Battery: the identity reply (`02 00`) is decoded as `YCBTFrameCodec.DeviceInfo`; payload byte 4 is the charging state (non-zero while charging) and byte 5 the percent (above 100 is discarded), as `SmartRingWatcher`'s `YCParsers.deviceInfo` reads them. The session emits `.battery`, which `BluetoothManager` stores with `HealthStore.updateBattery(_:isCharging:forSource:)` on `DataSource.batteryPercent`/`batteryIsCharging`. It is source metadata, never a reading.
 - `YCBTHistory` reads stored heart-rate, blood-pressure, combined, SpO₂, and temperature records (`05` group). A type is decoded only when its concatenated bytes match the terminal block's length and CRC; the app then acknowledges (`05 80 00`, or `04` on failure). Nothing is ever deleted from the ring. Timestamps are the ring's local wall clock since 2000; records older than 30 days, in the future, or with a repeated timestamp are skipped. History IDs are `UUID(stableFrom:)` of source, metric, and timestamp, and a batch goes through `onReadings`, bypassing receipt-time admission only because it is one user-started, checked import.
-- Ring blood pressure and temperature are `.estimated` (`R11MRingSession.provenance(for:)`); heart rate, SpO₂, and respiratory rate are measured, as other vendor values are. The vendor HRV byte is not imported (RMSSD versus SDNN is undocumented); stress and sleep have no metric.
+- Ring blood pressure and temperature are `.estimated` (`R11MRingSession.provenance(for:)`); heart rate, SpO₂, and respiratory rate are measured, as other vendor values are. The vendor HRV byte is not imported (RMSSD versus SDNN is undocumented); vendor stress and sleep are not imported.
 - While the session owns heart rate, the same ring's `2A37` frames are counted as superseded, not ingested.
 - The framing is from public reverse-engineering and is unverified on hardware. Do not add commands (clock, settings, delete, keepalive, periodic-monitoring schedules) without captured evidence and tests. Do not describe the path as verified.
 
@@ -364,7 +366,8 @@ These abstractions encode product correctness and should be reused rather than r
 - `HealthStore`: ingestion, validation, de-duplication, querying, pruning, and persistence seam.
 - `ComparisonEngine`: epoch-aligned windows, per-source medians, pairing, evidence state, discrepancies, and Bland-Altman statistics.
 - `PairwiseExporter`: stable CSV and summary semantics, UTC formatting, and explicit source metadata. `CSV.escape` (RFC 4180) and `CSV.spreadsheetSafe` (leading `=`, `+`, `-`, `@` made literal) are the only CSV writers; the whole-history and per-source exports use them for source names and models too.
-- Estimates HeartSync computes carry `ReadingMetadata.modelledBy`, and `HealthStore.reconcileEstimates` deletes only within its scope: blood-pressure estimates under `AppModel.estimateSourceID`, VO₂ max estimates that are HeartSync's own. A ring's estimated blood pressure and temperature are never candidates.
+- Estimates HeartSync computes carry `ReadingMetadata.modelledBy`, and `HealthStore.reconcileEstimates` deletes only within its scope: blood-pressure and stress estimates under `AppModel.estimateSourceID`, VO₂ max estimates that are HeartSync's own. A ring's estimated blood pressure and temperature are never candidates.
+- `StressModel`: the stress index (`MetricKind.stress`, 0–100, always `.estimated`, one reading per five-minute slot under the estimate source, never written to Health). Robust z-scores against the user's own history: per-source ln(HRV) median/MAD over 30 days (0.40), heart rate against the same local hours over 14 days from one SQL aggregate (`HealthDatabase.hourOfDayMoments`, 0.30, else resting heart rate plus a waking allowance at half weight), respiration (0.10), a temperature rise (0.08), and an SpO₂ fall (0.07). Weights fade with freshness; a heart-rate reserve above 50% refuses to score (likely exercise) and 30–50% fades the heart-rate and HRV terms; thin evidence is shrunk towards the typical score; a score from the previous 20 minutes is blended in. Blood pressure is not an input (it is modelled from the same signals). The `Baseline` is cached by `AppModel` for six hours and dropped on reset. `StressModel.disclaimer` appears with every stress value.
 - `HRVCalculator`/`HRVAccumulator`: RR filtering and HRV derivation.
 - `Estimators`: estimated VO2 max and blood-pressure trend rules/provenance.
 - `Components.swift`: `SourceDot`, `SourceValueRow`, `AgreementBadge`, `EmptyStateView`, `EstimateDisclaimer`, `BatteryMeter`, `BatteryBadge`, `SignalBars`, and `metricCard()`.
@@ -404,6 +407,8 @@ The application is SwiftUI-first and targets iOS 18:
 - A chart whose automatic Audio Graph would name series by source ID gets an `AXChartDescriptorRepresentable` (`ChartAudioGraph.swift`) that names devices.
 - A screen that loads a snapshot per key shows "Updating for the new selection…" and dims and disables the old results while the question has changed, as Compare and metric detail do.
 - Now: only a streaming Bluetooth source can be labelled Live (`SourceChipStatus`). Sparklines draw completed-window medians only and are cached until the window closes. Motion honours Reduce Motion.
+- Now keeps each enabled device's last reading of a metric for `DashboardSnapshot.recentHorizon(for:)` (seven days; 30 for daily summaries) through one bounded `LIMIT 1` read per device (`HealthDatabase.latest(kind:sourceID:midpointIn:)`). Such a row is `isCurrent == false`, listed after the live rows, never compared, and a card with no live row says "Last reported … Not a live value." Verdicts still come from the live windows only.
+- The Now brief (`NowBriefFacts`, `NowBriefCheck`, `NowBriefGenerator`) is written on the device by Apple's language model from one sentence per card and shown only if `NowBriefCheck` accepts it: every number belongs to the reading it is said of, an estimate is called one and a measurement is not, a reading that is not live keeps its age, and no judgement word, diagnosis, or reading the facts lack appears. Three attempts, then no brief. Regenerated when the rounded facts change, at most every three minutes. Nothing leaves the device; without Apple Intelligence (or on iOS 18) there is no brief.
 - Layout adapts to size class: `.sidebarAdaptable` tabs, an adaptive grid on Now, and a split view on Compare in regular widths.
 - Use SF Symbols, semantic system colors, monospaced digits for measurements, and existing source colors.
 - Keep empty, loading, unavailable, insufficient-evidence, and estimated states explicit. Do not hide uncertainty to make a screen look complete.
@@ -599,6 +604,20 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   measurement, sensor codes, the history request against a published capture, history
   transfer (acknowledgement, empty types, bad CRC, silence, cancel, overflow), record
   decoding, clock guards, local wall-clock conversion, estimate provenance, and stable IDs.
+- `Tests/NowRecentReadingsTests.swift`: 7 tests covering spot readings kept on Now with their
+  age, blood pressure from yesterday, the horizon, the newest earlier reading, old rows kept
+  out of a live verdict, paused devices, and the bounded latest-reading query.
+- `Tests/StressModelTests.swift`: 18 tests covering robust statistics, the hour-of-day
+  aggregate, typical/stressed/relaxed scores and their drivers, the exercise gate, missing
+  signals and baselines, per-source HRV scales, smoothing, secondary signals, freshness,
+  bands, storage as a slot estimate, baseline lifetime, the metric's contract, and the ring
+  stress check.
+- `Tests/RingTemperatureTests.swift`: 6 tests covering the temperature start request, a
+  refusal storing nothing, completion reading memory and reporting the new value, only an
+  old record, no contact, and live measurements reading no memory.
+- `Tests/NowBriefTests.swift`: 11 tests covering the facts' order and caveats, the coarse
+  key, accepted model drafts, numbers tied to their reading, estimate wording, kept ages,
+  judgement and diagnosis, readings the facts lack, and longest-name matching.
 - `Tests/Watch/WatchChartTests.swift`: 23 tests covering chart payload compatibility and
   validation, the 1H/3H/24H/7D/30D periods and their windows, per-period evidence, empty periods,
   the long-period cache and its invalidation (only by removals that reach a period, routine
@@ -655,7 +674,7 @@ and copy or symlink the real source files into it — `Sources/Store`, `Sources/
 `Sources/Views/ComparisonEmptyReason.swift`, the other Foundation-only view projections
 (`DashboardSnapshot`, `PairwiseSnapshot`, `ChartSegmentation`, `LiveReloadPolicy`,
 `SourceRemovalConsequence`, `WindowLabel`, `ChartLookup`, `ChartViewport`,
-`MetricChartProjection`, `ReadingsExportJob`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
+`MetricChartProjection`, `ReadingsExportJob`, `NowBrief`, `NowBriefGenerator`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
 `Oura/OuraMovementClass`, `Oura/OuraDailyTrend`), `Shared`, plus
 `Sources/Bluetooth/GATT.swift` for `BodySensorLocation` (CoreBluetooth exists on macOS, so it needs no shim, and
 `R11MRingSession`), the Foundation-only Bluetooth files (`BluetoothDiagnostics`,
