@@ -209,6 +209,9 @@ but not the platform behavior.
   permission off in Health and confirm Settings reports it instead of failing silently.
 - [ ] Complications: watch the reload count while a strap streams; a new delivery that changes no
   displayed value must not reload the timelines.
+- [ ] Stress complication: add **HeartSync Stress** to a face in each family. A new five-minute
+  score updates it, every value is labelled as an estimate, it reads Older after 15 minutes with
+  no score, and a tap opens the stress detail.
 - [ ] Watch periods: 3H appears between 1H and 24H on the detail and Compare pages, all five
   buttons fit a 41 mm watch, and 3H has its own verdict and chart.
 - [ ] Diagnostics: open Devices while a strap streams and confirm the list stays still, and that

@@ -5,6 +5,9 @@ import Foundation
 struct WatchComplicationStore {
     static let appGroup = "group.com.heartsync.HeartSyncChecker.watch"
     static let metricWidgetKind = "HeartSyncMeasurement"
+    static let stressWidgetKind = "HeartSyncStress"
+    /// Every widget that draws from this cache; each is reloaded when `save` returns true.
+    static let widgetKinds = [metricWidgetKind, stressWidgetKind]
     private let directory: URL?
 
     init(directory: URL?) {

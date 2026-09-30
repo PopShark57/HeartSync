@@ -248,6 +248,8 @@ Watch faces also offer the **HeartSync Measurement** complication in
 circular, rectangular, inline, and corner slots. Choose heart rate, resting heart rate, SpO₂,
 RMSSD, SDNN, respiratory rate, or temperature for each measurement slot. Old readings are
 explicitly labelled, estimates are excluded, and tapping opens the corresponding details.
+A separate **HeartSync Stress** complication shows HeartSync's stress index (0–100) in the
+same four families. It is always labelled as an estimate, never as a measurement.
 Rectangular versions also
 support the Smart Stack. Updates use the last iPhone snapshot and watchOS scheduling.
 

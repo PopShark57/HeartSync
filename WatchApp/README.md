@@ -49,6 +49,13 @@ recommendations include heart rate, resting heart rate, SpO₂, RMSSD, SDNN, res
 and absolute body temperature. Each slot can use a different measurement. The widget supports circular, rectangular, inline, and corner families; rectangular widgets also work
 in the Smart Stack.
 
+- **HeartSync Stress** is a separate complication with nothing to configure. It shows
+  HeartSync's stress index, a score out of 100 against the user's own baseline, in the same
+  four families. It is the only complication that shows an estimate, and every family says
+  so: **Est.** in the circular opening, **Estimated** in the others, and "HeartSync's
+  estimate, not a measurement" for VoiceOver. No band or colour judges the score. It ages
+  like other fast metrics (**Older** after 15 minutes without a new score) and a tap opens
+  the stress detail and its caveat.
 - Measurements use the most recent non-estimated reading among the dashboard's displayed
   enabled sources. RMSSD and SDNN stay separate. Derived readings and compacted medians keep
   their labels. The complication does not make device-agreement or medical-accuracy claims.
@@ -155,7 +162,9 @@ Before release, use a signed paired iPhone/watch to check:
    tinting, long source names, VoiceOver, large text, and privacy/Always On redaction. The
    circular gauge must render in tinted and full-colour faces with its Older and Median
    labels. Lower the wrist and confirm the reduced presentation: values prominent, secondary
-   text dimmed, trends hidden. Tap each measurement.
+   text dimmed, trends hidden. Tap each measurement. Add **HeartSync Stress** in each family:
+   every value reads as an estimate (Est. / Estimated), it turns Older 15 minutes after the
+   last score, and a tap opens the stress detail.
 7. Change phone data with the watch app closed, then check eventual complication reloads.
    Verify first-use empty state, no selected metric, old measurement after a fresh sync, aging
    without new data, source removal, reset, unavailable phone storage, and locked-watch reads.
