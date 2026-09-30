@@ -5,6 +5,7 @@ import SwiftUI
 /// statistics for that metric.
 struct MetricDetailView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let kind: MetricKind
     /// A saved session whose exact span this screen analyses, or nil for a rolling preset.
     let session: ComparisonSession?
@@ -43,6 +44,12 @@ struct MetricDetailView: View {
     @State private var periodLoadedKey: PeriodLoadKey?
     @State private var periodLoadedAt: Date?
     @State private var savingPeriod = false
+    /// Bumped by Use the span shown. That period covers the whole plot, so the chart cannot
+    /// show it; the list scrolls to its evidence instead.
+    @State private var periodScrollRequest = 0
+
+    /// The last row of the Selected period section, which the list scrolls to.
+    private static let periodSectionEndID = "metric.periodSectionEnd"
 
     init(kind: MetricKind, initialRange: TimeRange = .day, session: ComparisonSession? = nil) {
         self.kind = kind
@@ -212,8 +219,25 @@ struct MetricDetailView: View {
         }
     }
 
-    @ViewBuilder
     private func content(_ snapshot: MetricDetailSnapshot) -> some View {
+        ScrollViewReader { proxy in
+            list(snapshot)
+                .onChange(of: periodScrollRequest) {
+                    // Deferred one turn so the section inserted by the same tap is in the
+                    // list before it is scrolled to. Bottom-anchored, so the whole section shows.
+                    Task { @MainActor in
+                        if reduceMotion {
+                            proxy.scrollTo(Self.periodSectionEndID, anchor: .bottom)
+                        } else {
+                            withAnimation { proxy.scrollTo(Self.periodSectionEndID, anchor: .bottom) }
+                        }
+                    }
+                }
+        }
+    }
+
+    @ViewBuilder
+    private func list(_ snapshot: MetricDetailSnapshot) -> some View {
         let chart = displayedChart(snapshot)
         List {
             Section {
@@ -493,27 +517,47 @@ struct MetricDetailView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Use the span shown") {
-                    selectedPeriod = ChartViewport.snappedPeriod(
+                    guard let shown = ChartViewport.snappedPeriod(
                         from: chart.xDomain.lowerBound,
                         to: chart.xDomain.upperBound,
                         bucket: chart.bucketSize,
                         within: chart.xDomain
-                    )
+                    ) else { return }
+                    selectedPeriod = shown
                     isSelectingPeriod = false
+                    periodScrollRequest &+= 1
                 }
                 .font(.subheadline)
                 .frame(minHeight: 44)
                 .accessibilityIdentifier("metric.useVisibleSpan")
-            } else if let selected {
-                HStack {
-                    Text("Selected: \(spanText(DateInterval(start: selected.start, duration: selected.duration)))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 8)
-                    Button("Clear selection") { selectedWindowStart = nil }
-                        .font(.caption)
-                        .frame(minHeight: 44)
-                        .accessibilityIdentifier("metric.clearSelection")
+            } else {
+                // Said beside the chart as well as in its own section further down: a period
+                // that covers the whole plot draws no visible band, so without this line
+                // choosing one looked as if nothing had happened.
+                if let selectedPeriod {
+                    HStack {
+                        Text("Period: \(spanText(selectedPeriod))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("metric.periodSummary")
+                        Spacer(minLength: 8)
+                        Button("Clear period") { self.selectedPeriod = nil }
+                            .font(.caption)
+                            .frame(minHeight: 44)
+                            .accessibilityIdentifier("metric.clearPeriodInline")
+                    }
+                }
+                if let selected {
+                    HStack {
+                        Text("Selected: \(spanText(DateInterval(start: selected.start, duration: selected.duration)))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Button("Clear selection") { selectedWindowStart = nil }
+                            .font(.caption)
+                            .frame(minHeight: 44)
+                            .accessibilityIdentifier("metric.clearSelection")
+                    }
                 }
             }
         }
@@ -689,6 +733,7 @@ struct MetricDetailView: View {
                 Label("Clear period", systemImage: "xmark.circle")
             }
             .accessibilityIdentifier("metric.clearPeriod")
+            .id(Self.periodSectionEndID)
         } header: {
             Text("Selected period")
                 .accessibilityIdentifier("metric.period")
