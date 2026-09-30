@@ -212,6 +212,13 @@ final class AppModel {
     /// `StressModel.Baseline.lifetime`. Tied to `dataEpoch`, so a reset discards it.
     private var stressBaseline: StressModel.Baseline?
     private var stressBaselineEpoch = -1
+    /// The five-minute stress slot (`StressModel.slot(at:)`) the last estimate pass ran in.
+    /// A slot is scored once, by whichever reaches it first: the slot timer, or a new reading
+    /// the score depends on. Nil until the first pass.
+    private(set) var lastScoredSlot: Int?
+    /// The pass `scoreCurrentSlotIfDue` started and has not finished, so a burst of
+    /// readings starts one pass, not one each.
+    private var slotPass: Task<Void, Never>?
 
     /// Live Bluetooth values waiting to commit as one transaction (improvement 52).
     private var bluetoothBuffer = BluetoothIngestBuffer()
@@ -719,6 +726,12 @@ final class AppModel {
         let accepted = result.acceptedReadings
         guard !accepted.isEmpty else { return true }
 
+        // The stress log keeps going while the app runs in the background: iOS wakes it for
+        // Bluetooth values and Health updates, but suspends the slot timer in between.
+        if accepted.contains(where: { StressModel.inputKinds.contains($0.kind) }) {
+            scoreCurrentSlotIfDue()
+        }
+
         // Optional write-back into Apple Health, measured Bluetooth values only.
         if settings.snapshot.mirrorBluetoothToHealthKit, transports.isHealthKitAuthorized() {
             let mirrorable = accepted.filter { reading in
@@ -733,9 +746,13 @@ final class AppModel {
 
     // MARK: - Derived metrics
 
-    /// Recomputes estimates on a slow timer. They depend on windows of data rather than
-    /// single samples, so recomputing on every incoming reading would be wasteful and
-    /// would produce a jittery display.
+    /// Recomputes estimates once per five-minute stress slot, shortly after it begins. They
+    /// depend on windows of data rather than single samples, so recomputing on every
+    /// incoming reading would be wasteful and would produce a jittery display.
+    ///
+    /// The timer only runs while the process does. In the background iOS suspends it between
+    /// wake-ups, so `ingest` also scores a slot that the timer has not reached
+    /// (`scoreCurrentSlotIfDue`); whichever comes first scores the slot and the other skips.
     private func startDerivedMetrics() {
         derivedTask?.cancel()
         derivedTask = Task { [weak self] in
@@ -743,13 +760,47 @@ final class AppModel {
                 // The model is named only for the duration of the call: holding it across the
                 // sleep would keep a released model alive for up to five more minutes.
                 guard await self?.runDerivedTick() != nil else { return }
-                try? await Task.sleep(for: .seconds(300))
+                try? await Task.sleep(for: .seconds(Self.delayUntilNextSlotPass(after: .now)))
             }
         }
     }
 
     private func runDerivedTick() async {
-        await recomputeDerivedMetrics()
+        await scoreCurrentSlotIfDue()?.value
+    }
+
+    /// How long after a slot begins its timer pass runs, so a Bluetooth batch that was
+    /// waiting at the boundary (`BluetoothIngestBuffer.flushInterval`) is committed first.
+    nonisolated static let slotPassDelay: TimeInterval = 5
+
+    /// Seconds from `date` until the next slot's timer pass.
+    nonisolated static func delayUntilNextSlotPass(after date: Date) -> TimeInterval {
+        let next = Double(StressModel.slot(at: date) + 1) * StressModel.slotLength
+        return max(1, next + slotPassDelay - date.timeIntervalSince1970)
+    }
+
+    /// Runs one estimate pass, stress index included, unless one already ran in this
+    /// five-minute slot or is running, and returns the pass it started.
+    ///
+    /// Called by the slot timer and after readings the stress index reads are committed. The
+    /// second is what logs stress while the app is in the background: iOS wakes HeartSync for
+    /// each Bluetooth notification (the `bluetooth-central` mode) and for Health background
+    /// delivery, for a few seconds each time, and does not run the timer in between. The pass
+    /// holds a background-task assertion, taken before this returns, so that a wake-up that
+    /// ends mid-pass does not suspend it before its result is committed.
+    @discardableResult
+    func scoreCurrentSlotIfDue(now: Date = .now) -> Task<Void, Never>? {
+        guard slotPass == nil,
+              !isResettingData,
+              store.loadState == .loaded || !store.persistenceEnabled,
+              lastScoredSlot != StressModel.slot(at: now)
+        else { return nil }
+        let pass = BackgroundWork.start(named: "HeartSync stress index") { [weak self] in
+            await self?.recomputeDerivedMetrics()
+            self?.slotPass = nil
+        }
+        slotPass = pass
+        return pass
     }
 
     /// Prune, compact, and checkpoint on a timer. HealthKit pages and Bluetooth batches no
@@ -796,7 +847,27 @@ final class AppModel {
         stressBaseline = result.stressBaseline
         stressBaselineEpoch = epoch
         stress = result.stressAssessment
+        let slot = StressModel.slot(at: now)
+        lastScoredSlot = slot
         applyDerivedEstimates(result, now: now)
+        logStress(result.stressAssessment, slot: slot)
+    }
+
+    /// One line per pass, so a device's log shows whether background scoring kept up. The
+    /// score itself is health data and is redacted unless the device allows private data.
+    private func logStress(_ assessment: Result<StressModel.Assessment, StressModel.Unavailable>?, slot: Int) {
+        switch assessment {
+        case .success(let result):
+            logger.info("Stress slot \(slot, privacy: .public) scored \(result.score, privacy: .private)")
+        case .failure(.noCurrentSignal):
+            logger.info("Stress slot \(slot, privacy: .public) not scored: no current heart rate or HRV")
+        case .failure(.likelyExercise):
+            logger.info("Stress slot \(slot, privacy: .public) not scored: likely exercise")
+        case .failure(.insufficientEvidence):
+            logger.info("Stress slot \(slot, privacy: .public) not scored: insufficient evidence")
+        case nil:
+            break
+        }
     }
 
     // MARK: - Stress check

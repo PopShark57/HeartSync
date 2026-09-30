@@ -67,8 +67,8 @@ enum DerivedEstimates {
         now: Date,
         timeZone: TimeZone = .current
     ) -> (reading: Reading?, assessment: Swift.Result<StressModel.Assessment, StressModel.Unavailable>) {
-        let slot = Int(now.timeIntervalSince1970 / 300)
-        let stamp = Date(timeIntervalSince1970: Double(slot) * 300)
+        let slot = StressModel.slot(at: now)
+        let stamp = Date(timeIntervalSince1970: Double(slot) * StressModel.slotLength)
         let earlier = DateInterval(
             start: now.addingTimeInterval(-StressModel.smoothingHorizon),
             end: stamp.addingTimeInterval(-0.001)

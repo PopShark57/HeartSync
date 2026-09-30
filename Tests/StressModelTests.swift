@@ -3,7 +3,7 @@ import Testing
 @testable import HeartSyncChecker
 
 /// HeartSync's stress index (`StressModel`): personal baselines, the exercise gate, evidence
-/// weighting, smoothing, storage as an estimate, and the ring's stress check.
+/// weighting, smoothing, storage as an estimate, the ring's stress check, and background logging.
 @Suite("Stress index")
 @MainActor
 struct StressModelTests {
@@ -328,5 +328,59 @@ struct StressModelTests {
         )
         model.checkStress(ringSourceID: "ring")
         #expect(model.stressChecks["ring"] == nil)
+    }
+
+    // MARK: Background logging
+
+    @Test("The slot timer runs five seconds into each five-minute slot, and the index never wakes itself")
+    func slotTimerAlignment() {
+        let start = Date(timeIntervalSince1970: 1_700_000_100)
+        #expect(StressModel.slot(at: start) == 5_666_667)
+        #expect(StressModel.slot(at: start.addingTimeInterval(299.9)) == 5_666_667)
+        #expect(StressModel.slot(at: start.addingTimeInterval(300)) == 5_666_668)
+        #expect(AppModel.delayUntilNextSlotPass(after: start) == 305)
+        #expect(AppModel.delayUntilNextSlotPass(after: start.addingTimeInterval(299)) == 6)
+        #expect(AppModel.delayUntilNextSlotPass(after: start.addingTimeInterval(302)) == 303)
+        #expect(!StressModel.inputKinds.contains(.stress))
+        #expect(StressModel.inputKinds.isSuperset(of: [.heartRate, .hrvRMSSD, .hrvSDNN]))
+    }
+
+    @Test("A new heart rate scores the current slot once, as a background wake-up does; other metrics do not")
+    func ingestScoresSlotOnce() async throws {
+        var onReadings: (@MainActor ([Reading]) -> Void)?
+        var transports = AppModel.TransportActions.inert
+        transports.configureBluetooth = { _, _, readings, _ in onReadings = readings }
+        let model = AppModel(
+            store: seededStore(),
+            settings: AppSettings(persistenceEnabled: false),
+            sessions: ComparisonSessionStore(persistenceEnabled: false),
+            transports: transports
+        )
+        model.launch()
+        let deliver = try #require(onReadings)
+        #expect(model.lastScoredSlot == nil)
+
+        // Blood pressure is not an input, so it starts no pass.
+        deliver([Reading(sourceID: strap.id, kind: .bloodPressureSystolic, value: 120, start: Date.now.addingTimeInterval(-30))])
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(model.lastScoredSlot == nil)
+        #expect(model.stress == nil)
+
+        let before = StressModel.slot(at: .now)
+        deliver([Reading(sourceID: strap.id, kind: .heartRate, value: 66, start: Date.now.addingTimeInterval(-30))])
+        for _ in 0..<300 where model.lastScoredSlot == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let scored = try #require(model.lastScoredSlot)
+        #expect(scored >= before && scored <= StressModel.slot(at: .now))
+        #expect(model.stress != nil)
+
+        // The same slot is not scored twice; the next one is.
+        let slotStart = Date(timeIntervalSince1970: Double(scored) * StressModel.slotLength)
+        #expect(model.scoreCurrentSlotIfDue(now: slotStart.addingTimeInterval(1)) == nil)
+        let next = try #require(model.scoreCurrentSlotIfDue(now: slotStart.addingTimeInterval(StressModel.slotLength)))
+        // One pass at a time: a burst of readings while it runs starts nothing more.
+        #expect(model.scoreCurrentSlotIfDue(now: slotStart.addingTimeInterval(2 * StressModel.slotLength)) == nil)
+        await next.value
     }
 }
