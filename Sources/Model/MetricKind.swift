@@ -17,6 +17,9 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
     case vo2Max
     case bloodPressureSystolic
     case bloodPressureDiastolic
+    /// HeartSync's stress index, 0\u{2013}100. Always an estimate (`StressModel`): no device
+    /// measures stress, so this is only ever modelled from the other metrics.
+    case stress
 
     var id: String { rawValue }
 
@@ -48,6 +51,8 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
             String(localized: "metric.title.bloodPressureSystolic", defaultValue: "Blood Pressure (Systolic)", comment: "Full metric name for the systolic half of a blood-pressure pair")
         case .bloodPressureDiastolic:
             String(localized: "metric.title.bloodPressureDiastolic", defaultValue: "Blood Pressure (Diastolic)", comment: "Full metric name for the diastolic half of a blood-pressure pair")
+        case .stress:
+            String(localized: "metric.title.stress", defaultValue: "Stress Level", comment: "Full metric name for HeartSync's estimated stress index, a score from 0 to 100")
         }
     }
 
@@ -70,6 +75,7 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
         case .vo2Max:                "VO\u{2082} Max"
         case .bloodPressureSystolic: "Blood Pressure (Systolic)"
         case .bloodPressureDiastolic:"Blood Pressure (Diastolic)"
+        case .stress:                "Stress Level"
         }
     }
 
@@ -100,6 +106,8 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
             String(localized: "metric.short.bloodPressureSystolic", defaultValue: "SYS", comment: "Abbreviated metric name for systolic blood pressure")
         case .bloodPressureDiastolic:
             String(localized: "metric.short.bloodPressureDiastolic", defaultValue: "DIA", comment: "Abbreviated metric name for diastolic blood pressure")
+        case .stress:
+            String(localized: "metric.short.stress", defaultValue: "Stress", comment: "Abbreviated metric name for the estimated stress index")
         }
     }
 
@@ -125,6 +133,8 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
             String(localized: "unit.millilitresPerKilogramPerMinute", defaultValue: "mL/kg\u{00B7}min", comment: "Unit symbol for VO2 max: millilitres of oxygen per kilogram of body mass per minute")
         case .bloodPressureSystolic, .bloodPressureDiastolic:
             String(localized: "unit.mmHg", defaultValue: "mmHg", comment: "Unit symbol: millimetres of mercury, the unit of blood pressure. This symbol is international and is normally left untranslated.")
+        case .stress:
+            String(localized: "unit.stressScore", defaultValue: "/100", comment: "Unit of the stress index: a score out of 100, written directly after the number")
         }
     }
 
@@ -144,6 +154,7 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
         case .bodyTemperature:              "\u{00B0}C"
         case .vo2Max:                       "mL/kg\u{00B7}min"
         case .bloodPressureSystolic, .bloodPressureDiastolic: "mmHg"
+        case .stress:                       "/100"
         }
     }
 
@@ -156,6 +167,7 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
         case .bodyTemperature:              "thermometer.medium"
         case .vo2Max:                       "figure.run"
         case .bloodPressureSystolic, .bloodPressureDiastolic: "gauge.with.dots.needle.33percent"
+        case .stress:                       "brain.head.profile"
         }
     }
 
@@ -168,6 +180,7 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
         case .bodyTemperature:              .orange
         case .vo2Max:                       .green
         case .bloodPressureSystolic, .bloodPressureDiastolic: .red
+        case .stress:                       .indigo
         }
     }
 
@@ -195,6 +208,7 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
         case .vo2Max:                10...95
         case .bloodPressureSystolic: 60...260
         case .bloodPressureDiastolic:30...180
+        case .stress:                0...100
         }
     }
 
@@ -211,6 +225,7 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
         case .vo2Max:                25...60
         case .bloodPressureSystolic: 90...160
         case .bloodPressureDiastolic:50...100
+        case .stress:                0...100
         }
     }
 
@@ -234,13 +249,16 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
         case .vo2Max:                .init(warn: 3,   alert: 7)
         case .bloodPressureSystolic: .init(warn: 8,   alert: 15)
         case .bloodPressureDiastolic:.init(warn: 5,   alert: 10)
+        // Only ever an estimate, so never in a device verdict by default. The tolerance
+        // exists for a caller that asks to include estimates.
+        case .stress:                .init(warn: 10,  alert: 25)
         }
     }
 
     /// Metrics that stream continuously and belong on the live dashboard.
     var isContinuous: Bool {
         switch self {
-        case .heartRate, .spo2, .hrvRMSSD, .respiratoryRate, .bodyTemperature: true
+        case .heartRate, .spo2, .hrvRMSSD, .respiratoryRate, .bodyTemperature, .stress: true
         default: false
         }
     }
@@ -250,7 +268,7 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
     var comparisonWindow: TimeInterval {
         switch self {
         case .heartRate, .spo2, .respiratoryRate, .bodyTemperature: 60
-        case .hrvSDNN, .hrvRMSSD:                                   300
+        case .hrvSDNN, .hrvRMSSD, .stress:                          300
         case .restingHeartRate, .vo2Max:                            86_400
         case .bloodPressureSystolic, .bloodPressureDiastolic:       600
         }
@@ -292,10 +310,10 @@ enum MetricKind: String, Codable, CaseIterable, Sendable, Identifiable {
     /// composes its own value and `exportUnit` so its bytes stay language-independent.
     /// What sits between a value and its unit symbol: nothing for a percent sign, a space for
     /// every other unit. Decided by metric, not by comparing the localised symbol.
-    var unitSeparator: String { self == .spo2 ? "" : " " }
+    var unitSeparator: String { self == .spo2 || self == .stress ? "" : " " }
 
     func formatWithUnit(_ value: Double) -> String {
-        "\(format(value)) \(unit)"
+        "\(format(value))\(self == .stress ? "" : " ")\(unit)"
     }
 }
 

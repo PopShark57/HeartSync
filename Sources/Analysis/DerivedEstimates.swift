@@ -13,26 +13,88 @@ enum DerivedEstimates {
         var estimatedMaxHeartRate: Double?
         /// Only when the trend index is enabled and calibrated.
         var bloodPressureCalibration: UserProfile.BPCalibration?
-        /// The synthetic source the blood-pressure trend is written under.
+        /// The synthetic source the blood-pressure trend and the stress index are written under.
         var estimateSourceID: String
+        /// The user's own history, summarised for the stress index. Nil means build it now.
+        var stressBaseline: StressModel.Baseline? = nil
     }
 
     struct Result: Sendable {
         var vo2Max: [Reading]
         var bloodPressure: [Reading]
-        var all: [Reading] { vo2Max + bloodPressure }
+        /// At most one reading: the stress index for the current five-minute slot.
+        var stress: [Reading] = []
+        /// Why there is or is not a stress index now; nil only when it was not computed.
+        var stressAssessment: Swift.Result<StressModel.Assessment, StressModel.Unavailable>?
+        /// The baseline the stress index used, so the caller can reuse it.
+        var stressBaseline: StressModel.Baseline?
+        var all: [Reading] { vo2Max + bloodPressure + stress }
     }
 
     static func compute(
         history: HealthHistory,
         inputs: Inputs,
         now: Date,
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        timeZone: TimeZone = .current
     ) -> Result {
-        Result(
-            vo2Max: vo2Max(history: history, inputs: inputs, now: now, calendar: calendar),
-            bloodPressure: bloodPressure(history: history, inputs: inputs, now: now) ?? []
+        let baseline = inputs.stressBaseline.flatMap {
+            $0.isStale(at: now, utcOffset: timeZone.secondsFromGMT(for: now)) ? nil : $0
+        } ?? StressModel.Baseline.build(
+            history: history,
+            now: now,
+            estimateSourceID: inputs.estimateSourceID,
+            timeZone: timeZone
         )
+        let stress = stress(history: history, inputs: inputs, baseline: baseline, now: now, timeZone: timeZone)
+        return Result(
+            vo2Max: vo2Max(history: history, inputs: inputs, now: now, calendar: calendar),
+            bloodPressure: bloodPressure(history: history, inputs: inputs, now: now) ?? [],
+            stress: stress.reading.map { [$0] } ?? [],
+            stressAssessment: stress.assessment,
+            stressBaseline: baseline
+        )
+    }
+
+    /// The stress index for the current five-minute slot, smoothed with the last slot's.
+    ///
+    /// The previous score is read only from slots before the current one, so recomputing
+    /// inside one slot revises its value rather than blending it with itself.
+    static func stress(
+        history: HealthHistory,
+        inputs: Inputs,
+        baseline: StressModel.Baseline,
+        now: Date,
+        timeZone: TimeZone = .current
+    ) -> (reading: Reading?, assessment: Swift.Result<StressModel.Assessment, StressModel.Unavailable>) {
+        let slot = Int(now.timeIntervalSince1970 / 300)
+        let stamp = Date(timeIntervalSince1970: Double(slot) * 300)
+        let earlier = DateInterval(
+            start: now.addingTimeInterval(-StressModel.smoothingHorizon),
+            end: stamp.addingTimeInterval(-0.001)
+        )
+        let previous = (history.latestOutcome(kind: .stress, sourceID: inputs.estimateSourceID, midpointIn: earlier).value ?? nil)
+            .map { (score: $0.value, at: $0.end) }
+        let assessment = StressModel.assess(
+            history: history,
+            baseline: baseline,
+            now: now,
+            maxHeartRate: inputs.estimatedMaxHeartRate,
+            estimateSourceID: inputs.estimateSourceID,
+            previous: previous,
+            timeZone: timeZone
+        )
+        guard case .success(let result) = assessment else { return (nil, assessment) }
+        let reading = Reading(
+            id: UUID(stableFrom: "derived.stress.\(slot)"),
+            sourceID: inputs.estimateSourceID,
+            kind: .stress,
+            value: (result.score * 10).rounded() / 10,
+            start: stamp,
+            provenance: .estimated,
+            metadata: ReadingMetadata(modelledBy: ReadingMetadata.heartSyncModel)
+        )
+        return (reading, assessment)
     }
 
     /// A VO\u{2082} max estimate per source that reports resting heart rate but no measured

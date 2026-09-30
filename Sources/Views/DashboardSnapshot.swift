@@ -18,6 +18,9 @@ struct SourceReadingRow: Identifiable {
     /// the aligned window the verdict came from. Nil is not "no difference"; it means the
     /// reading was never compared.
     var deltaFromWindowConsensus: Double?
+    /// False for a device's last reading from before `DashboardSnapshot.liveWindow`: shown
+    /// with its age so a spot measurement does not vanish, never compared.
+    var isCurrent: Bool = true
 
     var id: String { source.id }
 }
@@ -47,6 +50,13 @@ struct MetricSummary: Identifiable {
     var sparkline: Sparkline? = nil
 
     var id: MetricKind { kind }
+
+    /// True when at least one device reported inside the live window. A card without a
+    /// current row shows the last value each device reported, labelled with its age.
+    var isCurrent: Bool { rows.contains(where: \.isCurrent) }
+
+    /// When the newest value on the card was measured.
+    var newestTimestamp: Date? { rows.map(\.timestamp).max() }
 }
 
 // MARK: - Sparkline
@@ -233,6 +243,17 @@ struct DashboardSnapshot {
         min(outerLookback, 2 * kind.comparisonWindow + liveWindow)
     }
 
+    /// How long a device's last reading stays on Now once nothing newer has arrived.
+    ///
+    /// Blood pressure, SpO\u{2082}, temperature, and respiratory rate are spot or nightly
+    /// measurements. Dropping them after `liveWindow` meant a card existed only in the quarter
+    /// hour after a measurement, so Now showed heart rate and little else. Such a reading is
+    /// now kept for a week (a month for a daily summary such as VO\u{2082} max), shown with its
+    /// age, and never compared: the verdict still comes from the live windows only.
+    nonisolated static func recentHorizon(for kind: MetricKind) -> TimeInterval {
+        kind.isIntervalSummary ? 30 * 86_400 : 7 * 86_400
+    }
+
     /// Display order of `MetricKind`, precomputed so the comparator is O(1) and total.
     private static let displayOrder: [MetricKind: Int] = Dictionary(
         uniqueKeysWithValues: MetricKind.allCases.enumerated().map { ($0.element, $0.offset) }
@@ -278,8 +299,16 @@ struct DashboardSnapshot {
             )
             failure = failure ?? windowed.error
             let readings = Self.union(windowed.valueOrEmpty, liveByKind[kind] ?? [])
-            guard !readings.isEmpty,
-                  var summary = Self.summary(kind: kind, readings: readings, store: store, now: now)
+            let earlier = Self.earlierReadings(kind: kind, excluding: readings, store: store, now: now, horizon: horizon)
+            failure = failure ?? earlier.error
+            guard !readings.isEmpty || !earlier.valueOrEmpty.isEmpty,
+                  var summary = Self.summary(
+                      kind: kind,
+                      readings: readings,
+                      earlier: earlier.valueOrEmpty,
+                      store: store,
+                      now: now
+                  )
             else { continue }
             let entry = Self.sparklineEntry(
                 kind: kind,
@@ -327,6 +356,33 @@ struct DashboardSnapshot {
         )
     }
 
+    /// Each enabled device's last reading of `kind` within `recentHorizon(for:)`, for the
+    /// devices that have nothing current in `readings`. One indexed `LIMIT 1` read per device
+    /// that has ever reported the metric.
+    private static func earlierReadings(
+        kind: MetricKind,
+        excluding readings: [Reading],
+        store: HealthHistory,
+        now: Date,
+        horizon: Date
+    ) -> HealthStoreQueryOutcome<[Reading]> {
+        let current = Set(ComparisonEngine.latestBySource(
+            from: readings,
+            kind: kind,
+            now: now,
+            staleAfter: liveWindow
+        ).keys)
+        let range = DateInterval(start: now.addingTimeInterval(-recentHorizon(for: kind)), end: horizon)
+        var found: [Reading] = []
+        for source in store.enabledSources
+        where source.observedMetrics.contains(kind) && !current.contains(source.id) {
+            let outcome = store.latestOutcome(kind: kind, sourceID: source.id, midpointIn: range)
+            if let error = outcome.error { return .failure(error) }
+            if let reading = outcome.value ?? nil, reading.isPlausible { found.append(reading) }
+        }
+        return .success(found)
+    }
+
     /// Both reads can return the same reading; each is kept once.
     private static func union(_ first: [Reading], _ second: [Reading]) -> [Reading] {
         guard !second.isEmpty else { return first }
@@ -347,6 +403,7 @@ struct DashboardSnapshot {
     private static func summary(
         kind: MetricKind,
         readings: [Reading],
+        earlier: [Reading] = [],
         store: HealthHistory,
         now: Date
     ) -> MetricSummary? {
@@ -356,7 +413,6 @@ struct DashboardSnapshot {
             now: now,
             staleAfter: liveWindow
         )
-        guard !latest.isEmpty else { return nil }
 
         // Sources with something live to show, resolved once so the verdict below can be
         // checked against what the card actually displays.
@@ -364,7 +420,13 @@ struct DashboardSnapshot {
             guard let source = store.source(id: sourceID) else { return nil }
             return LiveReading(source: source, reading: reading)
         }
-        guard !visible.isEmpty else { return nil }
+        // Devices whose last reading is older than the live window. They are shown, with
+        // their age, and take no part in the verdict below.
+        let previous = earlier.compactMap { reading -> LiveReading? in
+            guard latest[reading.sourceID] == nil, let source = store.source(id: reading.sourceID) else { return nil }
+            return LiveReading(source: source, reading: reading)
+        }
+        guard !visible.isEmpty || !previous.isEmpty else { return nil }
         let visibleIDs = Set(visible.map(\.source.id))
 
         let windowSize = kind.comparisonWindow
@@ -387,7 +449,7 @@ struct DashboardSnapshot {
         let isCurrent = (shared?.start ?? .distantPast) >= currentBucket.addingTimeInterval(-windowSize)
         let aligned = isCurrent ? shared : nil
 
-        let rows = visible
+        let liveRows = visible
             .map { live in
                 SourceReadingRow(
                     source: live.source,
@@ -398,6 +460,19 @@ struct DashboardSnapshot {
                 )
             }
             .sorted { $0.source.displayName < $1.source.displayName }
+        let previousRows = previous
+            .map { earlier in
+                SourceReadingRow(
+                    source: earlier.source,
+                    value: earlier.reading.value,
+                    provenance: earlier.reading.provenance,
+                    timestamp: earlier.reading.end,
+                    deltaFromWindowConsensus: nil,
+                    isCurrent: false
+                )
+            }
+            .sorted { $0.timestamp > $1.timestamp }
+        let rows = liveRows + previousRows
 
         let comparison = aligned.map { window in
             WindowComparison(
@@ -415,7 +490,7 @@ struct DashboardSnapshot {
             comparison: comparison,
             notComparedDetail: comparison == nil
                 ? notComparedDetail(
-                    rows: rows,
+                    rows: liveRows,
                     sharedWindow: shared,
                     sharedWindowIsCurrent: isCurrent,
                     kind: kind,

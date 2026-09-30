@@ -19,6 +19,17 @@ struct DashboardView: View {
     @State private var lastRetryToken = 0
     /// Bumped by the retry button so the load key changes and the query runs again.
     @State private var retryToken = 0
+    /// The on-device summary above the cards, with the facts it was written from.
+    @State private var brief: GeneratedBrief?
+
+    private struct GeneratedBrief: Equatable {
+        var text: String
+        var key: String
+        var generatedAt: Date
+    }
+
+    /// A new brief is asked for at most this often, however the readings move.
+    private static let briefInterval: TimeInterval = 180
 
     /// Clock for the freshness cutoff, not for the timestamps.
     ///
@@ -61,8 +72,12 @@ struct DashboardView: View {
                             message: "Your devices are connected but haven't reported anything yet. Wearables often take a minute to start streaming."
                         )
                     } else {
+                        let facts = NowBriefFacts.build(metrics: snapshot.metrics, stressBand: stressBand, now: now)
                         ScrollView {
                             VStack(alignment: .leading, spacing: 16) {
+                                if let brief {
+                                    NowBriefView(text: brief.text, generatedAt: brief.generatedAt)
+                                }
                                 sourcesHeader
                                 // One column on iPhone; as many 320-point columns as fit on
                                 // iPad or in landscape.
@@ -75,7 +90,8 @@ struct DashboardView: View {
                                             summary: summary,
                                             isBluetoothStreaming: summary.rows.contains {
                                                 streamingSourceIDs.contains($0.source.id)
-                                            }
+                                            },
+                                            stressDrivers: summary.kind == .stress ? stressDrivers : nil
                                         )
                                     }
                                 }
@@ -83,6 +99,8 @@ struct DashboardView: View {
                             .padding(.horizontal)
                             .padding(.bottom, 24)
                         }
+                        // Keyed by what the brief would say, not by every reading.
+                        .task(id: facts?.key) { await refreshBrief(facts) }
                     }
                 } else {
                     ProgressView()
@@ -133,6 +151,27 @@ struct DashboardView: View {
             .refreshable { await model.refresh() }
             .onReceive(tick) { now = $0 }
         }
+    }
+
+    private var stressBand: StressModel.Band? {
+        guard case .success(let assessment) = model.stress else { return nil }
+        return assessment.band
+    }
+
+    /// Asks the on-device model for a new brief when the facts changed, no more often than
+    /// `briefInterval`. Until a new one is accepted the previous brief stays, with its time.
+    private func refreshBrief(_ facts: NowBriefFacts?) async {
+        guard let facts, facts.key != brief?.key, NowBriefGenerator.isAvailable else { return }
+        let wait = brief.map { max(2, Self.briefInterval - Date.now.timeIntervalSince($0.generatedAt)) } ?? 1
+        try? await Task.sleep(for: .seconds(wait))
+        guard !Task.isCancelled, let text = await NowBriefGenerator.generate(facts), !Task.isCancelled else { return }
+        brief = GeneratedBrief(text: text, key: facts.key, generatedAt: .now)
+    }
+
+    /// What moved the current stress level most, when the latest assessment scored.
+    private var stressDrivers: String? {
+        guard case .success(let assessment) = model.stress else { return nil }
+        return assessment.driverSummary
     }
 
     /// Bluetooth sources whose connection is currently streaming.
@@ -199,6 +238,33 @@ struct DashboardView: View {
     }
 }
 
+/// The on-device summary of the cards: a plain paragraph, not a card, so it reads as a
+/// subtitle rather than competing with the measurements.
+private struct NowBriefView: View {
+    var text: String
+    var generatedAt: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(text)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Label {
+                Text("Written on this iPhone by Apple Intelligence from the readings below, \(generatedAt, style: .time). Not medical advice.")
+            } icon: {
+                Image(systemName: "sparkles")
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("now.brief")
+    }
+}
+
 /// One source in the Sources header, with a status it can support.
 private struct SourceChip: View {
     var source: DataSource
@@ -248,6 +314,8 @@ private struct MetricCard: View {
     var summary: MetricSummary
     /// A Bluetooth source on this card is streaming right now.
     var isBluetoothStreaming: Bool
+    /// For the stress card: which signals moved the latest score most.
+    var stressDrivers: String?
 
     /// Keeps the larger Now numerals while still tracking Dynamic Type (fixed 34pt does not).
     @ScaledMetric(relativeTo: .largeTitle) private var headlineSize: CGFloat = 34
@@ -285,6 +353,19 @@ private struct MetricCard: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel(headlineAccessibilityLabel(headline))
                 }
+            }
+
+            // A spot or nightly measurement stays on Now after the live window, but it must
+            // not read as a current value.
+            if !summary.isCurrent, let newest = summary.newestTimestamp {
+                Label {
+                    Text("Last reported \(newest, format: .relative(presentation: .named)). Not a live value.")
+                } icon: {
+                    Image(systemName: "clock.arrow.circlepath")
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("now.card.lastReported")
             }
 
             if let comparison = summary.comparison {
@@ -328,6 +409,16 @@ private struct MetricCard: View {
                 EstimateDisclaimer(text: Estimators.BloodPressureEstimate.disclaimer)
             }
 
+            if summary.kind == .stress {
+                if let stressDrivers, summary.isCurrent {
+                    Text(stressDrivers)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("now.stress.drivers")
+                }
+                EstimateDisclaimer(text: StressModel.disclaimer)
+            }
+
             NavigationLink {
                 MetricDetailView(kind: summary.kind)
             } label: {
@@ -356,6 +447,9 @@ private struct MetricCard: View {
     /// whether the devices could be compared.
     private func headlineAccessibilityLabel(_ value: Double) -> String {
         let formatted = summary.kind.formatWithUnit(value)
+        guard summary.isCurrent else {
+            return "\(summary.kind.title), last reported \(formatted)"
+        }
         return summary.comparison == nil
             ? "\(summary.kind.title), latest reading \(formatted)"
             : "\(summary.kind.title), window consensus \(formatted)"

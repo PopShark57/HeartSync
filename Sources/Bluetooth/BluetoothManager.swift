@@ -146,6 +146,9 @@ final class BluetoothManager: NSObject {
     private var onReadings: (@MainActor ([Reading]) -> Void)?
     /// Called when a link ends, so values waiting to be committed are not held back.
     private var onLinkEnded: (@MainActor () -> Void)?
+    /// Called after a ring's on-demand measurement completed and its value was handed to
+    /// `onReading`, with the ring's source ID. A stress check waits on this.
+    @ObservationIgnored var onRingMeasurement: (@MainActor (String, R11MRingSession.RingValue) -> Void)?
 
     // MARK: Setup
 
@@ -943,6 +946,7 @@ final class BluetoothManager: NSObject {
                     )
                     if accepted { note(metric: metric.kind, for: id, at: measuredAt) }
                 }
+                onRingMeasurement?(id.uuidString, value)
 
             case .emitHistory(let samples):
                 emitRingHistory(samples, from: id)

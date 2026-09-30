@@ -63,11 +63,17 @@ enum YCBTFrameCodec {
     }
 
     /// The measurement sensors the start/stop command addresses. Both public references agree
-    /// on these three codes; others they list (temperature, HRV, stress) are not requested.
+    /// on the first three, which are verified on an R11M. Temperature (`04`) is PulseLoop's
+    /// mode table, checked against the vendor app's own measure screens but not on this
+    /// ring; the vitals capture reports an R11M whose capability bitmap has no temperature
+    /// sensor, and such a ring is expected to refuse it with a non-zero status. HRV (`0A`)
+    /// and stress (`0C`) are never requested: their values arrive only in history records
+    /// HeartSync cannot decode, and the same capture shows the R11M lacks both.
     enum Sensor: UInt8, CaseIterable, Sendable {
         case heartRate = 0x00
         case bloodPressure = 0x01
         case bloodOxygen = 0x02
+        case temperature = 0x04
     }
 
     // MARK: Encoding

@@ -731,7 +731,7 @@ struct PairwiseAnalysisView: View {
         case .hrvSDNN, .hrvRMSSD:
             true
         case .heartRate, .restingHeartRate, .spo2, .respiratoryRate, .bodyTemperature,
-             .vo2Max, .bloodPressureSystolic, .bloodPressureDiastolic:
+             .vo2Max, .bloodPressureSystolic, .bloodPressureDiastolic, .stress:
             false
         }
     }

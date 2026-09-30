@@ -25,7 +25,9 @@ import Foundation
 /// - A write that CoreBluetooth completed is only a transport result. Acceptance is the
 ///   protocol acknowledgement, and success is a decoded, completed measurement.
 ///
-/// Heart rate, blood oxygen, and blood pressure can be measured on request. Blood pressure
+/// Heart rate, blood oxygen, blood pressure, and temperature can be measured on request.
+/// Temperature has no live frame: the ring only stores it, so a completed temperature
+/// measurement is read back from the ring's temperature and combined records. Blood pressure
 /// from a finger's optical sensor is a vendor model, not a cuff measurement, so it is stored
 /// as an estimate; so is the ring's temperature, which is a vendor-adjusted finger reading
 /// rather than a body-temperature measurement (`provenance(for:)`).
@@ -104,12 +106,14 @@ struct R11MRingSession: Equatable, Sendable {
         case heartRate
         case bloodOxygen
         case bloodPressure
+        case temperature
 
         var sensor: YCBTFrameCodec.Sensor {
             switch self {
             case .heartRate:     .heartRate
             case .bloodOxygen:   .bloodOxygen
             case .bloodPressure: .bloodPressure
+            case .temperature:   .temperature
             }
         }
 
@@ -119,6 +123,7 @@ struct R11MRingSession: Equatable, Sendable {
             case .heartRate:     "heart rate"
             case .bloodOxygen:   "blood oxygen"
             case .bloodPressure: "blood pressure"
+            case .temperature:   "temperature"
             }
         }
 
@@ -128,6 +133,7 @@ struct R11MRingSession: Equatable, Sendable {
             case .heartRate:     "Heart rate"
             case .bloodOxygen:   "Blood oxygen"
             case .bloodPressure: "Blood pressure (estimate)"
+            case .temperature:   "Temperature (estimate)"
             }
         }
 
@@ -136,7 +142,22 @@ struct R11MRingSession: Equatable, Sendable {
             case .heartRate:     "heart.text.square"
             case .bloodOxygen:   "lungs"
             case .bloodPressure: "gauge.with.dots.needle.33percent"
+            case .temperature:   "thermometer.medium"
             }
+        }
+
+        /// The ring's stored records that hold this measurement's value, when it sends no
+        /// live frame for it. Empty for a measurement with a live value.
+        var storedIn: [YCBTHistory.Kind] {
+            switch self {
+            case .heartRate, .bloodOxygen, .bloodPressure: []
+            case .temperature: [.temperature, .combined]
+            }
+        }
+
+        /// The metric a stored-only measurement produces.
+        var storedMetric: MetricKind? {
+            self == .temperature ? .bodyTemperature : nil
         }
     }
 
@@ -194,7 +215,7 @@ struct R11MRingSession: Equatable, Sendable {
     /// Apple Health.
     static func provenance(for kind: MetricKind) -> Provenance {
         switch kind {
-        case .bloodPressureSystolic, .bloodPressureDiastolic, .bodyTemperature:
+        case .bloodPressureSystolic, .bloodPressureDiastolic, .bodyTemperature, .stress:
             .estimated
         case .heartRate, .restingHeartRate, .hrvSDNN, .hrvRMSSD, .spo2, .respiratoryRate, .vo2Max:
             .measured
@@ -208,6 +229,8 @@ struct R11MRingSession: Equatable, Sendable {
         var skipped = 0
         /// Types whose transfer failed its length or CRC check, or stopped answering.
         var failed: [YCBTHistory.Kind] = []
+        /// The newest decoded record of each metric, for reporting a stored-only measurement.
+        var newest: [MetricKind: YCBTHistory.Sample] = [:]
     }
 
     enum Outcome: Equatable, Sendable {
@@ -228,6 +251,9 @@ struct R11MRingSession: Equatable, Sendable {
         case unrecognizedResult(UInt8)
         case cancelled
         case historyImported(HistorySummary)
+        /// A stored-only measurement finished and was read back from the ring's memory.
+        /// `sample` is nil when no record new enough to be this measurement came back.
+        case readFromMemory(Measurement, sample: YCBTHistory.Sample?, summary: HistorySummary)
     }
 
     /// Progress through a history import: one type at a time, in `YCBTHistory.Kind` order.
@@ -240,6 +266,9 @@ struct R11MRingSession: Equatable, Sendable {
         /// The first reply for the current type; the per-type cap runs from here.
         var firstReplyAt: Date?
         var summary = HistorySummary()
+        /// Set when this import reads back a stored-only measurement that just finished.
+        var measurement: Measurement?
+        var measurementFinishedAt: Date?
     }
 
     enum Phase: Equatable, Sendable {
@@ -521,6 +550,17 @@ struct R11MRingSession: Equatable, Sendable {
             guard let measurement = activeMeasurement, sensor == measurement.sensor.rawValue else { return [] }
             token += 1
             switch result {
+            case 0x01 where !measurement.storedIn.isEmpty:
+                // No live frame carries this value; the ring has written it to memory, which
+                // is where its own app reads it from too.
+                var progress = HistoryProgress(
+                    current: measurement.storedIn[0],
+                    remaining: Array(measurement.storedIn.dropFirst())
+                )
+                progress.measurement = measurement
+                progress.measurementFinishedAt = date
+                phase = .importingHistory(progress)
+                return requestHistoryActions(progress.current)
             case 0x01:
                 guard let value = lastLiveValue, let at = lastLiveAt else {
                     phase = .ready(last: .finishedWithoutValue)
@@ -559,6 +599,9 @@ struct R11MRingSession: Equatable, Sendable {
                 let decoded = YCBTHistory.decode(progress.current, records: progress.buffer, timeZone: historyTimeZone, now: date)
                 progress.summary.imported += decoded.samples.count
                 progress.summary.skipped += decoded.skipped
+                for sample in decoded.samples where sample.recordedAt > (progress.summary.newest[sample.kind]?.recordedAt ?? .distantPast) {
+                    progress.summary.newest[sample.kind] = sample
+                }
                 if !decoded.samples.isEmpty { actions.append(.emitHistory(decoded.samples)) }
             } else {
                 progress.summary.failed.append(progress.current)
@@ -613,7 +656,15 @@ struct R11MRingSession: Equatable, Sendable {
         var progress = progress
         guard !progress.remaining.isEmpty else {
             token += 1
-            phase = .ready(last: .historyImported(progress.summary))
+            if let measurement = progress.measurement {
+                phase = .ready(last: .readFromMemory(
+                    measurement,
+                    sample: Self.storedResult(of: measurement, in: progress),
+                    summary: progress.summary
+                ))
+            } else {
+                phase = .ready(last: .historyImported(progress.summary))
+            }
             return []
         }
         progress.current = progress.remaining.removeFirst()
@@ -622,6 +673,22 @@ struct R11MRingSession: Equatable, Sendable {
         progress.firstReplyAt = nil
         phase = .importingHistory(progress)
         return requestHistoryActions(progress.current)
+    }
+
+    /// How far before the completion event a stored record may be timed and still be this
+    /// measurement: the measurement's own length, plus a few minutes for a ring clock that
+    /// runs behind.
+    static let storedResultTolerance: TimeInterval = defaultAcquisitionTimeout + 5 * 60
+
+    /// The newest stored record of the measurement's metric, if it is recent enough to be the
+    /// one just taken. An older record is an earlier reading, not this measurement's.
+    private static func storedResult(of measurement: Measurement, in progress: HistoryProgress) -> YCBTHistory.Sample? {
+        guard let metric = measurement.storedMetric,
+              let sample = progress.summary.newest[metric],
+              let finished = progress.measurementFinishedAt,
+              sample.recordedAt >= finished.addingTimeInterval(-storedResultTolerance)
+        else { return nil }
+        return sample
     }
 
     // MARK: Presentation
@@ -649,7 +716,7 @@ struct R11MRingSession: Equatable, Sendable {
             case .finishedWithoutValue:
                 "The ring finished without sending a value."
             case .requestRejected(let status):
-                "Ring rejected the measurement request (status \(String(format: "%02X", status)))."
+                "Ring rejected the measurement request (status \(String(format: "%02X", status))). Its firmware may not support that measurement."
             case .writeFailed(let error):
                 "The request could not be sent: \(error)"
             case .timedOut(let packets):
@@ -666,6 +733,12 @@ struct R11MRingSession: Equatable, Sendable {
                 "Cancelled."
             case .historyImported(let summary):
                 Self.historyText(summary)
+            case .readFromMemory(let measurement, let sample, _):
+                if let sample {
+                    "\(measurement.menuTitle) read from the ring: \(sample.kind.formatWithUnit(sample.value)) at \(sample.recordedAt.formatted(date: .omitted, time: .shortened))."
+                } else {
+                    "The ring finished measuring \(measurement.title) but stored no new value."
+                }
             }
         case .starting(let measurement):
             "Starting \(measurement.title) measurement\u{2026}"
