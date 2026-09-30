@@ -63,7 +63,13 @@ rate, body temperature, VO₂ max, blood pressure, and HeartSync's estimated str
 device against its own 30-day history), heart rate (against your own heart rate at the same
 time of day), and, when available, breathing, temperature, and SpO₂ with your baseline,
 weights them by how fresh and well supported they are, and declines to score when heart rate
-suggests exercise. It is recomputed every five minutes and never written to Apple Health.
+suggests exercise. It is scored once per five-minute slot and kept as a log in the local
+history (the Stress card on Now opens it), never written to Apple Health. Scoring continues
+in the background whenever iOS wakes HeartSync with a new input: each Bluetooth value from a
+connected strap or ring, and Apple Health background delivery (at most about hourly). With no
+new input nothing wakes the app, so the log has gaps; iOS also stops relaunching it after
+the user force-quits it from the app switcher. A slot where there is no current heart rate
+or HRV, or where heart rate suggests exercise, is not scored.
 
 **Now** shows each device's latest reading of every metric from the last week (a month for
 daily summaries), so spot measurements such as blood pressure or SpO₂ stay visible with

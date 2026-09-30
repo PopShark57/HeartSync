@@ -139,7 +139,7 @@ The XcodeGen settings enable Swift 6 with complete strict-concurrency checking.
 - History reads and analysis run off the main actor. `HealthStore.history` is a `Sendable` `HealthHistory` (sources, generations, and a pool of read-only SQLite connections, `HealthDatabase.ReaderPool`); snapshot builders take it and run inside `HealthHistory.offMain`, and only the finished snapshot is published on the main actor. Writes stay on the store's writer connection on the main actor.
 - Networking uses `async`/`await` and `URLSession.data(for:)`.
 - Authentication and HealthKit callback APIs are bridged to async continuations or explicit `Task { @MainActor in ... }` hops.
-- Repeating work uses cancellable `Task` loops. The derived-estimate loop runs every 300 seconds; Oura auto-sync has a 300-second minimum; BLE scanning has a 60-second timeout.
+- Repeating work uses cancellable `Task` loops. The derived-estimate loop runs once per five-minute stress slot, five seconds after it begins (`AppModel.delayUntilNextSlotPass`); Oura auto-sync has a 300-second minimum; BLE scanning has a 60-second timeout.
 - Use `Task {}` to bridge synchronous SwiftUI/framework callbacks into isolated work. Long-lived tasks should check cancellation and weakly capture app-lifetime owners where the existing code does so.
 - Do not use detached work to mutate observed state.
 
@@ -367,7 +367,7 @@ These abstractions encode product correctness and should be reused rather than r
 - `ComparisonEngine`: epoch-aligned windows, per-source medians, pairing, evidence state, discrepancies, and Bland-Altman statistics.
 - `PairwiseExporter`: stable CSV and summary semantics, UTC formatting, and explicit source metadata. `CSV.escape` (RFC 4180) and `CSV.spreadsheetSafe` (leading `=`, `+`, `-`, `@` made literal) are the only CSV writers; the whole-history and per-source exports use them for source names and models too.
 - Estimates HeartSync computes carry `ReadingMetadata.modelledBy`, and `HealthStore.reconcileEstimates` deletes only within its scope: blood-pressure and stress estimates under `AppModel.estimateSourceID`, VO₂ max estimates that are HeartSync's own. A ring's estimated blood pressure and temperature are never candidates.
-- `StressModel`: the stress index (`MetricKind.stress`, 0–100, always `.estimated`, one reading per five-minute slot under the estimate source, never written to Health). Robust z-scores against the user's own history: per-source ln(HRV) median/MAD over 30 days (0.40), heart rate against the same local hours over 14 days from one SQL aggregate (`HealthDatabase.hourOfDayMoments`, 0.30, else resting heart rate plus a waking allowance at half weight), respiration (0.10), a temperature rise (0.08), and an SpO₂ fall (0.07). Weights fade with freshness; a heart-rate reserve above 50% refuses to score (likely exercise) and 30–50% fades the heart-rate and HRV terms; thin evidence is shrunk towards the typical score; a score from the previous 20 minutes is blended in. Blood pressure is not an input (it is modelled from the same signals). The `Baseline` is cached by `AppModel` for six hours and dropped on reset. `StressModel.disclaimer` appears with every stress value.
+- `StressModel`: the stress index (`MetricKind.stress`, 0–100, always `.estimated`, one reading per five-minute slot under the estimate source, never written to Health). Robust z-scores against the user's own history: per-source ln(HRV) median/MAD over 30 days (0.40), heart rate against the same local hours over 14 days from one SQL aggregate (`HealthDatabase.hourOfDayMoments`, 0.30, else resting heart rate plus a waking allowance at half weight), respiration (0.10), a temperature rise (0.08), and an SpO₂ fall (0.07). Weights fade with freshness; a heart-rate reserve above 50% refuses to score (likely exercise) and 30–50% fades the heart-rate and HRV terms; thin evidence is shrunk towards the typical score; a score from the previous 20 minutes is blended in. Blood pressure is not an input (it is modelled from the same signals). The `Baseline` is cached by `AppModel` for six hours and dropped on reset. Background logging: `AppModel.ingest` calls `scoreCurrentSlotIfDue` when it commits a reading of `StressModel.inputKinds`, so a slot the suspended timer missed is scored when a Bluetooth notification or Health background delivery wakes the app; a slot is scored once (`lastScoredSlot`), one pass runs at a time, and the pass holds a background-task assertion taken before the callback returns (`BackgroundWork.start`). There is no `BGTaskScheduler` path: with no new input nothing wakes the app, and that gap is not filled. `StressModel.disclaimer` appears with every stress value.
 - `HRVCalculator`/`HRVAccumulator`: RR filtering and HRV derivation.
 - `Estimators`: estimated VO2 max and blood-pressure trend rules/provenance.
 - `Components.swift`: `SourceDot`, `SourceValueRow`, `AgreementBadge`, `EmptyStateView`, `EstimateDisclaimer`, `BatteryMeter`, `BatteryBadge`, `SignalBars`, and `metricCard()`.
@@ -607,11 +607,12 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/NowRecentReadingsTests.swift`: 7 tests covering spot readings kept on Now with their
   age, blood pressure from yesterday, the horizon, the newest earlier reading, old rows kept
   out of a live verdict, paused devices, and the bounded latest-reading query.
-- `Tests/StressModelTests.swift`: 18 tests covering robust statistics, the hour-of-day
+- `Tests/StressModelTests.swift`: 20 tests covering robust statistics, the hour-of-day
   aggregate, typical/stressed/relaxed scores and their drivers, the exercise gate, missing
   signals and baselines, per-source HRV scales, smoothing, secondary signals, freshness,
-  bands, storage as a slot estimate, baseline lifetime, the metric's contract, and the ring
-  stress check.
+  bands, storage as a slot estimate, baseline lifetime, the metric's contract, the ring
+  stress check, the slot timer's alignment, and background logging (a new input scores an
+  unscored slot once, one pass at a time, and other metrics start none).
 - `Tests/RingTemperatureTests.swift`: 6 tests covering the temperature start request, a
   refusal storing nothing, completion reading memory and reporting the new value, only an
   old record, no contact, and live measurements reading no memory.

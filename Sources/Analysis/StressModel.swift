@@ -299,6 +299,20 @@ enum StressModel {
 
     // MARK: Parameters
 
+    /// The metrics a score reads. A newly committed reading of one of these is what makes a
+    /// five-minute slot worth scoring while the app runs in the background.
+    static let inputKinds: Set<MetricKind> = [
+        .heartRate, .restingHeartRate, .hrvRMSSD, .hrvSDNN, .respiratoryRate, .bodyTemperature, .spo2,
+    ]
+
+    /// The length of one stored stress slot: one reading per slot, stamped at its start.
+    static let slotLength: TimeInterval = 300
+
+    /// The five-minute slot `date` falls in, counted from the Unix epoch.
+    static func slot(at date: Date) -> Int {
+        Int((date.timeIntervalSince1970 / slotLength).rounded(.down))
+    }
+
     static let heartRateMaxAge: TimeInterval = 15 * 60
     static let rmssdMaxAge: TimeInterval = 90 * 60
     /// Apple Watch records SDNN every few hours; an Oura night's average ends at waking.
