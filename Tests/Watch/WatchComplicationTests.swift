@@ -64,6 +64,74 @@ struct WatchComplicationTests {
         #expect(value.availability == .unavailable)
     }
 
+    @Test("The stress complication shows HeartSync's estimate; other metrics still drop estimates")
+    func stressEstimate() throws {
+        var snapshot = fixture()
+        var heartEstimate = snapshot.metrics[0].readings[0]
+        heartEstimate.id = "heartsync.estimate"
+        heartEstimate.timestamp = now
+        heartEstimate.provenance = .estimated
+        snapshot.metrics[0].readings.append(heartEstimate)
+        snapshot.metrics.append(WatchMetric(
+            kind: .stress,
+            readings: [WatchSourceReading(id: "heartsync.estimate", sourceName: "HeartSync estimates", value: 42,
+                                         timestamp: now.addingTimeInterval(-60),
+                                         provenance: .estimated, isCompacted: false)],
+            omittedSourceCount: 0,
+            comparison: WatchComparison(readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: 86_400)
+        ))
+        #expect(WatchComplicationValue.estimatedKinds == [.stress])
+        #expect(WatchComplicationValue(kind: .heartRate, snapshot: snapshot).reading?.id == "strap")
+
+        let stress = WatchComplicationValue(kind: .stress, snapshot: snapshot)
+        let reading = try #require(stress.reading)
+        #expect(reading.value == 42)
+        #expect(reading.provenance == .estimated)
+
+        // The cache keeps it, so the extension draws the same thing the app would.
+        let projection = snapshot.complicationProjection
+        #expect(projection.metrics.map(\.kind) == [.heartRate, .stress])
+        #expect(WatchComplicationValue(kind: .stress, snapshot: projection).reading == reading)
+
+        // Ages like any five-minute metric, and a reset or unavailable phone clears it.
+        #expect(!stress.isStale(at: now.addingTimeInterval(14 * 60)))
+        #expect(stress.isStale(at: now.addingTimeInterval(15 * 60)))
+        snapshot.availability = .unavailable
+        snapshot.metrics = []
+        #expect(WatchComplicationValue(kind: .stress, snapshot: snapshot).reading == nil)
+    }
+
+    @Test("A new stress score reloads the complications; an unchanged one does not")
+    func stressReload() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = WatchComplicationStore(directory: directory)
+        var snapshot = fixture()
+        snapshot.metrics.append(WatchMetric(
+            kind: .stress,
+            readings: [WatchSourceReading(id: "heartsync.estimate", sourceName: "HeartSync estimates", value: 42,
+                                         timestamp: now.addingTimeInterval(-60),
+                                         provenance: .estimated, isCompacted: false)],
+            omittedSourceCount: 0,
+            comparison: WatchComparison(readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: 86_400)
+        ))
+        #expect(try store.save(snapshot))
+        let cached = try store.load()
+        #expect(WatchComplicationValue(kind: .stress, snapshot: cached).reading?.value == 42)
+        #expect(WatchComplicationStore.widgetKinds.contains(WatchComplicationStore.stressWidgetKind))
+        #expect(Set(WatchComplicationStore.widgetKinds).count == WatchComplicationStore.widgetKinds.count)
+
+        var redelivered = snapshot
+        redelivered.generatedAt = now.addingTimeInterval(30)
+        #expect(try !store.save(redelivered))
+
+        var rescored = redelivered
+        rescored.generatedAt = now.addingTimeInterval(300)
+        rescored.metrics[1].readings[0].value = 55
+        rescored.metrics[1].readings[0].timestamp = now.addingTimeInterval(240)
+        #expect(try store.save(rescored))
+    }
+
     @Test("A future timeline entry ages a reading without receiving another snapshot")
     func timelineAging() throws {
         let value = WatchComplicationValue(kind: .heartRate, snapshot: fixture())

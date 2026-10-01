@@ -14,12 +14,18 @@ struct WatchComplicationValue: Sendable {
             : nil
     }
 
-    /// The reading a complication draws for a metric. Estimates need their full explanation
-    /// in the app, so they are never shown. Selected deterministically from the same bounded
-    /// set of enabled sources shown on the watch dashboard: newest first, ties by source id.
+    /// Metrics whose complication shows HeartSync's estimate. The stress index is never
+    /// measured, only modelled (`StressModel`), so its own complication would otherwise be
+    /// permanently empty; it labels every value as an estimate and opens the metric's caveat.
+    static let estimatedKinds: Set<MetricKind> = [.stress]
+
+    /// The reading a complication draws for a metric. Other estimates (blood pressure,
+    /// VO₂ max, a ring's temperature) need their full explanation in the app, so they are
+    /// never shown. Selected deterministically from the same bounded set of enabled sources
+    /// shown on the watch dashboard: newest first, ties by source id.
     static func displayedReading(in metric: WatchMetric) -> WatchSourceReading? {
         metric.readings
-            .filter { $0.provenance != .estimated }
+            .filter { $0.provenance != .estimated || estimatedKinds.contains(metric.kind) }
             .sorted {
                 $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp > $1.timestamp
             }.first

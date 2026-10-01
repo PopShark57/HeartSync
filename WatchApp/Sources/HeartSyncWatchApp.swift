@@ -76,7 +76,9 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
         connection.onSnapshotReceived = { snapshot in
             do {
                 if try WatchComplicationStore().save(snapshot) {
-                    WidgetCenter.shared.reloadTimelines(ofKind: WatchComplicationStore.metricWidgetKind)
+                    for kind in WatchComplicationStore.widgetKinds {
+                        WidgetCenter.shared.reloadTimelines(ofKind: kind)
+                    }
                 }
             } catch {
                 Logger(subsystem: "com.heartsync.HeartSyncChecker.watchkitapp", category: "Complications")

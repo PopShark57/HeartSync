@@ -5,6 +5,7 @@ import WidgetKit
 struct HeartSyncComplications: WidgetBundle {
     var body: some Widget {
         HeartSyncMeasurementWidget()
+        HeartSyncStressWidget()
     }
 }
 
@@ -18,6 +19,22 @@ struct HeartSyncMeasurementWidget: Widget {
         }
         .configurationDisplayName("HeartSync Measurement")
         .description("A recent reading from iPhone. Choose heart rate, oxygen, HRV, breathing rate, or temperature. Tap for sources and measurement time.")
+        .supportedFamilies([.accessoryCircular, .accessoryRectangular, .accessoryInline, .accessoryCorner])
+    }
+}
+
+/// HeartSync's stress index on the watch face. A separate widget, not a choice in the
+/// measurement intent: the stress index is only ever an estimate, and every family says so.
+/// Tapping opens the metric on the watch, where its caveat is shown.
+struct HeartSyncStressWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: WatchComplicationStore.stressWidgetKind, provider: StressProvider()) { entry in
+            MeasurementComplicationView(entry: entry)
+                .containerBackground(.fill.tertiary, for: .widget)
+                .widgetURL(WatchComplicationLink.metric(entry.value.kind).url)
+        }
+        .configurationDisplayName("HeartSync Stress")
+        .description("HeartSync's stress estimate from iPhone, a score out of 100 against your own baseline. An estimate, not a measurement or a medical assessment.")
         .supportedFamilies([.accessoryCircular, .accessoryRectangular, .accessoryInline, .accessoryCorner])
     }
 }
@@ -71,6 +88,10 @@ struct MeasurementComplicationView: View {
         guard let reading = value.reading else { return value.kind.shortTitle }
         if isStale { return String(localized: "Older") }
         if reading.isCompacted { return String(localized: "Median") }
+        if reading.provenance == .estimated {
+            return String(localized: "complication.estimate.short", defaultValue: "Est.",
+                          comment: "Short label in a circular watch complication's opening: the value is HeartSync's estimate, not a measurement")
+        }
         if reading.provenance == .derived { return reading.provenance.title }
         return value.kind.shortTitle
     }
@@ -90,7 +111,7 @@ struct MeasurementComplicationView: View {
                     Text("·")
                     if reading.isCompacted {
                         Text("Median")
-                    } else if reading.provenance == .derived {
+                    } else if reading.provenance != .measured {
                         Text(reading.provenance.title)
                     } else {
                         Text(reading.sourceName)
@@ -114,7 +135,7 @@ struct MeasurementComplicationView: View {
         guard let reading = value.reading else { return value.emptyMessage }
         if isStale { return String(localized: "Older") }
         if reading.isCompacted { return String(localized: "Median") }
-        if reading.provenance == .derived { return reading.provenance.title }
+        if reading.provenance != .measured { return reading.provenance.title }
         return value.kind.unit
     }
 
@@ -123,7 +144,7 @@ struct MeasurementComplicationView: View {
         if isStale { return String(localized: "Older reading") }
         let formatted = value.kind.formatWithUnit(reading.value)
         if reading.isCompacted { return "\(formatted) · \(String(localized: "Median"))" }
-        if reading.provenance == .derived { return "\(formatted) · \(reading.provenance.title)" }
+        if reading.provenance != .measured { return "\(formatted) · \(reading.provenance.title)" }
         return formatted
     }
 
@@ -132,25 +153,31 @@ struct MeasurementComplicationView: View {
         let time = reading.timestamp.formatted(date: .abbreviated, time: .shortened)
         let age = isStale ? String(localized: "Older reading") : String(localized: "Recent reading")
         let aggregation = reading.isCompacted ? String(localized: "Compacted window median") : ""
-        return "\(value.kind.title), \(value.kind.formatWithUnit(reading.value)). \(age). \(reading.provenance.title). \(aggregation) \(reading.sourceName). \(time)."
+        let caveat = reading.provenance == .estimated
+            ? String(localized: "complication.estimate.spoken", defaultValue: "HeartSync's estimate, not a measurement.",
+                     comment: "Spoken after an estimated value on a watch complication, such as the stress index")
+            : ""
+        return "\(value.kind.title), \(value.kind.formatWithUnit(reading.value)). \(age). \(reading.provenance.title). \(caveat) \(aggregation) \(reading.sourceName). \(time)."
     }
 }
 
 #if DEBUG
 /// A current, an older, and a compacted heart rate, so the gauge and its Older and Median
-/// labels can be checked in Xcode. Preview-only: nothing here reaches the shared cache.
+/// labels can be checked in Xcode, and a current and an older stress estimate. Preview-only:
+/// nothing here reaches the shared cache.
 private enum ComplicationPreviewEntries {
-    static func entry(value: Double, age: TimeInterval, compacted: Bool = false) -> MeasurementEntry {
+    static func entry(kind: MetricKind = .heartRate, value: Double, age: TimeInterval,
+                      provenance: Provenance = .measured, compacted: Bool = false) -> MeasurementEntry {
         let now = Date.now
         let snapshot = WatchSnapshot(generatedAt: now, metrics: [WatchMetric(
-            kind: .heartRate,
+            kind: kind,
             readings: [WatchSourceReading(id: "preview", sourceName: "Example source", value: value,
                                          timestamp: now.addingTimeInterval(-age),
-                                         provenance: .measured, isCompacted: compacted)],
+                                         provenance: provenance, isCompacted: compacted)],
             omittedSourceCount: 0,
             comparison: WatchComparison(readyPairs: 0, incompletePairs: 0, outsideTolerancePairs: 0, lookback: 3_600)
         )])
-        return MeasurementEntry(date: now, value: WatchComplicationValue(kind: .heartRate, snapshot: snapshot))
+        return MeasurementEntry(date: now, value: WatchComplicationValue(kind: kind, snapshot: snapshot))
     }
 }
 
@@ -160,5 +187,18 @@ private enum ComplicationPreviewEntries {
     ComplicationPreviewEntries.entry(value: 72, age: 60)
     ComplicationPreviewEntries.entry(value: 72, age: 6 * 3_600)
     ComplicationPreviewEntries.entry(value: 68, age: 120, compacted: true)
+}
+
+#Preview("Stress, circular", as: .accessoryCircular) {
+    HeartSyncStressWidget()
+} timeline: {
+    ComplicationPreviewEntries.entry(kind: .stress, value: 32, age: 120, provenance: .estimated)
+    ComplicationPreviewEntries.entry(kind: .stress, value: 32, age: 3_600, provenance: .estimated)
+}
+
+#Preview("Stress, rectangular", as: .accessoryRectangular) {
+    HeartSyncStressWidget()
+} timeline: {
+    ComplicationPreviewEntries.entry(kind: .stress, value: 58, age: 120, provenance: .estimated)
 }
 #endif

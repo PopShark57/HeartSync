@@ -51,7 +51,7 @@ HeartSyncApp
 | `Sources/Watch` | iPhone snapshot projection and coalesced WatchConnectivity publication. |
 | `Shared` | Versioned display payload, WatchConnectivity session, and complication projection compiled into both apps. |
 | `WatchApp` | Native watchOS SwiftUI dashboard and Compare pages, `WatchTheme` glass surfaces, resources, and entitlements. |
-| `WatchComplications` | WidgetKit measurement complication, metric intent, resources, and App Group entitlement. |
+| `WatchComplications` | WidgetKit measurement and stress complications, metric intent, resources, and App Group entitlement. |
 | `Sources/Health` | HealthKit authorization, anchored queries, unit/source conversion, background delivery, and measured-value write-back. |
 | `Sources/Oura` | OAuth, Keychain-backed credentials, API transport/DTOs, endpoint status, token-free cache, sync orchestration, and scalar mapping. |
 | `Sources/Analysis` | Comparison/windowing/statistics, HRV, estimators, and pairwise export. These are mostly pure or value-oriented. |
@@ -271,7 +271,7 @@ The watch app's dashboard requires a snapshot from the paired iPhone and always 
   rejects malformed data, and ignores older contexts after newer resets. The watch restores
   the OS-managed received context. `WatchComplicationStore` caches one replaceable display
   snapshot for the extension; there is no second health history database.
-- The App Group holds `WatchSnapshot.complicationProjection`, not the whole payload: per metric, the one reading a complication draws. `WatchComplicationStore.save` returns true, and timelines reload, only when that projection differs (`drawsSameComplications`); a new delivery time, chart, or comparison count reloads nothing.
+- The App Group holds `WatchSnapshot.complicationProjection`, not the whole payload: per metric, the one reading a complication draws. `WatchComplicationStore.save` returns true, and every kind in `WatchComplicationStore.widgetKinds` reloads, only when that projection differs (`drawsSameComplications`); a new delivery time, chart, or comparison count reloads nothing.
 - Complications share `group.com.heartsync.HeartSyncChecker.watch` between the watch app and
   extension only. Both profiles must include App Groups. The cache is validated, bounded to
   60 KB, atomic, protected until first unlock, and excluded from backup. Cache writes and
@@ -283,6 +283,14 @@ The watch app's dashboard requires a snapshot from the paired iPhone and always 
   Preserve derived/median labels, explicit empty/old states, and measurement-time freshness.
   Schedule a future stale entry; WidgetKit reload timing remains system-controlled. Mark
   measurement views privacy-sensitive. `heartsync-watch` links open metric details only. Preview fixtures must not enter the shared cache.
+- The **HeartSync Stress** complication (`HeartSyncStressWidget`, kind `HeartSyncStress`, a
+  `StaticConfiguration` with no intent) is the one place a complication shows an estimate.
+  `WatchComplicationValue.estimatedKinds` is `[.stress]` only; every other metric's estimates
+  (blood pressure, VO₂ max, a ring's temperature) stay out of the projection. Every family
+  labels the value: Est. in the circular opening, Estimated elsewhere, and "HeartSync's
+  estimate, not a measurement" for VoiceOver. It shows no band and no colour judgement, and a
+  tap opens the stress detail with its estimate caveat. Do not add stress to
+  `ComplicationMetric`, and do not widen `estimatedKinds` without the same labelling.
 - Always On: the dashboard reads `isLuminanceReduced`, keeps values prominent, dims secondary
   content, and hides trends. Measurement values are `privacySensitive()`, as the complications are.
 - The watch's App ID needs only the App Group and the same team `7RLDYXQTNX`. Its generated
