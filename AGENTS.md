@@ -282,9 +282,14 @@ The watch app's dashboard requires a snapshot from the paired iPhone and always 
   opening shows Older or Median when either applies.
   Preserve derived/median labels, explicit empty/old states, and measurement-time freshness.
   Schedule a future stale entry; WidgetKit reload timing remains system-controlled. Mark
-  measurement views privacy-sensitive. `heartsync-watch` links open metric details only. Preview fixtures must not enter the shared cache.
-- The **HeartSync Stress** complication (`HeartSyncStressWidget`, kind `HeartSyncStress`, a
-  `StaticConfiguration` with no intent) is the one place a complication shows an estimate.
+  measurement views privacy-sensitive. Colour is the metric's identity hue only
+  (`MetricKind.tint`: a light-to-full ring of that one hue, tinted labels, and
+  `ComplicationBackground` in the Smart Stack), grey when empty or Older; it never encodes
+  whether a value is good or bad, and tinted faces recolour the `widgetAccentable` parts. `heartsync-watch` links open metric details only. Preview fixtures must not enter the shared cache.
+- The **HeartSync Stress** complication (`HeartSyncStressWidget`, kind `HeartSyncStress`, an
+  `AppIntentConfiguration` whose `StressIntent` has no parameter and one recommendation,
+  "Stress (estimate)": the watch face's complication list names rows from recommendations,
+  and as a `StaticConfiguration` the row had no name) is the one place a complication shows an estimate.
   `WatchComplicationValue.estimatedKinds` is `[.stress]` only; every other metric's estimates
   (blood pressure, VO₂ max, a ring's temperature) stay out of the projection. Every family
   labels the value: Est. in the circular opening, Estimated elsewhere, and "HeartSync's

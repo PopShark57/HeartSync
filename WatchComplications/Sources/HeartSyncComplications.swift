@@ -14,7 +14,7 @@ struct HeartSyncMeasurementWidget: Widget {
         AppIntentConfiguration(kind: WatchComplicationStore.metricWidgetKind,
                                intent: MeasurementIntent.self, provider: MeasurementProvider()) { entry in
             MeasurementComplicationView(entry: entry)
-                .containerBackground(.fill.tertiary, for: .widget)
+                .containerBackground(for: .widget) { ComplicationBackground(kind: entry.value.kind) }
                 .widgetURL(WatchComplicationLink.metric(entry.value.kind).url)
         }
         .configurationDisplayName("HeartSync Measurement")
@@ -25,17 +25,30 @@ struct HeartSyncMeasurementWidget: Widget {
 
 /// HeartSync's stress index on the watch face. A separate widget, not a choice in the
 /// measurement intent: the stress index is only ever an estimate, and every family says so.
-/// Tapping opens the metric on the watch, where its caveat is shown.
+/// Tapping opens the metric on the watch, where its caveat is shown. Its intent has no
+/// parameter; it exists so the complication list has a named row (`StressProvider.recommendations`).
 struct HeartSyncStressWidget: Widget {
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: WatchComplicationStore.stressWidgetKind, provider: StressProvider()) { entry in
+        AppIntentConfiguration(kind: WatchComplicationStore.stressWidgetKind,
+                               intent: StressIntent.self, provider: StressProvider()) { entry in
             MeasurementComplicationView(entry: entry)
-                .containerBackground(.fill.tertiary, for: .widget)
+                .containerBackground(for: .widget) { ComplicationBackground(kind: entry.value.kind) }
                 .widgetURL(WatchComplicationLink.metric(entry.value.kind).url)
         }
         .configurationDisplayName("HeartSync Stress")
         .description("HeartSync's stress estimate from iPhone, a score out of 100 against your own baseline. An estimate, not a measurement or a medical assessment.")
         .supportedFamilies([.accessoryCircular, .accessoryRectangular, .accessoryInline, .accessoryCorner])
+    }
+}
+
+/// The metric's own hue behind a complication where the system draws a background (the
+/// Smart Stack). Watch faces remove it.
+struct ComplicationBackground: View {
+    let kind: MetricKind
+
+    var body: some View {
+        LinearGradient(colors: [kind.tint.opacity(0.45), kind.tint.opacity(0.14)],
+                       startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 }
 
@@ -46,6 +59,18 @@ struct MeasurementComplicationView: View {
     private var value: WatchComplicationValue { entry.value }
     private var isStale: Bool { value.isStale(at: entry.date) }
 
+    /// The metric's identity hue (`MetricKind.tint`), grey once there is no current value.
+    /// It names the metric and never judges the value: the ring is one hue from light to
+    /// full, the same for every reading, and stress gets no band. Full-colour faces draw it;
+    /// tinted and vibrant faces recolour the `widgetAccentable` parts themselves.
+    private var hue: Color {
+        value.reading == nil || isStale ? .gray : value.kind.tint
+    }
+
+    private var hueGradient: Gradient {
+        Gradient(colors: [hue.mix(with: .white, by: 0.5), hue])
+    }
+
     var body: some View {
         Group {
             switch family {
@@ -55,6 +80,8 @@ struct MeasurementComplicationView: View {
             case .accessoryCorner:
                 Text(compactNumber)
                     .font(.title3.bold()).monospacedDigit()
+                    .foregroundStyle(hue.mix(with: .white, by: 0.25))
+                    .widgetAccentable()
                     .widgetCurvesContent()
                     .widgetLabel { Text("\(value.kind.shortTitle) · \(compactFootnote)") }
             default: circular
@@ -75,12 +102,14 @@ struct MeasurementComplicationView: View {
         let shown = value.reading.flatMap { isStale ? nil : $0.value }
         return Gauge(value: min(max(shown ?? range.lowerBound, range.lowerBound), range.upperBound), in: range) {
             Text(circularLabel)
+                .foregroundStyle(hue.mix(with: .white, by: 0.25))
         } currentValueLabel: {
             Text(compactNumber)
                 .monospacedDigit()
                 .minimumScaleFactor(0.6)
         }
         .gaugeStyle(.accessoryCircular)
+        .tint(hueGradient)
         .widgetAccentable()
     }
 
@@ -99,7 +128,9 @@ struct MeasurementComplicationView: View {
     private var rectangular: some View {
         VStack(alignment: .leading, spacing: 2) {
             Label(value.kind.title, systemImage: value.kind.systemImage)
-                .font(.caption).widgetAccentable().lineLimit(1)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(hue.mix(with: .white, by: 0.25))
+                .widgetAccentable().lineLimit(1)
             if let reading = value.reading {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(value.kind.formatWithUnit(reading.value)).font(.headline).monospacedDigit()
@@ -117,7 +148,7 @@ struct MeasurementComplicationView: View {
                         Text(reading.sourceName)
                     }
                 }
-                .font(.caption2).lineLimit(1)
+                .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             } else {
                 Text(value.emptyMessage).font(.headline)
                 Text("Sync from iPhone").font(.caption2)

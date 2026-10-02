@@ -49,11 +49,13 @@ recommendations include heart rate, resting heart rate, SpO₂, RMSSD, SDNN, res
 and absolute body temperature. Each slot can use a different measurement. The widget supports circular, rectangular, inline, and corner families; rectangular widgets also work
 in the Smart Stack.
 
-- **HeartSync Stress** is a separate complication with nothing to configure. It shows
+- **HeartSync Stress** is a separate complication with nothing to configure, listed as
+  **Stress (estimate)**. It shows
   HeartSync's stress index, a score out of 100 against the user's own baseline, in the same
   four families. It is the only complication that shows an estimate, and every family says
   so: **Est.** in the circular opening, **Estimated** in the others, and "HeartSync's
-  estimate, not a measurement" for VoiceOver. No band or colour judges the score. It ages
+  estimate, not a measurement" for VoiceOver. No band or colour judges the score: like
+  every complication it wears its metric's own hue, grey when empty or **Older**. It ages
   like other fast metrics (**Older** after 15 minutes without a new score) and a tap opens
   the stress detail and its caveat.
 - Measurements use the most recent non-estimated reading among the dashboard's displayed
