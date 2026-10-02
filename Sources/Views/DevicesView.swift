@@ -317,7 +317,7 @@ struct DevicesView: View {
         } header: {
             Text("Bluetooth sensors")
         } footer: {
-            Text("Works with devices using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles, such as most chest straps and standards-compliant pulse oximeters. Some rings only measure on request through a vendor protocol. HeartSync has candidate support for one such protocol (YCBT): once the ring has identified itself, it offers heart-rate, blood-oxygen, blood-pressure, and temperature measurements and a stress check, and can import the readings the ring stored on its own. The stress level is HeartSync's own estimate: the ring measures heart rate for it. Ring blood pressure and temperature are saved as estimates. Use Run Bluetooth diagnostics from a device's menu to see what it sends.")
+            Text("Works with devices using the standard Bluetooth Heart Rate (0x180D), Pulse Oximeter (0x1822), or Health Thermometer (0x1809) profiles, such as most chest straps and standards-compliant pulse oximeters. Some rings only measure on request through a vendor protocol. HeartSync has candidate support for one such protocol (YCBT): once the ring has identified itself, it offers heart-rate, blood-oxygen, blood-pressure, and temperature measurements and a stress check, and can import the readings the ring stored on its own. Measure › Automatic measuring sets how often the ring measures by itself, like the vendor app's Health monitoring interval; the ring only does so once its clock has been set (HeartSync does not set it), and it measures even when it is off your finger, so imported automatic readings can include values taken while the ring was not worn. The stress level is HeartSync's own estimate: the ring measures heart rate for it. Ring blood pressure and temperature are saved as estimates. Use Run Bluetooth diagnostics from a device's menu to see what it sends.")
         }
     }
 
@@ -358,6 +358,8 @@ struct DevicesView: View {
                         Label("Stress level (estimate)", systemImage: MetricKind.stress.systemImage)
                     }
                     .accessibilityHint("Measures your heart rate on the ring, then estimates your stress level from it and from your recent HRV, breathing, temperature, and blood oxygen, compared with your own baseline.")
+                    Divider()
+                    automaticMeasuringMenu(source: source)
                 } label: {
                     Label("Measure", systemImage: "waveform.path.ecg")
                         .font(.caption.weight(.medium))
@@ -365,7 +367,7 @@ struct DevicesView: View {
                 }
                 // Takes the row's borderless button style, so only its label is a tap target.
                 .menuStyle(.button)
-                .accessibilityHint("Choose heart rate, blood oxygen, blood pressure, temperature, or a stress check for one on-demand measurement.")
+                .accessibilityHint("Choose heart rate, blood oxygen, blood pressure, temperature, or a stress check for one on-demand measurement, or how often the ring measures on its own.")
                 Button {
                     model.bluetooth.importRingHistory(sourceID: source.id)
                 } label: {
@@ -379,6 +381,29 @@ struct DevicesView: View {
             .buttonStyle(.borderless)
             .labelStyle(.titleAndIcon)
         }
+    }
+
+    /// The ring's own schedule, as the vendor app's Health monitoring interval. The ring
+    /// cannot report its current setting, so no choice is shown as selected; the row's status
+    /// line says what the ring accepted.
+    private func automaticMeasuringMenu(source: DataSource) -> some View {
+        Menu {
+            Section {
+                ForEach(R11MRingSession.MonitoringSchedule.intervalChoices, id: \.self) { minutes in
+                    Button("Every \(minutes) min") {
+                        model.bluetooth.setRingMonitoring(.every(minutes), sourceID: source.id)
+                    }
+                }
+                Button("Off") {
+                    model.bluetooth.setRingMonitoring(.off, sourceID: source.id)
+                }
+            } header: {
+                Text("How often the ring measures heart rate and blood oxygen on its own")
+            }
+        } label: {
+            Label("Automatic measuring", systemImage: "timer")
+        }
+        .accessibilityHint("Sets how often the ring measures by itself. It keeps those readings in its memory until you use Import stored. The ring measures on schedule even when it is not on your finger, unless it is charging.")
     }
 
     private func measurementHint(_ measurement: R11MRingSession.Measurement) -> String {

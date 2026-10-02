@@ -78,6 +78,12 @@ Record the ring's model, firmware, and the diagnostic report with each result.
   and matches SmartHealth's figure. On the charger the meter turns green with a bolt within 15
   minutes; off it, the level updates within 15 minutes. The diagnostics report shows one
   "Battery query" command per interval and none during a measurement or import.
+- [ ] Automatic measuring: choose Every 30 min. The row reports what the ring accepted for
+  heart rate and blood oxygen (or names the one it refused), and the diagnostics report shows
+  exactly one "Set automatic … measuring" command per monitor. SmartHealth's Health monitoring
+  › Interval then shows 30 min. After an hour on the finger, Import stored brings in about two
+  new heart-rate values. Choose Off: SmartHealth shows monitoring off, and no new automatic
+  values appear. Reconnecting sends no setting.
 - [ ] A chest strap and a standard pulse oximeter still work unchanged.
 
 ## Liquid Glass (iOS 26+, and the iOS 18 fallback)
