@@ -810,6 +810,13 @@ final class BluetoothManager: NSObject {
         updateRingSession(sourceID: sourceID) { $0.importHistory() }
     }
 
+    /// Sets how often the ring measures on its own. The one ring setting HeartSync writes,
+    /// and only from the user's choice; the readings it leads to stay in the ring's memory
+    /// until Import stored.
+    func setRingMonitoring(_ schedule: R11MRingSession.MonitoringSchedule, sourceID: String) {
+        updateRingSession(sourceID: sourceID) { $0.setMonitoring(schedule) }
+    }
+
     /// Import stored on every connected ring that is identified and idle, for a wrist
     /// sync-all. A ring that is measuring, importing, or not yet identified is left alone.
     /// Returns how many imports started.

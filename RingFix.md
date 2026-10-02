@@ -45,6 +45,24 @@ HeartSync's own estimate (`StressModel`), not the vendor's: the menu item measur
 rate on the ring and scores stress with it and with other sources' HRV. Vendor HRV (`0A`) and
 stress (`0C`) modes are not requested. Unverified on hardware.
 
+### Follow-up (2026-10-02): automatic measuring interval
+
+At the owner's request, the Measure menu has an Automatic measuring submenu (every 30, 40,
+50, 60, 90, or 120 minutes, or off), the setting SmartHealth shows as Health monitoring ›
+Interval. It writes `settingHeartMonitor` (`01 0C`) and then `settingBloodOxygenModeMonitor`
+(`01 26`), payload `{enable, minutes}`, each after the previous reply or a 10-second timeout,
+and reports each answer (a one-byte status: `00` accepted, `FC` not implemented). Evidence:
+the vitals write-up lists both as accepted by a ring whose firmware images are R11M, and
+PulseLoop builds the same bytes; its captured refusal of the blood-pressure monitor
+(`01 1C 07 00 FC CB 44`) reproduces exactly under HeartSync's CRC, so that monitor, and the
+temperature and HRV monitors its capability bitmap lacks, are never sent. The 30-minute floor
+is SmartHealth's own clamp for rings, as PulseLoop documents it. The setting is written only
+when the user picks one, never on connect; the ring keeps it, and HeartSync cannot read it
+back. The write-up reports that automatic readings are stored, never pushed (they arrive
+through Import stored), that the ring samples only once its clock is synced (HeartSync does
+not set it), and that the sampler does not check wear. Tests: `Tests/RingMonitoringTests.swift`.
+Unverified on this ring.
+
 Where the framing came from: the frame layout (`group | command | length LE | payload | CRC
 LE`, CRC-16/CCITT-FALSE, total length including header and CRC) and the `04 0E` completion
 event are from independent public write-ups of R11M-reporting and YCBT rings

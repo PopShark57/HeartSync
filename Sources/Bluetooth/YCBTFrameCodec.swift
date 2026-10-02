@@ -60,7 +60,48 @@ enum YCBTFrameCodec {
         static let liveBloodPressure = Opcode(group: 0x06, command: 0x03)
         /// End of one history transfer (`05 80`). See `YCBTHistory`.
         static let historyBlockEnd = Opcode(group: YCBTHistory.group, command: YCBTHistory.blockEndCommand)
+        /// The ring's own periodic heart-rate sampling (`01 0C`, `settingHeartMonitor`).
+        static let heartRateMonitor = Opcode(group: 0x01, command: 0x0C)
+        /// The ring's own periodic blood-oxygen sampling (`01 26`, `settingBloodOxygenModeMonitor`).
+        static let bloodOxygenMonitor = Opcode(group: 0x01, command: 0x26)
     }
+
+    /// The ring's automatic ("all-day") samplers HeartSync can schedule: the two a ring
+    /// reporting R11M firmware accepted in the vitals capture. That capture's ring refused the
+    /// blood-pressure monitor (`01 1C`, reply `FC`), and its capability bitmap lacks
+    /// temperature and HRV, so those monitors are never sent.
+    ///
+    /// Payload `{enable, minutes}`, as both public references build it. A sampler stores its
+    /// values in the ring's memory and pushes nothing live, so its readings reach HeartSync only
+    /// through Import stored readings.
+    enum Monitor: String, CaseIterable, Hashable, Sendable {
+        case heartRate
+        case bloodOxygen
+
+        var opcode: Opcode {
+            switch self {
+            case .heartRate:   .heartRateMonitor
+            case .bloodOxygen: .bloodOxygenMonitor
+            }
+        }
+
+        init?(opcode: Opcode) {
+            guard let monitor = Self.allCases.first(where: { $0.opcode == opcode }) else { return nil }
+            self = monitor
+        }
+
+        /// Lower-case, for use inside sentences.
+        var title: String {
+            switch self {
+            case .heartRate:   "heart rate"
+            case .bloodOxygen: "blood oxygen"
+            }
+        }
+    }
+
+    /// Status bytes the vendor SDK treats as a refusal when they are a reply's whole payload.
+    /// `FC` means the firmware does not implement that command.
+    static let unsupportedCommandStatus: UInt8 = 0xFC
 
     /// The measurement sensors the start/stop command addresses. Both public references agree
     /// on the first three, which are verified on an R11M. Temperature (`04`) is PulseLoop's
@@ -106,6 +147,13 @@ enum YCBTFrameCodec {
         encode(.measurementControl, payload: [start ? 0x01 : 0x00, sensor.rawValue])
     }
 
+    /// Turns one of the ring's automatic samplers on or off. `intervalMinutes` is how often
+    /// it measures while on; the vendor app sends it with "off" too. This changes a setting
+    /// on the ring, so it is written only when the user chooses a schedule.
+    static func monitorRequest(_ monitor: Monitor, enabled: Bool, intervalMinutes: UInt8) -> Data {
+        encode(monitor.opcode, payload: [enabled ? 0x01 : 0x00, intervalMinutes])
+    }
+
     // MARK: Checking
 
     /// CRC-16/CCITT-FALSE. The check value for ASCII "123456789" is 0x29B1.
@@ -143,6 +191,8 @@ enum YCBTFrameCodec {
         /// Record bytes of one history type, to be concatenated before decoding.
         case historyData(YCBTHistory.Kind, payload: [UInt8])
         case historyBlockEnd(YCBTHistory.BlockEnd)
+        /// The ring's reply to a monitor setting. `status == 0` is acceptance.
+        case monitorAck(Monitor, status: UInt8)
         /// A CRC-valid frame HeartSync does not interpret (status, history\u{2026}).
         case other(Opcode)
         /// A CRC-valid frame whose payload is too short for its opcode.
@@ -201,6 +251,11 @@ enum YCBTFrameCodec {
         case .historyBlockEnd:
             guard let end = YCBTHistory.blockEnd(from: payload) else { return .truncated(frame.opcode) }
             return .historyBlockEnd(end)
+        case .heartRateMonitor, .bloodOxygenMonitor:
+            guard let status = payload.first, let monitor = Monitor(opcode: frame.opcode) else {
+                return .truncated(frame.opcode)
+            }
+            return .monitorAck(monitor, status: status)
         default:
             guard frame.group == YCBTHistory.group else { return .other(frame.opcode) }
             if let kind = YCBTHistory.Kind(queryCommand: frame.command) {

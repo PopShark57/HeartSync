@@ -12,9 +12,12 @@ import Foundation
 ///   properties), never from the advertised name.
 /// - No command is written until both vendor channels have confirmed their subscription.
 /// - The only command sent unprompted is a read-only identity query, repeated while the ring
-///   is idle to refresh its battery level (`refreshBattery`). A measurement command or
-///   a history request is sent only after that query produced a CRC-valid reply, and only
-///   when the user asks.
+///   is idle to refresh its battery level (`refreshBattery`). A measurement command,
+///   a history request, or the automatic-measuring setting is sent only after that query
+///   produced a CRC-valid reply, and only when the user asks.
+/// - The automatic-measuring setting (`setMonitoring`) is the one ring setting HeartSync
+///   writes. It is never sent on connect or repeated: the ring keeps whatever was last set,
+///   by HeartSync or by the vendor app.
 /// - Live values during a measurement are provisional. The ring's early values are a warm-up
 ///   (a steady, wrong figure) and it signals the end of a measurement separately, so a value
 ///   is emitted only when the ring reports that measurement complete, using the last live
@@ -161,6 +164,55 @@ struct R11MRingSession: Equatable, Sendable {
         }
     }
 
+    // MARK: Automatic measuring
+
+    /// How often the ring measures on its own, as the vendor app's Health monitoring switch
+    /// and Interval picker set it. The ring keeps the setting; HeartSync cannot read it back.
+    struct MonitoringSchedule: Equatable, Hashable, Sendable {
+        var isEnabled: Bool
+        var intervalMinutes: Int
+
+        /// The vendor app clamps a ring's interval to at least 30 minutes, and its picker steps
+        /// by ten from there. Larger values are within the payload byte; the ring's reply says
+        /// whether it took them.
+        static let intervalChoices = [30, 40, 50, 60, 90, 120]
+        static let minimumIntervalMinutes = 30
+        /// The vendor default, also sent alongside "off" as the vendor app does.
+        static let defaultIntervalMinutes = 60
+
+        static func every(_ minutes: Int) -> Self {
+            Self(isEnabled: true, intervalMinutes: minutes)
+        }
+
+        static let off = Self(isEnabled: false, intervalMinutes: defaultIntervalMinutes)
+
+        /// The interval as sent: never under the vendor floor and never past one byte.
+        var intervalByte: UInt8 {
+            UInt8(min(Int(UInt8.max), max(Self.minimumIntervalMinutes, intervalMinutes)))
+        }
+
+        var text: String {
+            isEnabled ? "every \(intervalByte) min" : "off"
+        }
+    }
+
+    /// What the ring said to one monitor setting.
+    enum MonitorResult: Equatable, Sendable {
+        case accepted
+        /// A non-zero status. `FC` is the firmware's "not implemented".
+        case rejected(status: UInt8)
+        case noAnswer
+        case writeFailed(String)
+    }
+
+    /// Progress through a schedule change: one monitor at a time, in `Monitor` order.
+    struct MonitoringProgress: Equatable, Sendable {
+        var schedule: MonitoringSchedule
+        var current: YCBTFrameCodec.Monitor
+        var remaining: [YCBTFrameCodec.Monitor]
+        var results: [YCBTFrameCodec.Monitor: MonitorResult] = [:]
+    }
+
     /// One completed or provisional value from a live measurement.
     enum RingValue: Equatable, Hashable, Sendable {
         case heartRate(bpm: Int)
@@ -254,6 +306,8 @@ struct R11MRingSession: Equatable, Sendable {
         /// A stored-only measurement finished and was read back from the ring's memory.
         /// `sample` is nil when no record new enough to be this measurement came back.
         case readFromMemory(Measurement, sample: YCBTHistory.Sample?, summary: HistorySummary)
+        /// A schedule change finished; each monitor has its own answer.
+        case monitoringSet(MonitoringSchedule, results: [YCBTFrameCodec.Monitor: MonitorResult])
     }
 
     /// Progress through a history import: one type at a time, in `YCBTHistory.Kind` order.
@@ -282,6 +336,8 @@ struct R11MRingSession: Equatable, Sendable {
         case starting(Measurement)
         case measuring(Measurement, provisional: RingValue?)
         case importingHistory(HistoryProgress)
+        /// Writing the automatic-measuring setting and waiting for the ring's replies.
+        case configuringMonitors(MonitoringProgress)
     }
 
     enum Timeout: Equatable, Sendable {
@@ -289,6 +345,8 @@ struct R11MRingSession: Equatable, Sendable {
         case acquisition
         /// No history frame for `historyInactivityTimeout`.
         case history
+        /// No reply to a monitor setting within `monitorReplyTimeout`.
+        case monitorSetting
     }
 
     enum Purpose: Equatable, Sendable {
@@ -299,6 +357,7 @@ struct R11MRingSession: Equatable, Sendable {
         case stop(Measurement)
         case historyRequest(YCBTHistory.Kind)
         case historyAcknowledgement
+        case setMonitor(YCBTFrameCodec.Monitor, MonitoringSchedule)
 
         /// Diagnostic wording.
         var rawValue: String {
@@ -309,6 +368,7 @@ struct R11MRingSession: Equatable, Sendable {
             case .stop(let measurement):  "Stop \(measurement.title) measurement"
             case .historyRequest(let kind): "Request stored \(kind.title) history"
             case .historyAcknowledgement: "Acknowledge history transfer"
+            case .setMonitor(let monitor, let schedule): "Set automatic \(monitor.title) measuring \(schedule.text)"
             }
         }
     }
@@ -338,6 +398,8 @@ struct R11MRingSession: Equatable, Sendable {
     /// A single history type that keeps streaming past this is abandoned, so a misbehaving
     /// peripheral cannot hold the session in an import indefinitely.
     static let historyTypeCap: TimeInterval = 120
+    /// A setting is answered at once; the identity query uses the same budget.
+    static let monitorReplyTimeout: TimeInterval = 10
 
     let writeWithResponse: Bool
     var acquisitionTimeout: TimeInterval
@@ -365,7 +427,7 @@ struct R11MRingSession: Equatable, Sendable {
     /// for this peripheral.
     var isIdentified: Bool {
         switch phase {
-        case .ready, .starting, .measuring, .importingHistory: true
+        case .ready, .starting, .measuring, .importingHistory, .configuringMonitors: true
         default: false
         }
     }
@@ -399,6 +461,11 @@ struct R11MRingSession: Equatable, Sendable {
 
     var isImportingHistory: Bool {
         if case .importingHistory = phase { return true }
+        return false
+    }
+
+    var isConfiguringMonitors: Bool {
+        if case .configuringMonitors = phase { return true }
         return false
     }
 
@@ -457,6 +524,21 @@ struct R11MRingSession: Equatable, Sendable {
         return requestHistoryActions(first)
     }
 
+    /// The user chose how often the ring measures on its own. Writes the heart-rate monitor,
+    /// then the blood-oxygen monitor, each after the previous reply (or its timeout), so one
+    /// refusal does not hide the other's answer. Changes a setting on the ring and nothing
+    /// else; the readings it then takes stay in the ring's memory until Import stored.
+    mutating func setMonitoring(_ schedule: MonitoringSchedule) -> [Action] {
+        guard canStartMeasurement, let first = YCBTFrameCodec.Monitor.allCases.first else { return [] }
+        let progress = MonitoringProgress(
+            schedule: schedule,
+            current: first,
+            remaining: Array(YCBTFrameCodec.Monitor.allCases.dropFirst())
+        )
+        phase = .configuringMonitors(progress)
+        return requestMonitorActions(progress)
+    }
+
     /// Asks an idle, identified ring for its battery with the same read-only identity query.
     /// Nothing is sent while a measurement or an import owns the channel.
     mutating func refreshBattery() -> [Action] {
@@ -482,6 +564,8 @@ struct R11MRingSession: Equatable, Sendable {
     mutating func writeFinished(_ purpose: Purpose, error: String?) -> [Action] {
         guard let error else { return [] }
         switch (purpose, phase) {
+        case (.setMonitor(let monitor, _), .configuringMonitors(let progress)) where progress.current == monitor:
+            return recordMonitor(.writeFailed(error), in: progress)
         case (.identify, .identifying):
             token += 1
             phase = .unidentified("The identity query could not be written: \(error)")
@@ -511,6 +595,8 @@ struct R11MRingSession: Equatable, Sendable {
         case (.history, .importingHistory(var progress)):
             progress.summary.failed.append(progress.current)
             return advanceHistory(progress)
+        case (.monitorSetting, .configuringMonitors(let progress)):
+            return recordMonitor(.noAnswer, in: progress)
         default:
             return []
         }
@@ -608,6 +694,10 @@ struct R11MRingSession: Equatable, Sendable {
             }
             return actions + advanceHistory(progress)
 
+        case .monitorAck(let monitor, let status):
+            guard case .configuringMonitors(let progress) = phase, progress.current == monitor else { return [] }
+            return recordMonitor(status == 0 ? .accepted : .rejected(status: status), in: progress)
+
         case .other, .truncated:
             return []
         }
@@ -635,6 +725,33 @@ struct R11MRingSession: Equatable, Sendable {
             .write(YCBTHistory.request(kind), purpose: .historyRequest(kind)),
             .scheduleTimeout(.history, seconds: Self.historyInactivityTimeout, token: token),
         ]
+    }
+
+    private mutating func requestMonitorActions(_ progress: MonitoringProgress) -> [Action] {
+        token += 1
+        let request = YCBTFrameCodec.monitorRequest(
+            progress.current,
+            enabled: progress.schedule.isEnabled,
+            intervalMinutes: progress.schedule.intervalByte
+        )
+        return [
+            .write(request, purpose: .setMonitor(progress.current, progress.schedule)),
+            .scheduleTimeout(.monitorSetting, seconds: Self.monitorReplyTimeout, token: token),
+        ]
+    }
+
+    /// Records the current monitor's answer and moves to the next, or finishes.
+    private mutating func recordMonitor(_ result: MonitorResult, in progress: MonitoringProgress) -> [Action] {
+        var progress = progress
+        progress.results[progress.current] = result
+        guard !progress.remaining.isEmpty else {
+            token += 1
+            phase = .ready(last: .monitoringSet(progress.schedule, results: progress.results))
+            return []
+        }
+        progress.current = progress.remaining.removeFirst()
+        phase = .configuringMonitors(progress)
+        return requestMonitorActions(progress)
     }
 
     /// Keeps the import alive after a frame of the current type, unless that type has run
@@ -739,6 +856,8 @@ struct R11MRingSession: Equatable, Sendable {
                 } else {
                     "The ring finished measuring \(measurement.title) but stored no new value."
                 }
+            case .monitoringSet(let schedule, let results):
+                Self.monitoringText(schedule, results: results)
             }
         case .starting(let measurement):
             "Starting \(measurement.title) measurement\u{2026}"
@@ -750,7 +869,47 @@ struct R11MRingSession: Equatable, Sendable {
             }
         case .importingHistory(let progress):
             "Reading the ring's stored \(progress.current.title)\u{2026}"
+        case .configuringMonitors(let progress):
+            "Setting the ring's automatic \(progress.current.title) measuring\u{2026}"
         }
+    }
+
+    /// What the ring accepted, then what it did not and why. Only an accepted setting is
+    /// described as in effect.
+    static func monitoringText(
+        _ schedule: MonitoringSchedule,
+        results: [YCBTFrameCodec.Monitor: MonitorResult]
+    ) -> String {
+        let monitors = YCBTFrameCodec.Monitor.allCases
+        let accepted = monitors.filter { results[$0] == .accepted }
+        var parts: [String] = []
+        if accepted.isEmpty {
+            parts.append("The ring did not accept the automatic-measuring setting.")
+        } else {
+            let names = accepted.map(\.title).joined(separator: " and ")
+            if schedule.isEnabled {
+                parts.append("The ring accepted automatic \(names) measuring every \(schedule.intervalByte) min. It keeps those readings until you use Import stored.")
+            } else {
+                parts.append("Automatic \(names) measuring is off on the ring.")
+            }
+        }
+        for monitor in monitors {
+            let reason: String
+            switch results[monitor] {
+            case .accepted:
+                continue
+            case .rejected(let status) where status == YCBTFrameCodec.unsupportedCommandStatus:
+                reason = "not supported by this ring"
+            case .rejected(let status):
+                reason = "refused (status \(String(format: "%02X", status)))"
+            case .noAnswer, nil:
+                reason = "no answer"
+            case .writeFailed(let error):
+                reason = "not sent (\(error))"
+            }
+            parts.append("Automatic \(monitor.title): \(reason).")
+        }
+        return parts.joined(separator: " ")
     }
 
     /// Short enough for the one-line device row: counts first, details only when they

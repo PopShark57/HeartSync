@@ -39,6 +39,15 @@ until the ring answers it correctly. After that, and only when you tap them:
   temperature. Reading does not delete anything from the ring. Each transfer must pass its
   length and CRC check; records older than 30 days, in the future, or sharing a timestamp
   (a clock that was never set) are skipped. Importing again does not duplicate readings.
+- **Measure › Automatic measuring** sets how often the ring measures by itself (every 30 to
+  120 minutes, or off), the setting SmartHealth calls Health monitoring › Interval. HeartSync
+  writes the ring's heart-rate (`01 0C`) and blood-oxygen (`01 26`) monitor settings, the two a
+  ring reporting R11M firmware accepted in a published capture, and reports each reply; it
+  never sends them on its own and cannot read the current setting back. The ring keeps these
+  readings in its memory, so they reach HeartSync through Import stored readings. Per the same
+  write-up, the ring samples only once its clock has been set (HeartSync does not set it) and
+  samples on schedule whether or not it is worn, so imported automatic values can include
+  readings from a ring that was off the finger.
 
 Ring blood pressure is a cuffless optical model and ring temperature is a vendor-adjusted
 finger reading, so both are stored as **estimates**: excluded from device agreement by
