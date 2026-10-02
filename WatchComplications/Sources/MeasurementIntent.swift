@@ -44,3 +44,13 @@ struct MeasurementIntent: WidgetConfigurationIntent {
         self.metric = metric
     }
 }
+
+/// The stress complication has nothing to choose. It is still an intent configuration, with
+/// one recommendation, because the watch face's complication list names each row from a
+/// recommendation's description: as a `StaticConfiguration` its row had no name.
+struct StressIntent: WidgetConfigurationIntent {
+    static let title: LocalizedStringResource = "HeartSync Stress"
+    static let description = IntentDescription("HeartSync's stress estimate, synced from HeartSync on iPhone.")
+
+    init() {}
+}

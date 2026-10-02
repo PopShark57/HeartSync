@@ -44,17 +44,27 @@ struct MeasurementProvider: AppIntentTimelineProvider {
 }
 
 /// The stress complication has nothing to configure: it always shows HeartSync's own score.
-struct StressProvider: TimelineProvider {
+struct StressProvider: AppIntentTimelineProvider {
     func placeholder(in context: Context) -> MeasurementEntry {
         preview()
     }
 
-    func getSnapshot(in context: Context, completion: @escaping @Sendable (MeasurementEntry) -> Void) {
-        completion(context.isPreview ? preview() : ComplicationTimeline.entry(kind: .stress, date: .now))
+    func snapshot(for configuration: StressIntent, in context: Context) async -> MeasurementEntry {
+        context.isPreview ? preview() : ComplicationTimeline.entry(kind: .stress, date: .now)
     }
 
-    func getTimeline(in context: Context, completion: @escaping @Sendable (Timeline<MeasurementEntry>) -> Void) {
-        completion(ComplicationTimeline.timeline(kind: .stress))
+    func timeline(for configuration: StressIntent, in context: Context) async -> Timeline<MeasurementEntry> {
+        ComplicationTimeline.timeline(kind: .stress)
+    }
+
+    /// The one row the watch face's complication list shows for this widget, named as an
+    /// estimate like every other place the score appears.
+    func recommendations() -> [AppIntentRecommendation<StressIntent>] {
+        [AppIntentRecommendation(
+            intent: StressIntent(),
+            description: String(localized: "complication.stress.listName", defaultValue: "Stress (estimate)",
+                                comment: "Name of the stress complication in the watch face's complication list")
+        )]
     }
 
     /// Synthetic, and an estimate like every real stress value.
