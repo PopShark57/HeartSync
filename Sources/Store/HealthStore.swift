@@ -283,6 +283,9 @@ final class HealthStore {
                 ?? existing.upstreamDeviceRelationshipID
             existing.identifiesHealthKitWriter = source.identifiesHealthKitWriter
                 ?? existing.identifiesHealthKitWriter
+            if let types = source.writerProductTypes {
+                existing.writerProductTypes = (existing.writerProductTypes ?? []).union(types)
+            }
             if let battery = source.batteryPercent { existing.batteryPercent = battery }
             existing.observedMetrics.formUnion(source.observedMetrics)
             sources[index] = existing
@@ -755,6 +758,23 @@ final class HealthStore {
     func latest(kind: MetricKind, sourceID: String) -> Reading? {
         _ = dataGeneration
         return query { try $0.latest(kind: kind, sourceID: sourceID) }.value ?? nil
+    }
+
+    /// One source's raw readings of a metric, refiled under `targetID` for an upsert that
+    /// moves them there (`HealthKitWatchRelay`). Each keeps its id, so the move is idempotent.
+    ///
+    /// Compacted window medians stay where they are: their ids derive from the source that
+    /// compacted them, and a compacted window is final. They age out with retention. Nil
+    /// before load and when the read fails, so the caller can try again later.
+    func rawReadings(kind: MetricKind, sourceID: String, refiledUnder targetID: String) -> [Reading]? {
+        guard loadState == .loaded else { return nil }
+        return query { try $0.readings(kind: kind, sourceID: sourceID) }.value?
+            .filter { $0.metadata?.aggregation == nil }
+            .map { reading in
+                var moved = reading
+                moved.sourceID = targetID
+                return moved
+            }
     }
 
     func lastDataDate(sourceID: String) -> Date? {

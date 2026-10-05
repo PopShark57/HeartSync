@@ -133,11 +133,11 @@ struct HealthKitSelfSourceTests {
             end: start.addingTimeInterval(3600)
         )
 
-        let empty = HealthKitManager.convert([], mapping: mapping)
-        #expect(empty.readings.isEmpty)
-        #expect(empty.sources.isEmpty)
+        #expect(HealthKitManager.descriptors(from: [], mapping: mapping).isEmpty)
 
-        let converted = HealthKitManager.convert([categorySample], mapping: mapping)
+        let descriptors = HealthKitManager.descriptors(from: [categorySample], mapping: mapping)
+        #expect(descriptors.isEmpty)
+        let converted = HealthKitManager.convert(descriptors: descriptors, mapping: mapping)
         #expect(converted.readings.isEmpty)
         // A source must never be invented for a sample that produced no reading.
         #expect(converted.sources.isEmpty)

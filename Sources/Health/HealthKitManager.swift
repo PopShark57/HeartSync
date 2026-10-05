@@ -152,7 +152,7 @@ final class HealthKitManager {
     var writeBackIssue: String?
     /// Readings the buffer dropped because it was full or Health refused them.
     var writeBackDroppedCount = 0
-    private var onReadings: (@MainActor ([Reading], [DataSource], Set<UUID>) -> Bool)?
+    private var onReadings: (@MainActor ([Reading], [DataSource], Set<UUID>, Bool) -> Bool)?
 
     /// HealthKit query results are deliberately drained in finite pages. The total budget is a
     /// per-mapping guardrail: a dense type is resumed from its committed anchor on the next
@@ -170,8 +170,11 @@ final class HealthKitManager {
     nonisolated static let observerBufferLimit = 1
 
     private struct AnchoredBatch: Sendable {
-        let readings: [Reading]
-        let sources: [DataSource]
+        /// Converted on the main actor at commit, against the store's current sources, so a
+        /// watch's Blood Oxygen relayed by the iPhone finds the watch's row
+        /// (`HealthKitWatchRelay`). Long-lived observer queries would otherwise convert
+        /// against whatever sources existed when they were installed.
+        let descriptors: [SampleDescriptor]
         let deletedIDs: [UUID]
         /// Counts framework objects, not only converted readings: self-written samples still
         /// advance the HealthKit anchor and must count toward the work budget.
@@ -333,6 +336,10 @@ final class HealthKitManager {
         var rawValue: Double
         var start: Date
         var end: Date
+        /// `HKSourceRevision.productType`: the hardware the writer ran on ("iPhone17,2").
+        var sourceProductType: String? = nil
+        /// `HKDevice.hardwareVersion`: the measuring device's hardware ("Watch7,12").
+        var deviceHardwareVersion: String? = nil
     }
 
     nonisolated static func sourceRelationshipID(
@@ -384,10 +391,13 @@ final class HealthKitManager {
 
     /// Wires the manager to the store and the app's transactional ingestion seam. The
     /// callback receives sources, readings, and deleted sample ids from one anchor page and
-    /// reports whether that entire generation committed before the anchor may advance.
+    /// reports whether that entire generation committed before the anchor may advance. The
+    /// last argument asks for upsert rather than append: true when the page refiles readings
+    /// already stored under another source (`HealthKitWatchRelay`). HealthKit samples are
+    /// immutable, so an upsert changes nothing else.
     func configure(
         store: HealthStore,
-        onReadings: @escaping @MainActor ([Reading], [DataSource], Set<UUID>) -> Bool
+        onReadings: @escaping @MainActor ([Reading], [DataSource], Set<UUID>, Bool) -> Bool
     ) {
         self.store = store
         self.onReadings = onReadings
@@ -568,10 +578,8 @@ final class HealthKitManager {
 
                 let samples = samples ?? []
                 let deleted = deleted ?? []
-                let converted = Self.convert(samples, mapping: mapping)
                 continuation.resume(returning: AnchoredBatch(
-                    readings: converted.readings,
-                    sources: converted.sources,
+                    descriptors: Self.descriptors(from: samples, mapping: mapping),
                     deletedIDs: Self.deletedReadingIDs(deleted),
                     objectCount: samples.count + deleted.count,
                     anchorData: newAnchor.flatMap(Self.archiveAnchor)
@@ -600,16 +608,48 @@ final class HealthKitManager {
             return nil
         }
 
+        let converted = Self.convert(
+            descriptors: batch.descriptors,
+            mapping: mapping,
+            knownSources: store.sources
+        )
+        var readings = converted.readings
+        // A writer row stored before relayed samples were refiled holds the watch's earlier
+        // readings. Its raw ones move in this page's transaction, once per writer and metric.
+        var settledMoves: [WatchRelay] = []
+        for relay in converted.relays
+        where !UserDefaults.standard.bool(forKey: Self.relayHistoryKey(relay, kind: mapping.kind)) {
+            guard let writer = store.source(id: relay.writerID),
+                  HealthKitWatchRelay.mayMoveHistory(of: writer)
+            else {
+                settledMoves.append(relay)
+                continue
+            }
+            // A failed read leaves the marker unset, so a later page tries again.
+            guard let history = store.rawReadings(
+                kind: mapping.kind,
+                sourceID: relay.writerID,
+                refiledUnder: relay.watchID
+            ) else { continue }
+            readings += history
+            settledMoves.append(relay)
+        }
+
         // Sources, samples, and deletions belong to one HealthKit anchor generation. The
         // app's ingest seam commits them together so a failed page can be replayed without
         // leaving mixed source/reading state behind.
         guard onReadings?(
-            batch.readings,
-            batch.sources,
-            Set(batch.deletedIDs)
+            readings,
+            converted.sources,
+            Set(batch.deletedIDs),
+            !converted.relays.isEmpty
         ) == true else {
             logger.error("HealthKit page transaction failed; refusing to advance sync")
             return nil
+        }
+        // Later relayed samples arrive under the watch directly.
+        for relay in settledMoves {
+            UserDefaults.standard.set(true, forKey: Self.relayHistoryKey(relay, kind: mapping.kind))
         }
 
         // The page committed as one SQLite transaction with `synchronous = FULL`, so it is
@@ -674,10 +714,8 @@ final class HealthKitManager {
 
             let samples = samples ?? []
             let deleted = deleted ?? []
-            let converted = Self.convert(samples, mapping: mapping)
             let batch = AnchoredBatch(
-                readings: converted.readings,
-                sources: converted.sources,
+                descriptors: Self.descriptors(from: samples, mapping: mapping),
                 deletedIDs: Self.deletedReadingIDs(deleted),
                 objectCount: samples.count + deleted.count,
                 anchorData: newAnchor.flatMap(Self.archiveAnchor)
@@ -819,9 +857,44 @@ final class HealthKitManager {
 
     // MARK: - Conversion
 
+    /// Reduces HealthKit samples to Sendable descriptors inside HealthKit's callback, so no
+    /// `HKSample` crosses to the main actor. Conversion happens at commit (`convert`).
+    nonisolated static func descriptors(
+        from samples: [HKSample],
+        mapping: TypeMapping
+    ) -> [SampleDescriptor] {
+        samples.compactMap { sample -> SampleDescriptor? in
+            guard let quantitySample = sample as? HKQuantitySample else { return nil }
+            let hkSource = sample.sourceRevision.source
+            return SampleDescriptor(
+                id: sample.uuid,
+                sourceBundleIdentifier: hkSource.bundleIdentifier,
+                sourceName: hkSource.name,
+                deviceModel: sample.device?.model ?? sample.device?.name,
+                rawValue: quantitySample.quantity.doubleValue(for: mapping.unit),
+                start: sample.startDate,
+                end: sample.endDate,
+                sourceProductType: sample.sourceRevision.productType,
+                deviceHardwareVersion: sample.device?.hardwareVersion
+            )
+        }
+    }
+
+    /// A writer whose relayed Apple Watch samples were refiled under the watch's source.
+    struct WatchRelay: Hashable, Sendable {
+        var writerID: String
+        var watchID: String
+    }
+
+    /// Marks a writer's raw history of one metric as moved to the watch (or as not movable).
+    nonisolated static func relayHistoryKey(_ relay: WatchRelay, kind: MetricKind) -> String {
+        "hk.relay-history.\(relay.writerID).\(kind.rawValue)"
+    }
+
     /// Turns HealthKit samples into HeartSync readings, one source per writing device.
     ///
-    /// `nonisolated` and `static` so it can run on HealthKit's own queue without hopping.
+    /// `nonisolated` and `static` so it stays a pure function that can be unit-tested
+    /// without a device.
     ///
     /// Samples written by HeartSync itself are dropped. This is not defensive tidiness; it
     /// closes a feedback loop that produces the most misleading output this app is capable
@@ -836,42 +909,43 @@ final class HealthKitManager {
     ///
     /// The filter lives here as well as in `recentPredicate` on purpose. The predicate
     /// stops the samples arriving; this guard additionally means a store already polluted
-    /// by an earlier build stops growing, and it keeps the rule in a `nonisolated static`
-    /// pure function that can be unit-tested without a device.
-    nonisolated static func convert(
-        _ samples: [HKSample],
-        mapping: TypeMapping
-    ) -> (readings: [Reading], sources: [DataSource]) {
-        let descriptors = samples.compactMap { sample -> SampleDescriptor? in
-            guard let quantitySample = sample as? HKQuantitySample else { return nil }
-            let hkSource = sample.sourceRevision.source
-            return SampleDescriptor(
-                id: sample.uuid,
-                sourceBundleIdentifier: hkSource.bundleIdentifier,
-                sourceName: hkSource.name,
-                deviceModel: sample.device?.model ?? sample.device?.name,
-                rawValue: quantitySample.quantity.doubleValue(for: mapping.unit),
-                start: sample.startDate,
-                end: sample.endDate
-            )
-        }
-        return convert(descriptors: descriptors, mapping: mapping)
-    }
-
-    /// Pure conversion core used by both HealthKit callbacks and unit tests.
+    /// by an earlier build stops growing.
+    ///
+    /// A sample the iPhone wrote about an Apple Watch measurement (the redesigned Blood
+    /// Oxygen) is filed under the watch's own source when `HealthKitWatchRelay` finds exactly
+    /// one, among `knownSources` and this page's sources; otherwise under its writer. Each
+    /// writer refiled that way is listed in `relays`.
     nonisolated static func convert(
         descriptors: [SampleDescriptor],
-        mapping: TypeMapping
-    ) -> (readings: [Reading], sources: [DataSource]) {
+        mapping: TypeMapping,
+        knownSources: [DataSource] = []
+    ) -> (readings: [Reading], sources: [DataSource], relays: Set<WatchRelay>) {
         var readings: [Reading] = []
         var sources: [String: DataSource] = [:]
+        var relayed: [SampleDescriptor] = []
+        var relays: Set<WatchRelay> = []
 
-        for sample in descriptors {
-            guard !isOwnSource(bundleIdentifier: sample.sourceBundleIdentifier) else { continue }
+        func file(_ sample: SampleDescriptor, under sourceID: String) {
+            readings.append(Reading(
+                // The HealthKit sample UUID makes this idempotent: re-running a query
+                // after an anchor reset re-delivers the same samples, and they collapse
+                // onto the same reading instead of duplicating.
+                id: sample.id,
+                sourceID: sourceID,
+                kind: mapping.kind,
+                value: sample.rawValue * mapping.scale,
+                start: sample.start,
+                end: sample.end,
+                provenance: .measured
+            ))
+        }
+
+        func recordWriter(of sample: SampleDescriptor) -> String {
             // Preserve the shipped id formula as an alias: it identifies a HealthKit writer,
             // not necessarily one physical device. Device descriptors are retained below so
             // a second/replacement device cannot silently overwrite the first.
             let sourceID = "hk.\(sample.sourceBundleIdentifier)"
+            let productTypes: Set<String> = sample.sourceProductType.map { $0.isEmpty ? [] : [$0] } ?? []
 
             if var source = sources[sourceID] {
                 var models = source.observedDeviceModels ?? []
@@ -880,12 +954,14 @@ final class HealthKitManager {
                 source.model = models.count > 1
                     ? "Multiple reported devices: \(models.sorted().joined(separator: ", "))"
                     : models.first ?? source.model
+                let types = (source.writerProductTypes ?? []).union(productTypes)
+                source.writerProductTypes = types.isEmpty ? nil : types
                 source.lastSeenAt = max(source.lastSeenAt ?? sample.end, sample.end)
                 source.observedMetrics.insert(mapping.kind)
                 sources[sourceID] = source
             } else {
                 let models: Set<String> = sample.deviceModel.map { $0.isEmpty ? [] : [$0] } ?? []
-                sources[sourceID] = DataSource(
+                var source = DataSource(
                     id: sourceID,
                     displayName: sample.sourceName,
                     transport: .healthKit,
@@ -899,25 +975,53 @@ final class HealthKitManager {
                     ),
                     identifiesHealthKitWriter: true
                 )
+                source.writerProductTypes = productTypes.isEmpty ? nil : productTypes
+                sources[sourceID] = source
             }
-
-            let value = sample.rawValue * mapping.scale
-
-            readings.append(Reading(
-                // The HealthKit sample UUID makes this idempotent: re-running a query
-                // after an anchor reset re-delivers the same samples, and they collapse
-                // onto the same reading instead of duplicating.
-                id: sample.id,
-                sourceID: sourceID,
-                kind: mapping.kind,
-                value: value,
-                start: sample.start,
-                end: sample.end,
-                provenance: .measured
-            ))
+            return sourceID
         }
 
-        return (readings, Array(sources.values))
+        for sample in descriptors {
+            guard !isOwnSource(bundleIdentifier: sample.sourceBundleIdentifier) else { continue }
+            if HealthKitWatchRelay.isRelayedWatchMeasurement(
+                sourceBundleIdentifier: sample.sourceBundleIdentifier,
+                sourceProductType: sample.sourceProductType,
+                deviceModel: sample.deviceModel,
+                deviceHardwareVersion: sample.deviceHardwareVersion
+            ) {
+                // After the page's own writers, so a watch first seen on this page counts.
+                relayed.append(sample)
+                continue
+            }
+            file(sample, under: recordWriter(of: sample))
+        }
+
+        if !relayed.isEmpty {
+            // This page's view of a source replaces the stored one: it carries product types
+            // the store may not have recorded yet.
+            let candidates = knownSources.filter { sources[$0.id] == nil } + Array(sources.values)
+            for sample in relayed {
+                let writerID = "hk.\(sample.sourceBundleIdentifier)"
+                guard var watch = HealthKitWatchRelay.watchSource(
+                    forRelayFrom: writerID,
+                    deviceHardwareVersion: sample.deviceHardwareVersion,
+                    among: candidates
+                ) else {
+                    file(sample, under: recordWriter(of: sample))
+                    continue
+                }
+                // The watch keeps its own name, models, and product types; the relayed
+                // sample only adds a metric and a time.
+                if let current = sources[watch.id] { watch = current }
+                watch.lastSeenAt = max(watch.lastSeenAt ?? sample.end, sample.end)
+                watch.observedMetrics.insert(mapping.kind)
+                sources[watch.id] = watch
+                relays.insert(WatchRelay(writerID: writerID, watchID: watch.id))
+                file(sample, under: watch.id)
+            }
+        }
+
+        return (readings, Array(sources.values), relays)
     }
 
     /// Turns HealthKit's deletion objects into reading ids the store can remove.

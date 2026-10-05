@@ -152,6 +152,11 @@ the Apple Watch's SDNN — a different measure — and the resulting gap would b
 **SpO₂ scale conversion.** HealthKit stores oxygen saturation as a fraction (0.97) while the
 Bluetooth spec uses whole percent (97). These are normalised on ingest.
 
+**Apple Watch Blood Oxygen calculated on the iPhone.** The redesigned U.S. Blood Oxygen feature
+measures on the watch and calculates on the paired iPhone, so Health records the reading under
+the iPhone. HeartSync files it under the watch's own row when exactly one watch matches, and
+leaves it under the iPhone when it cannot tell which watch took it.
+
 ## Data handling
 
 HeartSync's local history stays on your devices; the paired watch receives a display snapshot.
