@@ -482,6 +482,7 @@ final class HealthKitManager {
         // from the last durable anchor rather than being trusted from memory.
         let restartObservers = !observerContinuations.isEmpty
         if restartObservers { stopObserving() }
+        scheduleRelayRereadIfNeeded()
 
         isSyncing = true
         defer { isSyncing = false }
@@ -613,25 +614,19 @@ final class HealthKitManager {
             mapping: mapping,
             knownSources: store.sources
         )
-        var readings = converted.readings
         // A writer row stored before relayed samples were refiled holds the watch's earlier
-        // readings. Its raw ones move in this page's transaction, once per writer and metric.
+        // readings. They move first, in their own transaction, once per writer and metric, so
+        // this page's re-delivered samples find them under the watch.
         var settledMoves: [WatchRelay] = []
         for relay in converted.relays
         where !UserDefaults.standard.bool(forKey: Self.relayHistoryKey(relay, kind: mapping.kind)) {
-            guard let writer = store.source(id: relay.writerID),
-                  HealthKitWatchRelay.mayMoveHistory(of: writer)
-            else {
-                settledMoves.append(relay)
-                continue
+            if let writer = store.source(id: relay.writerID),
+               HealthKitWatchRelay.mayMoveHistory(of: writer) {
+                // A failed move leaves the marker unset, so a later page tries again.
+                guard store.moveReadings(kind: mapping.kind, from: relay.writerID, to: relay.watchID) else {
+                    continue
+                }
             }
-            // A failed read leaves the marker unset, so a later page tries again.
-            guard let history = store.rawReadings(
-                kind: mapping.kind,
-                sourceID: relay.writerID,
-                refiledUnder: relay.watchID
-            ) else { continue }
-            readings += history
             settledMoves.append(relay)
         }
 
@@ -639,7 +634,7 @@ final class HealthKitManager {
         // app's ingest seam commits them together so a failed page can be replayed without
         // leaving mixed source/reading state behind.
         guard onReadings?(
-            readings,
+            converted.readings,
             converted.sources,
             Set(batch.deletedIDs),
             !converted.relays.isEmpty
@@ -888,7 +883,7 @@ final class HealthKitManager {
 
     /// Marks a writer's raw history of one metric as moved to the watch (or as not movable).
     nonisolated static func relayHistoryKey(_ relay: WatchRelay, kind: MetricKind) -> String {
-        "hk.relay-history.\(relay.writerID).\(kind.rawValue)"
+        "hk.relay-history.v2.\(relay.writerID).\(kind.rawValue)"
     }
 
     /// Turns HealthKit samples into HeartSync readings, one source per writing device.
@@ -1088,6 +1083,18 @@ final class HealthKitManager {
         await syncAll()
         await startObserving()
     }
+
+    /// Re-reads the 30-day Blood Oxygen window once, so readings an earlier build filed under
+    /// the iPhone that relayed them are seen again and refiled (`HealthKitWatchRelay`) without
+    /// waiting for a new measurement. Safe because readings de-duplicate on the sample UUID.
+    /// Run with the observers stopped; the anchor saved by the first committed page ends it.
+    private func scheduleRelayRereadIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: Self.relayRereadKey) else { return }
+        UserDefaults.standard.removeObject(forKey: anchorKey(.oxygenSaturation))
+        UserDefaults.standard.set(true, forKey: Self.relayRereadKey)
+    }
+
+    nonisolated static let relayRereadKey = "hk.relay-reread.oxygenSaturation.v1"
 
     /// Clears anchors so the next sync re-reads the full retention window. Safe because
     /// readings de-duplicate on the HealthKit sample UUID.

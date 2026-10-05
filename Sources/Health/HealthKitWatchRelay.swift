@@ -71,8 +71,11 @@ enum HealthKitWatchRelay {
 
     /// The one watch source a relayed sample belongs to, or nil when none or several match.
     ///
-    /// A watch whose product types are known must match the sample's hardware version; the
-    /// sole candidate is accepted without that check only when one of the two is unknown.
+    /// The hardware version chooses between several watches. A lone watch takes the sample
+    /// even when its recorded product type differs, because the format of
+    /// `HKDevice.hardwareVersion` on an iPhone-calculated sample is not documented, and a
+    /// second watch that relays through the iPhone also writes its own heart rate, so it would
+    /// have a row of its own to be matched against.
     static func watchSource(
         forRelayFrom writerID: String,
         deviceHardwareVersion: String?,
@@ -83,8 +86,6 @@ enum HealthKitWatchRelay {
             let exact = candidates.filter { $0.writerProductTypes?.contains(hardware) == true }
             if exact.count == 1 { return exact[0] }
             if exact.count > 1 { return nil }
-            let unknown = candidates.filter { ($0.writerProductTypes ?? []).isEmpty }
-            return candidates.count == 1 && unknown.count == 1 ? candidates[0] : nil
         }
         return candidates.count == 1 ? candidates[0] : nil
     }
