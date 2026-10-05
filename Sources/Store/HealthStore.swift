@@ -760,21 +760,42 @@ final class HealthStore {
         return query { try $0.latest(kind: kind, sourceID: sourceID) }.value ?? nil
     }
 
-    /// One source's raw readings of a metric, refiled under `targetID` for an upsert that
-    /// moves them there (`HealthKitWatchRelay`). Each keeps its id, so the move is idempotent.
+    /// Moves one source's readings of a metric to another source: a watch's readings that an
+    /// earlier build filed under the iPhone that relayed them (`HealthKitWatchRelay`).
     ///
-    /// Compacted window medians stay where they are: their ids derive from the source that
-    /// compacted them, and a compacted window is final. They age out with retention. Nil
-    /// before load and when the read fails, so the caller can try again later.
-    func rawReadings(kind: MetricKind, sourceID: String, refiledUnder targetID: String) -> [Reading]? {
-        guard loadState == .loaded else { return nil }
-        return query { try $0.readings(kind: kind, sourceID: sourceID) }.value?
-            .filter { $0.metadata?.aggregation == nil }
-            .map { reading in
-                var moved = reading
-                moved.sourceID = targetID
-                return moved
+    /// Raw rows keep their ids (HealthKit sample UUIDs), so a later re-read of the same
+    /// samples lands on them. A compacted window median is re-keyed to the target's compacted
+    /// id for its window, which makes that window final for the target too: a re-read cannot
+    /// add the raw samples behind it a second time. Where the target already has a median for
+    /// a window, the source keeps its own. When none of the metric is left, the source stops
+    /// listing it. One transaction; returns false when the read or the commit fails.
+    func moveReadings(kind: MetricKind, from sourceID: String, to targetID: String) -> Bool {
+        guard loadState == .loaded, sourceID != targetID,
+              let rows = query({ try $0.readings(kind: kind, sourceID: sourceID) }).value
+        else { return false }
+
+        var moved: [Reading] = []
+        var rekeyed: [UUID: UUID] = [:]
+        for reading in rows {
+            var refiled = reading
+            refiled.sourceID = targetID
+            if reading.metadata?.aggregation != nil {
+                refiled.id = compactedReadingID(for: refiled)
+                rekeyed[refiled.id] = reading.id
             }
+            moved.append(refiled)
+        }
+        guard let taken = query({ try $0.existingIDs(Array(rekeyed.keys)) }).value else { return false }
+        moved.removeAll { taken.contains($0.id) && rekeyed[$0.id] != nil }
+        let retired = Set(rekeyed.filter { !taken.contains($0.key) }.values)
+
+        if !moved.isEmpty {
+            guard store(moved, mode: .upsert, removingReadingIDs: retired).committed else { return false }
+        }
+        if case .success(.none) = query({ try $0.latest(kind: kind, sourceID: sourceID) }) {
+            mutateSource(sourceID) { $0.observedMetrics.remove(kind) }
+        }
+        return true
     }
 
     func lastDataDate(sourceID: String) -> Date? {

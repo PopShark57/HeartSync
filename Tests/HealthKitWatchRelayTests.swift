@@ -192,13 +192,27 @@ struct HealthKitWatchRelayTests {
         #expect(converted.readings.first?.sourceID == watchID)
     }
 
-    @Test("A sole watch whose known product type differs is not given another watch's reading")
-    func mismatchedSoleWatchKeepsWriter() throws {
-        let other = watchSource(productTypes: ["Watch6,18"])
+    @Test("A lone watch takes the sample even when its recorded product type differs")
+    func loneWatchTakesMismatchedHardware() throws {
+        // The hardware string on an iPhone-calculated sample is undocumented; with one watch
+        // there is no one else it could belong to.
+        let only = watchSource(productTypes: ["Watch7,20"])
         let converted = HealthKitManager.convert(
             descriptors: [relayed(hardware: "Watch7,12")],
             mapping: try spo2Mapping(),
-            knownSources: [other]
+            knownSources: [only]
+        )
+        #expect(converted.readings.first?.sourceID == watchID)
+    }
+
+    @Test("With several watches and no hardware match, the sample stays under its writer")
+    func severalWatchesWithoutMatchKeepWriter() throws {
+        let first = watchSource(productTypes: ["Watch6,18"])
+        let second = watchSource(id: "hk.com.apple.health.33333333", name: "Old Watch", productTypes: ["Watch5,4"])
+        let converted = HealthKitManager.convert(
+            descriptors: [relayed(hardware: "Watch7,12")],
+            mapping: try spo2Mapping(),
+            knownSources: [first, second]
         )
         #expect(converted.readings.first?.sourceID == phoneID)
         #expect(converted.relays.isEmpty)
@@ -267,47 +281,94 @@ struct HealthKitWatchRelayTests {
         #expect(!HealthKitWatchRelay.mayMoveHistory(of: thirdParty))
     }
 
-    @Test("Stored raw readings move to the watch once; compacted medians stay")
+    private func compactedID(sourceID: String, windowStart: Date) -> UUID {
+        UUID(stableFrom: "compact.\(sourceID).\(MetricKind.spo2.rawValue).\(Int(windowStart.timeIntervalSince1970))")
+    }
+
+    private func oldWindowStart() -> Date {
+        ComparisonEngine.floorToWindow(Date.now.addingTimeInterval(-20 * 86_400), size: MetricKind.spo2.comparisonWindow)
+    }
+
+    private func compactedMedian(sourceID: String, at windowStart: Date, value: Double = 97) -> Reading {
+        Reading(
+            id: compactedID(sourceID: sourceID, windowStart: windowStart),
+            sourceID: sourceID,
+            kind: .spo2,
+            value: value,
+            start: windowStart,
+            metadata: ReadingMetadata(aggregation: AggregationMetadata(
+                originalSampleCount: 4,
+                originalStandardDeviation: 0.5
+            ))
+        )
+    }
+
+    @Test("Stored history moves to the watch: raw rows keep their ids, medians are re-keyed")
     func storedHistoryMoves() throws {
         let store = HealthStore(persistenceEnabled: false)
         store.upsert(legacyPhoneSource())
         store.upsert(watchSource())
+        // Whole seconds, so a row rebuilt from its columns encodes exactly as delivered.
+        let now = Date(timeIntervalSince1970: Date.now.timeIntervalSince1970.rounded(.down))
         let raw = (0..<3).map { index in
             Reading(
                 id: UUID(),
                 sourceID: phoneID,
                 kind: .spo2,
                 value: 95 + Double(index),
-                start: Date.now.addingTimeInterval(Double(-3_600 * (index + 1)))
+                start: now.addingTimeInterval(Double(-3_600 * (index + 1)))
             )
         }
-        var compacted = Reading(
-            id: UUID(),
-            sourceID: phoneID,
-            kind: .spo2,
-            value: 97,
-            start: Date.now.addingTimeInterval(-20 * 86_400)
-        )
-        compacted.metadata = ReadingMetadata(aggregation: AggregationMetadata(originalSampleCount: 4, originalStandardDeviation: 0.5))
-        #expect(store.append(contentsOf: raw + [compacted]).count == 4)
+        let windowStart = oldWindowStart()
+        let median = compactedMedian(sourceID: phoneID, at: windowStart)
+        #expect(store.append(contentsOf: raw + [median]).count == 4)
 
-        let moved = try #require(store.rawReadings(kind: .spo2, sourceID: phoneID, refiledUnder: watchID))
-        #expect(Set(moved.map(\.id)) == Set(raw.map(\.id)))
-        #expect(moved.allSatisfy { $0.sourceID == watchID })
-
-        // Append would ignore rows it already holds; the relay page upserts.
-        #expect(store.appendBatch(readings: moved).acceptedReadings.isEmpty)
-        let result = store.upsertBatch(readings: moved)
-        #expect(result.committed)
-        #expect(result.acceptedReadings.count == 3)
+        #expect(store.moveReadings(kind: .spo2, from: phoneID, to: watchID))
 
         let all = store.readings(kind: .spo2, enabledOnly: false)
-        #expect(all.filter { $0.sourceID == watchID }.count == 3)
-        #expect(all.filter { $0.sourceID == phoneID }.map(\.id) == [compacted.id])
         #expect(all.count == 4)
+        #expect(all.allSatisfy { $0.sourceID == watchID })
+        #expect(Set(raw.map(\.id)).isSubset(of: Set(all.map(\.id))))
+        #expect(!all.contains { $0.id == median.id })
+        #expect(all.contains { $0.id == compactedID(sourceID: watchID, windowStart: windowStart) })
 
-        // Idempotent: a replay changes nothing.
-        #expect(store.upsertBatch(readings: moved).acceptedReadings.isEmpty)
+        // The iPhone row no longer lists the metric; the watch does.
+        #expect(store.source(id: phoneID)?.observedMetrics == [.heartRate])
+        #expect(store.source(id: watchID)?.observedMetrics.contains(.spo2) == true)
+
+        // The re-read delivers the same samples under the watch: nothing changes, and a raw
+        // sample behind the moved median cannot come back beside it.
+        let redelivered = raw.map { reading -> Reading in
+            var copy = reading
+            copy.sourceID = watchID
+            return copy
+        }
+        let folded = Reading(id: UUID(), sourceID: watchID, kind: .spo2, value: 96, start: windowStart.addingTimeInterval(1))
+        #expect(store.upsertBatch(readings: redelivered + [folded]).acceptedReadings.isEmpty)
+        #expect(store.readings(kind: .spo2, enabledOnly: false).count == 4)
+
+        // Idempotent.
+        #expect(store.moveReadings(kind: .spo2, from: phoneID, to: watchID))
+        #expect(store.readings(kind: .spo2, enabledOnly: false).count == 4)
+    }
+
+    @Test("Where the watch already has a median for a window, the iPhone row keeps its own")
+    func medianCollisionStays() throws {
+        let store = HealthStore(persistenceEnabled: false)
+        store.upsert(legacyPhoneSource())
+        store.upsert(watchSource())
+        let windowStart = oldWindowStart()
+        let phoneMedian = compactedMedian(sourceID: phoneID, at: windowStart, value: 97)
+        let watchMedian = compactedMedian(sourceID: watchID, at: windowStart, value: 95)
+        #expect(store.append(contentsOf: [phoneMedian, watchMedian]).count == 2)
+
+        #expect(store.moveReadings(kind: .spo2, from: phoneID, to: watchID))
+
+        let all = store.readings(kind: .spo2, enabledOnly: false)
+        #expect(all.count == 2)
+        #expect(all.first { $0.sourceID == watchID }?.value == 95)
+        #expect(all.first { $0.sourceID == phoneID }?.id == phoneMedian.id)
+        #expect(store.source(id: phoneID)?.observedMetrics.contains(.spo2) == true)
     }
 
     // MARK: - Source metadata
