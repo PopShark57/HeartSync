@@ -102,7 +102,7 @@ and the selected metric/provenance models. It does not compile `CompanionSession
 - Framework-specific: `Sources/Bluetooth` for CoreBluetooth, `Sources/Health` for HealthKit, and the OAuth presentation code in `Sources/Oura/OuraOAuth.swift` for AuthenticationServices/UIKit.
 - Security-specific: `Sources/Store/Keychain.swift` and CryptoKit-based `StableID.swift`.
 
-Do not assume the model layer can already be moved into a Foundation-only package: `DataSource`, `MetricKind`, and `Discrepancy` currently import SwiftUI for presentation colors. `DataSource` also imports UIKit, behind `#if canImport(UIKit)`, so that each source palette slot resolves a light or dark value. Source colours are defined as numbers (`SourcePaletteSlot`, `SRGBColor`) so that `Tests/ColourVisionTests.swift` measures exactly what is drawn. Change a slot's values in place, never renumber the slots, and keep that test passing. There are ten slots. The first six are checked under colour-vision simulation; red, gold, teal, and orchid (added later) are checked for ordinary vision only, by owner decision, and rely on shapes for colour-blind readers. A new source takes a random least-worn slot (`DataSource.leastUsedColorIndex`, random among equals so devices do not always get the same colours), and load repairs devices that share one (`colorIndexRepairs`: enabled first, oldest keeps it), so devices are never drawn in fewer colours than there are slots. There are seven shapes (`SourceSymbol`); slots past the seventh repeat one, and `MetricDetailSnapshot.symbols(for:)` gives a visible repeat a spare.
+Do not assume the model layer can already be moved into a Foundation-only package: `DataSource`, `MetricKind`, and `Discrepancy` currently import SwiftUI for presentation colors. `DataSource` also imports UIKit, behind `#if canImport(UIKit)`, so that each source palette slot resolves a light or dark value. Source colours are defined as numbers (`SourcePaletteSlot`, `SRGBColor`) so that `Tests/ColourVisionTests.swift` measures exactly what is drawn. Change a slot's values in place, never renumber the slots, and keep that test passing. There are ten slots. The first six are checked under colour-vision simulation; red, gold, teal, and orchid are checked for ordinary vision only, by owner decision, and rely on shapes for colour-blind readers. A new source takes a random least-worn slot (`DataSource.leastUsedColorIndex`, random among equals so devices do not always get the same colours), and load repairs devices that share one (`colorIndexRepairs`: enabled first, oldest keeps it), so devices are never drawn in fewer colours than there are slots. There are seven shapes (`SourceSymbol`); slots past the seventh repeat one, and `MetricDetailSnapshot.symbols(for:)` gives a visible repeat a spare.
 
 ## State Management and Dependency Injection
 
@@ -199,7 +199,7 @@ The restoration identifier is `com.heartsync.central`. `UIBackgroundModes = blue
 
 ## HealthKit and Apple Watch Architecture
 
-Apple Watch data reaches iPhone only through the HealthKit import. The watchOS companion is display only: it records no workouts, does not use HealthKit, and has no workout-mirroring path (workout recording, `MirroredWorkoutPayload`, and `MirroredWorkoutMonitor` were removed at the user's request). WatchConnectivity carries a display snapshot from iPhone, and refresh and sync-all requests (with the sync-all's per-transport report) between them; it never carries measurements. Do not add or imply direct Apple Watch BLE access.
+Apple Watch data reaches iPhone only through the HealthKit import. The watchOS companion is display only: it records no workouts, does not use HealthKit, and has no workout-mirroring path; the owner does not want workout recording. WatchConnectivity carries a display snapshot from iPhone, and refresh and sync-all requests (with the sync-all's per-transport report) between them; it never carries measurements. Do not add or imply direct Apple Watch BLE access.
 
 `HealthKitManager.TypeMapping` owns the HealthKit identifier, metric, unit, and scale. Current reads include heart rate, resting heart rate, SDNN HRV, oxygen saturation, respiratory rate, VO2 max, body temperature, and blood pressure. HealthKit oxygen saturation is a fraction and is multiplied by 100 on ingestion. There is no HealthKit RMSSD mapping.
 
@@ -543,23 +543,23 @@ The repository currently pins development team `7RLDYXQTNX`. Do not silently rep
 
 ## Tests
 
-The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@Suite`, `@Test`, `#expect`, and `#require`). Watch payload, projection, freshness, and companion HealthKit identity regressions are in `Tests/Watch` and `Tests/HealthKitConversionTests.swift`; count declarations from the current source rather than relying on an older total. The UI bundle uses XCTest/XCUIAutomation, and the separate performance bundle uses Swift Testing:
+The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@Suite`, `@Test`, `#expect`, and `#require`). Watch payload, projection, freshness, and companion HealthKit identity regressions are in `Tests/Watch` and `Tests/HealthKitConversionTests.swift`; count declarations from the current source when you need a number. The UI bundle uses XCTest/XCUIAutomation, and the separate performance bundle uses Swift Testing:
 
-- `Tests/AnalysisTests.swift`: 53 tests covering HRV, comparison/windowing/statistics/evidence, chart thinning, estimators, Oura mapping, debug fixtures, and stable identifiers.
-- `Tests/ParsingTests.swift`: 25 tests covering binary reads and GATT measurement parsing, including units, optional fields, PLX status fields, and invalid frames.
-- `Tests/OuraOAuthTests.swift`: 13 tests covering exact authorization URL/scopes, callback/state/token metadata, scope-related 401 behavior, expiry, and compatibility behavior.
-- `Tests/OuraDataTests.swift`: 14 tests covering decoding, snapshot/upsert behavior, injected-`URLProtocol` request/error behavior, and the Oura heart-rate chart series (window anchoring, unparseable timestamps, and plot thinning).
-- `Tests/PairwiseExportTests.swift`: 10 tests covering stable schemas, canonical A/B semantics, aggregation evidence, RFC escaping, evidence language, metadata isolation, UTC, and fallback output.
-- `Tests/SourceColourSeparationTests.swift`: 8 tests covering least-worn and random slot
+- `Tests/AnalysisTests.swift`: covers HRV, comparison/windowing/statistics/evidence, chart thinning, estimators, Oura mapping, debug fixtures, and stable identifiers.
+- `Tests/ParsingTests.swift`: covers binary reads and GATT measurement parsing, including units, optional fields, PLX status fields, and invalid frames.
+- `Tests/OuraOAuthTests.swift`: covers exact authorization URL/scopes, callback/state/token metadata, scope-related 401 behavior, expiry, and compatibility behavior.
+- `Tests/OuraDataTests.swift`: covers decoding, snapshot/upsert behavior, injected-`URLProtocol` request/error behavior, and the Oura heart-rate chart series (window anchoring, unparseable timestamps, and plot thinning).
+- `Tests/PairwiseExportTests.swift`: covers stable schemas, canonical A/B semantics, aggregation evidence, RFC escaping, evidence language, metadata isolation, UTC, and fallback output.
+- `Tests/SourceColourSeparationTests.swift`: covers least-worn and random slot
   choice, repair of devices sharing a slot, paused devices yielding, and re-enabling.
-- `Tests/HealthStoreTests.swift`: 38 tests covering validation, indexed queries, batch ingestion, deletion, persistence safety, retention, and bounded compaction.
-- `Tests/ReadingArchiveTests.swift`: 20 tests covering envelopes, legacy payloads, unique corrupt preservation, unreadable-file handling, and Oura cache compatibility.
-- `Tests/HealthKitConversionTests.swift`: 19 tests covering type mappings, minimal read scope, self-source rejection and cleanup, writer identity, scaling, and deletion conversion.
-- `Tests/OuraSyncTests.swift`: 35 tests covering endpoint isolation, pagination, scope failures, cache preservation, deletion reconciliation (including that aging out of the dashboard cache withdraws nothing), cache/database failure rollback, truncation, battery timestamps, rate-limit backoff and the early stop, the minimum interval, a clear during a running sync, and Keychain reads that fail versus find nothing.
-- `Tests/HRVFilterTests.swift`: 20 tests covering artefact filtering, body-location versus technology metadata, accumulator thresholds, and rate limiting.
-- `Tests/AppSettingsTests.swift`: 2 tests covering unreadable-load write refusal and recovery.
-- `Tests/ImprovementTests.swift`: 28 tests covering PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
-- `UITests/HeartSyncCheckerUITests.swift`: 15 deterministic flows, which keep screenshots
+- `Tests/HealthStoreTests.swift`: covers validation, indexed queries, batch ingestion, deletion, persistence safety, retention, and bounded compaction.
+- `Tests/ReadingArchiveTests.swift`: covers envelopes, legacy payloads, unique corrupt preservation, unreadable-file handling, and Oura cache compatibility.
+- `Tests/HealthKitConversionTests.swift`: covers type mappings, minimal read scope, self-source rejection and cleanup, writer identity, scaling, and deletion conversion.
+- `Tests/OuraSyncTests.swift`: covers endpoint isolation, pagination, scope failures, cache preservation, deletion reconciliation (including that aging out of the dashboard cache withdraws nothing), cache/database failure rollback, truncation, battery timestamps, rate-limit backoff and the early stop, the minimum interval, a clear during a running sync, and Keychain reads that fail versus find nothing.
+- `Tests/HRVFilterTests.swift`: covers artefact filtering, body-location versus technology metadata, accumulator thresholds, and rate limiting.
+- `Tests/AppSettingsTests.swift`: covers unreadable-load write refusal and recovery.
+- `Tests/ImprovementTests.swift`: covers PLX admission, Bluetooth discovery/stream state, real HRV intervals, HealthKit outcomes and relationships, data minimization, transactional migration, rollback and deletion ordering, revisable estimates, and pairwise uncertainty.
+- `UITests/HeartSyncCheckerUITests.swift`: deterministic flows, which keep screenshots
   (`XCTAttachment`, `.keepAlways`) of key screens; CI runs them on an iPhone simulator only:
   - recovery and settings;
   - device actions, including removal that asks first and deletes only that device;
@@ -573,102 +573,103 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   - the Oura hypnogram, movement, heart-rate, and fourteen-day trend charts
     (`--ui-test-ouraCharts`);
   - pseudo-localization.
-- `Tests/HistoryOutcomeTests.swift`: 12 tests covering query outcomes after a successful
+- `Tests/HistoryOutcomeTests.swift`: covers query outcomes after a successful
   startup (failure versus emptiness, retry, export failing visibly, paged export) and the
   compaction-honest per-device summary and whole-history export schema.
-- `Tests/PresentationIdentityTests.swift`: 14 tests covering chart series keyed by stable
+- `Tests/PresentationIdentityTests.swift`: covers chart series keyed by stable
   source ID, duplicate-name disambiguation, rename stability, the Compare empty-state
   distinction, and chart line segmentation across data gaps.
-- `Tests/PairTimingTests.swift`: 10 tests covering the pair timing policy — near/far samples
+- `Tests/PairTimingTests.swift`: covers the pair timing policy — near/far samples
   inside one bucket, close samples across a boundary, bursty delivery, interval summaries,
   unknown timing from compacted rows, evidence grading, and sparse coverage.
-- `Tests/AppModelTests.swift`: 20 tests over temporary files and inert transports covering saved retention across relaunch, unreadable/corrupt/newer-schema settings deleting nothing, a lost settings file not shortening a longer period, the user's choice lifting the hold, refresh gating, Oura throttling, the wrist sync-all (every transport asked in order, the 60-second bound, unconnected sources, before load, and the reply deadline), ring blood pressure surviving reconciliation, and a failed removal reporting.
-- `Tests/StoreMaintenanceTests.swift`: 22 tests covering source mutations that roll back, estimate reconciliation scope, ingest not pruning, compaction across a pass boundary, SQL-counted retention impact and session summaries, sub-second payload dates, coarse last-seen updates, and CSV formula neutralisation.
-- `Tests/HealthKitWriteBackTests.swift`: 7 tests covering the Gregorian date of birth and the write plan (sync identifier, device, scaling, refusals), the bounded queue, and refusal classification.
-- `Tests/ComparisonSourceSelectionTests.swift`: 6 tests covering comparison-only source
+- `Tests/AppModelTests.swift`: tests over temporary files and inert transports covering saved retention across relaunch, unreadable/corrupt/newer-schema settings deleting nothing, a lost settings file not shortening a longer period, the user's choice lifting the hold, refresh gating, Oura throttling, the wrist sync-all (every transport asked in order, the 60-second bound, unconnected sources, before load, and the reply deadline), ring blood pressure surviving reconciliation, and a failed removal reporting.
+- `Tests/StoreMaintenanceTests.swift`: covers source mutations that roll back, estimate reconciliation scope, ingest not pruning, compaction across a pass boundary, SQL-counted retention impact and session summaries, sub-second payload dates, coarse last-seen updates, and CSV formula neutralisation.
+- `Tests/HealthKitSessionTests.swift`: covers HealthKit session restore (`sessionRestoreDecision`) and write-authorization satisfaction.
+- `Tests/HealthKitWriteBackTests.swift`: covers the Gregorian date of birth and the write plan (sync identifier, device, scaling, refusals), the bounded queue, and refusal classification.
+- `Tests/ComparisonSourceSelectionTests.swift`: covers comparison-only source
   hiding, settings archive backward compatibility, and same-device pair disclosure.
-- `Tests/ComparisonSessionTests.swift`: 11 tests covering fixed versus rolling periods,
+- `Tests/ComparisonSessionTests.swift`: covers fixed versus rolling periods,
   session persistence and reload, revisit disclosure, and missing sources.
-- `Tests/SourceRemovalTests.swift`: 9 tests covering the per-source history count behind
+- `Tests/SourceRemovalTests.swift`: covers the per-source history count behind
   the removal dialog, failed counts reported as unknown, the per-source export, and the
   consequence wording for each transport.
-- `Tests/DrillDownPeriodTests.swift`: 6 tests covering fixed-period resolution: a saved
+- `Tests/DrillDownPeriodTests.swift`: covers fixed-period resolution: a saved
   session's seconds reach metric detail, the pair analysis, and its export unchanged.
-- `Tests/PairwiseSnapshotTests.swift`: 13 tests covering the pairwise snapshot: engine
+- `Tests/PairwiseSnapshotTests.swift`: covers the pairwise snapshot: engine
   equality, binary-search and two-dimensional screen-space lookups against a linear scan,
   a stacked outlier selected on its own, empty-area taps, window stepping, the spoken
   summary, the pinned timeline domain, thinning disclosure, and query failure.
-- `Tests/MetricDetailSelectionTests.swift`: 12 tests covering the metric-detail scrub:
+- `Tests/MetricDetailSelectionTests.swift`: covers the metric-detail scrub:
   every window selectable (first and last included), empty-area touches, the callout's
   order, flags, and tolerance wording (never "agree"), estimates kept out of the spread,
   the callout's spread equal to the band, and the pinned x domain.
-- `Tests/ChartZoomTests.swift`: 13 tests covering `ChartViewport` zoom, pan, and the live
+- `Tests/ChartZoomTests.swift`: covers `ChartViewport` zoom, pan, and the live
   edge, the finer re-read at the zoomed bucket and its failure, period snapping to buckets
   and whole seconds, and the brushed period's statistics and saved bounds matching a saved
   session's.
-- `Tests/OuraChartTests.swift`: 16 tests covering timed sleep-stage and movement runs,
+- `Tests/OuraChartTests.swift`: covers timed sleep-stage and movement runs,
   undefined codes as gaps, legacy caches without `timestamp`, legend coverage including
   non-wear, fourteen-day trends (gaps, first document per day, main sleep, spoken summary,
   temperature as a signed deviation), the chart UI fixture, and heart-rate selection.
-- `Tests/LiveReloadTests.swift`: 8 tests covering the reload-coalescing rule and the
+- `Tests/LiveReloadTests.swift`: covers the reload-coalescing rule and the
   bounded Now read, which shows the same values and verdicts as the two-day read.
-- `Tests/ChartGapTests.swift`: 12 tests covering shared gap segmentation for the band,
+- `Tests/ChartGapTests.swift`: covers shared gap segmentation for the band,
   the pairwise timeline, and Oura heart rate, including isolated points and thinning.
-- `Tests/RingVitalsTests.swift`: 15 tests covering blood-oxygen and blood-pressure
+- `Tests/RingVitalsTests.swift`: covers blood-oxygen and blood-pressure
   measurement, sensor codes, the history request against a published capture, history
   transfer (acknowledgement, empty types, bad CRC, silence, cancel, overflow), record
   decoding, clock guards, local wall-clock conversion, estimate provenance, and stable IDs.
-- `Tests/NowRecentReadingsTests.swift`: 7 tests covering spot readings kept on Now with their
+- `Tests/NowRecentReadingsTests.swift`: covers spot readings kept on Now with their
   age, blood pressure from yesterday, the horizon, the newest earlier reading, old rows kept
   out of a live verdict, paused devices, and the bounded latest-reading query.
-- `Tests/StressModelTests.swift`: 20 tests covering robust statistics, the hour-of-day
+- `Tests/StressModelTests.swift`: covers robust statistics, the hour-of-day
   aggregate, typical/stressed/relaxed scores and their drivers, the exercise gate, missing
   signals and baselines, per-source HRV scales, smoothing, secondary signals, freshness,
   bands, storage as a slot estimate, baseline lifetime, the metric's contract, the ring
   stress check, the slot timer's alignment, and background logging (a new input scores an
   unscored slot once, one pass at a time, and other metrics start none).
-- `Tests/RingMonitoringTests.swift`: 9 tests covering the automatic-measuring setting: request
+- `Tests/RingMonitoringTests.swift`: covers the automatic-measuring setting: request
   bytes and CRC, replies (accepted, `FC`, empty, the captured blood-pressure refusal), the
   30-minute floor and one-byte cap, gating before identification and while measuring, heart
   rate before blood oxygen, refusals named and never reported as in effect, off, silence and
   write failure, stale timers, and stray replies.
-- `Tests/RingTemperatureTests.swift`: 6 tests covering the temperature start request, a
+- `Tests/RingTemperatureTests.swift`: covers the temperature start request, a
   refusal storing nothing, completion reading memory and reporting the new value, only an
   old record, no contact, and live measurements reading no memory.
-- `Tests/NowBriefTests.swift`: 11 tests covering the facts' order and caveats, the coarse
+- `Tests/NowBriefTests.swift`: covers the facts' order and caveats, the coarse
   key, accepted model drafts, numbers tied to their reading, estimate wording, kept ages,
   judgement and diagnosis, readings the facts lack, and longest-name matching.
-- `Tests/Watch/WatchChartTests.swift`: 23 tests covering chart payload compatibility and
+- `Tests/Watch/WatchChartTests.swift`: covers chart payload compatibility and
   validation, the 1H/3H/24H/7D/30D periods and their windows, per-period evidence, empty periods,
   the long-period cache and its invalidation (only by removals that reach a period, routine
   pruning kept, the bounded removal record), one read sliced into every period, palette
   colours and shared-slot shapes, pair choice and threshold, estimate marking, the size drop
   order and its single encode, axis ticks, gap segmentation, domains, and spoken text.
-- `Tests/Watch/WatchChartSelectionTests.swift`: 7 tests covering the wrist chart selection:
+- `Tests/Watch/WatchChartSelectionTests.swift`: covers the wrist chart selection:
   windows grouped across sources at the drawn dates, snapping inside the radius and nothing
   in empty plot area, the radius in seconds, VoiceOver stepping, the popup's time span, and
   the spoken window and difference.
-- `Tests/Watch/WatchSyncReportTests.swift`: 6 tests covering the sync-all reply's round trip
+- `Tests/Watch/WatchSyncReportTests.swift`: covers the sync-all reply's round trip
   and rejection of impossible, newer, and oversized replies, its lines, and the Health and
   Oura outcome rules (never synced for a run that predates the request or met a rate limit).
-- `Tests/ExportStreamingTests.swift`: 8 tests covering keyset export pages (rows sharing an
+- `Tests/ExportStreamingTests.swift`: covers keyset export pages (rows sharing an
   end, one source), one snapshot across a mid-export deletion, the off-main writer against
   the whole-string export, progress, Cancel and empty exports leaving no file, a not-loaded
   store, the export job, the launch sweep, and pairwise files written together.
-- `Tests/RingSessionTests.swift`: 28 tests covering the YCBT codec (CRC check value,
+- `Tests/RingSessionTests.swift`: covers the YCBT codec (CRC check value,
   framing, reassembly, bad CRC and length, the identity reply's battery bytes), the battery
   query, topology selection, subscription gating,
   identification, warm-up and completion, no contact, rejection, timeouts, cancel and repeat,
   heart-rate-only readiness, control channels, late callbacks, stall diagnosis, raw-capture
   bounds, command stages, and stream cadence.
-- `Tests/DashboardTrendTests.swift`: 8 tests covering Now sparklines (window medians, gaps,
+- `Tests/DashboardTrendTests.swift`: covers Now sparklines (window medians, gaps,
   single points, spans, spoken summary, per-window caching), chip status, and the
   `--chart-gallery` fixture.
-- `Tests/ComparisonHonestyTests.swift`: 13 tests covering interval averages (no windowed pair, no compaction, never concluding), session titles across days, RMSSD adjacency, the t quantile and effective sample size, and clock skew.
-- `Tests/HistoryReaderTests.swift`: 9 tests covering off-main snapshots, reader visibility of commits, column and payload decoding, SQL source filters, failures and not-loaded history, temporary files, and the schema-3 migration and backfill.
-- `Tests/ResetAndIngestTests.swift`: 11 tests covering reset order and exclusivity, batched Bluetooth ingest, batched existence checks, changed-source persistence, and launch-time transport setup.
-- `Tests/PeripheralStateTests.swift`: 6 tests covering `PeripheralLink`, `RingLink`, and `PeripheralRecord`.
-- `Tests/ColourVisionTests.swift`: 12 tests. They pin the Machado/CAM02-UCS validator to
+- `Tests/ComparisonHonestyTests.swift`: covers interval averages (no windowed pair, no compaction, never concluding), session titles across days, RMSSD adjacency, the t quantile and effective sample size, and clock skew.
+- `Tests/HistoryReaderTests.swift`: covers off-main snapshots, reader visibility of commits, column and payload decoding, SQL source filters, failures and not-loaded history, temporary files, and the schema-3 migration and backfill.
+- `Tests/ResetAndIngestTests.swift`: covers reset order and exclusivity, batched Bluetooth ingest, batched existence checks, changed-source persistence, and launch-time transport setup.
+- `Tests/PeripheralStateTests.swift`: covers `PeripheralLink`, `RingLink`, and `PeripheralRecord`.
+- `Tests/ColourVisionTests.swift`: tests that pin the Machado/CAM02-UCS validator to
   published values and enforce ΔE ≥ 15 in ordinary vision between all source slots, and
   under protan, deutan, and tritan simulation between the first six slots, against the
   reference-line ink, and between sleep stages. They
@@ -813,11 +814,4 @@ When a comment and implementation disagree, document the discrepancy and test ac
 
 ## Agent Workflow
 
-1. **Inspect relevant existing code before modifying anything.** Read `project.yml`, the owning model/manager/view, nearby tests, and any persistence/capability contract touched by the request. Check the current worktree and preserve unrelated user changes.
-2. **Reuse existing abstractions and patterns.** Route measurements through `Reading`/`DataSource` and `HealthStore`; use `MetricKind`, parsers, type mappings, `ComparisonEngine`, exporters, fixtures, Observation, and the existing injection seams instead of creating parallel logic.
-3. **Make the smallest coherent change necessary.** Keep behavior, schema, identity, concurrency, and capability changes within explicit scope. Do not perform unrelated refactors or formatting sweeps.
-4. **Build affected targets after meaningful changes.** Regenerate first when needed, then build the `HeartSyncChecker` scheme. Remember that this builds the `HeartSync` product and that hosted tests depend on that exact product path.
-5. **Run appropriate tests.** Start with focused Swift Testing suites, then run the full test target for changes that cross shared models, storage, transport, analysis, or project boundaries. Distinguish test compilation from test execution.
-6. **Fix compiler errors and warnings caused by the change.** Maintain Swift 6 complete-concurrency correctness; do not suppress warnings that reveal isolation, Sendable, availability, or API-contract problems.
-7. **Check for regressions across related targets.** Exercise relevant failure/permission/empty states, persisted-data compatibility, and a real-device or live-flow check where framework behavior cannot be simulated. A build alone is not runtime validation.
-8. **Summarize what was changed and any unresolved concerns.** Report files and behavior affected, builds/tests/runtime checks actually completed, anything not testable in the current environment, data/capability implications, and remaining risks without overstating confidence.
+Before changing code, read `project.yml`, the owning model, manager, or view, its nearby tests, and any persistence or capability contract the request touches; the worktree may hold unrelated user changes, so leave them alone. Route new behavior through the existing seams described above rather than parallel logic, and keep schema, identity, concurrency, and capability changes inside the request's explicit scope. Building the `HeartSyncChecker` scheme produces the `HeartSync` product, and the hosted tests depend on that exact product path. When you finish, report the files and behavior affected, which builds, tests, and runtime checks actually ran, what could not be tested in this environment, and any data or capability implications, without overstating confidence.
