@@ -65,7 +65,7 @@ final class AppModel {
         var stopBluetoothScan: @MainActor () -> Void
         var configureHealthKit: @MainActor (
             HealthStore,
-            _ onReadings: @escaping @MainActor ([Reading], [DataSource], Set<UUID>) -> Bool
+            _ onReadings: @escaping @MainActor ([Reading], [DataSource], Set<UUID>, _ replacingExisting: Bool) -> Bool
         ) -> Void
         /// Installs HealthKit's background-delivery observer queries. Called at launch.
         var registerHealthKitBackgroundDelivery: @MainActor () -> Void = {}
@@ -376,11 +376,13 @@ final class AppModel {
         // gets it here. The central now sees the loaded source list, so reconnect the rest.
         launch()
         transports.resumeBluetoothAfterLoad()
-        transports.configureHealthKit(store) { [weak self] readings, sources, deletedIDs in
+        transports.configureHealthKit(store) { [weak self] readings, sources, deletedIDs, replacingExisting in
             self?.ingest(
                 readings,
                 updatingSources: sources,
-                removingReadingIDs: deletedIDs
+                removingReadingIDs: deletedIDs,
+                // Only a page that refiles a watch's relayed readings (`HealthKitWatchRelay`).
+                replacingExisting: replacingExisting
             ) ?? false
         }
         // Cold start always begins as `.notDetermined`; restore a prior Connect without

@@ -117,6 +117,11 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
     /// True when the stable id identifies a HealthKit writing app rather than a proven
     /// physical instrument. Optional keeps older source archives backward-decodable.
     var identifiesHealthKitWriter: Bool?
+    /// `HKSourceRevision.productType` values seen for a HealthKit writer ("Watch7,12",
+    /// "iPhone17,2"): the hardware the writing software ran on. `HealthKitWatchRelay` uses it
+    /// to tell a watch's own writer from the iPhone that relays the watch's Blood Oxygen.
+    /// Metadata, not identity. Optional keeps older source archives backward-decodable.
+    var writerProductTypes: Set<String>?
     /// True once the user has renamed this source. A transport upsert then leaves the name
     /// alone: Bluetooth updates reuse the stored name anyway, but a Health or Oura source
     /// re-reports its own name on every sync, which would undo the user's alias. Optional
