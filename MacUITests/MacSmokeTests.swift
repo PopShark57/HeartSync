@@ -86,6 +86,9 @@ final class MacSmokeTests: XCTestCase {
             screenshot.name = "Export sheet still open after saving to /Users/Shared"
             screenshot.lifetime = .keepAlways
             add(screenshot)
+            // Also in the job log, which can be read without downloading the result bundle:
+            // whether the panel is still open, where it is, and any error the sheet shows.
+            print("Export sheet still open. Accessibility hierarchy:\n\(app.debugDescription)")
         }
         XCTAssertEqual(saveResult, .completed, "The export sheet closes only after a successful move")
         XCTAssertTrue(export.waitForExistence(timeout: 5))
