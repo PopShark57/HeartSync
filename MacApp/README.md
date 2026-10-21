@@ -18,7 +18,9 @@ deletes is deleted on the Mac at the next sync.
 - **Transport** (`MacMirrorTransport.swift`). A paired Mac advertises `_heartsync._tcp` with
   its install id in the TXT record and accepts TLS 1.2 PSK connections
   (`TLS_PSK_WITH_AES_128_GCM_SHA256`) made with the pairing key. A handshake with any other key
-  fails. Frames are a four-byte length, a type byte, and a body.
+  fails. Session resumption is off, so every connection proves the current key rather than
+  resuming a session cached under an earlier one. Frames are a four-byte length, a type byte,
+  and a body.
 - **Change log** (`HealthDatabase`, schema 4). While at least one Mac is paired, SQLite
   triggers record the id of every inserted, updated, or deleted reading in `change_log`
   (AUTOINCREMENT, so sequence numbers are never reused). The log has an epoch (new each time

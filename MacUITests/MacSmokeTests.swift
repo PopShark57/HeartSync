@@ -48,6 +48,10 @@ final class MacSmokeTests: XCTestCase {
         XCTAssertTrue(pair.waitForExistence(timeout: 10))
         app.activate()
         pair.click()
+        // The export button, and with it the shortcut, exists only once the pair analysis has
+        // loaded its observations; a shortcut typed before then does nothing.
+        let export = app.descendants(matching: .any).matching(identifier: "pairwise.export").firstMatch
+        XCTAssertTrue(export.waitForExistence(timeout: 10))
         app.typeKey("e", modifierFlags: [.command, .shift])
         let save = app.buttons["Save…"]
         XCTAssertTrue(save.waitForExistence(timeout: 10))
@@ -58,26 +62,36 @@ final class MacSmokeTests: XCTestCase {
         app.activate()
         app.typeKey(.escape, modifierFlags: []) // Cancel the native destination picker.
         XCTAssertTrue(save.waitForExistence(timeout: 5))
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("HeartSync-ExportSmoke-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: destination) }
+        // The runner is sandboxed, so it can read only its own container, and HeartSync
+        // moving files into that container is a cross-app write that macOS 14 and later guard
+        // with an "access data from other apps" prompt nobody answers on CI. So the files go
+        // to /Users/Shared, which belongs to no app and which the panel grants as the user's
+        // choice, and the outcome is read from HeartSync itself: the sheet closes only when
+        // the move succeeded and stays open with its error otherwise. The files' contents are
+        // covered by the export unit tests. Names carry a UTC timestamp, so runs never collide;
+        // a local run leaves its two small files in /Users/Shared.
         app.activate()
         save.click()
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))
         app.typeKey("g", modifierFlags: [.command, .shift])
-        app.typeText(destination.path)
+        app.typeText("/Users/Shared")
         app.typeKey(.return, modifierFlags: [])
         app.typeKey(.return, modifierFlags: [])
-        let filesSaved = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            (try? FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil).count) == 2
-        }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [filesSaved], timeout: 10), .completed)
-        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "pairwise.export").firstMatch.waitForExistence(timeout: 5))
-        // Save dismissed the export and its ordinary temporary-directory cleanup ran.
-        // Both complete files must still exist in the selected destination afterwards.
-        let saved = (try? FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil)) ?? []
-        XCTAssertEqual(Set(saved.map(\.pathExtension)), ["csv", "txt"])
-        for file in saved { XCTAssertGreaterThan((try? Data(contentsOf: file).count) ?? 0, 0) }
+        let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: save)
+        let saveResult = XCTWaiter.wait(for: [closed], timeout: 10)
+        if saveResult != .completed {
+            // The whole screen, not just the app: a privacy alert from another process, a save
+            // error in the sheet, and a panel still open each mean something different.
+            let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            screenshot.name = "Export sheet still open after saving to /Users/Shared"
+            screenshot.lifetime = .keepAlways
+            add(screenshot)
+            // Also in the job log, which can be read without downloading the result bundle:
+            // whether the panel is still open, where it is, and any error the sheet shows.
+            print("Export sheet still open. Accessibility hierarchy:\n\(app.debugDescription)")
+        }
+        XCTAssertEqual(saveResult, .completed, "The export sheet closes only after a successful move")
+        XCTAssertTrue(export.waitForExistence(timeout: 5))
     }
 
 }
