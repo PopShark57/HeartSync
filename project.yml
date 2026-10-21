@@ -4,6 +4,7 @@ options:
   deploymentTarget:
     iOS: "18.0"
     watchOS: "11.0"
+    macOS: "15.0"
   createIntermediateGroups: true
   groupSortPosition: top
   # Base language of Resources/Localizable.xcstrings ("sourceLanguage": "en"). Pinned rather
@@ -59,6 +60,12 @@ targets:
         NSBluetoothAlwaysUsageDescription: "HeartSync uses Bluetooth to discover, connect to, and read measurements from nearby health sensors."
         NSHealthShareUsageDescription: "HeartSync reads heart and related measurements from Apple Health so you can compare your devices."
         NSHealthUpdateUsageDescription: "HeartSync saves directly measured Bluetooth readings to Apple Health when you enable mirroring."
+        # Mac sync (Sources/MacSync). Asked for only once a Mac is being paired or is paired:
+        # nothing browses the network before that.
+        NSLocalNetworkUsageDescription: "HeartSync finds your Mac on the local network to send it a copy of your history."
+        NSBonjourServices:
+          - _heartsync._tcp
+          - _heartsync-pair._tcp
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
             CFBundleURLName: com.heartsync.HeartSyncChecker.oura-oauth
@@ -198,6 +205,78 @@ targets:
         TARGETED_DEVICE_FAMILY: "4"
         SKIP_INSTALL: YES
 
+  # The Mac mirror (MacApp/README.md): a read-only copy of the iPhone's history, received
+  # over the local network from the paired iPhone (Sources/MacSync). It shares the store,
+  # model, analysis, and comparison screens with the iPhone app and has no transports.
+  HeartSyncMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: MacApp/Sources
+      - path: Sources/Model
+      - path: Sources/Store
+      - path: Sources/Analysis
+      - path: Sources/MacSync
+        # The phone's half: browsing for Macs and pairing from the phone.
+        excludes: ["MacMirrorPublisher.swift", "MacMirrorPairingClient.swift"]
+      # Value types the model and screens name (`BodySensorLocation`, the ring's
+      # provenance); `BluetoothManager` itself is the phone's.
+      - path: Sources/Bluetooth
+        excludes: ["BluetoothManager.swift", "PeripheralState.swift"]
+      # `--mirror-demo` (Debug only) fills an in-memory mirror from the chart gallery.
+      - path: Sources/Debug/DebugChartGallery.swift
+      - path: Sources/Views
+        # Screens that drive the phone's transports or settings, and the UIKit share sheet
+        # (the Mac has its own ReadingsShareSheet).
+        excludes:
+          - "BluetoothScanView.swift"
+          - "DashboardView.swift"
+          - "DevicesView.swift"
+          - "MacSyncSettingsView.swift"
+          - "Oura/**"
+          - "OuraDashboardView.swift"
+          - "OuraSetupView.swift"
+          - "ReadingsShareSheet.swift"
+          - "SettingsView.swift"
+      - path: Resources/Localizable.xcstrings
+        buildPhase: resources
+      - path: MacApp/Resources
+        buildPhase: resources
+        excludes: ["Info.plist", "HeartSyncMac.entitlements"]
+    dependencies:
+      - sdk: libsqlite3.tbd
+    info:
+      path: MacApp/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: HeartSync
+        LSApplicationCategoryType: public.app-category.healthcare-fitness
+        NSLocalNetworkUsageDescription: "HeartSync receives a copy of your history from HeartSync on your iPhone over the local network."
+        NSBonjourServices:
+          - _heartsync._tcp
+          - _heartsync-pair._tcp
+    entitlements:
+      path: MacApp/Resources/HeartSyncMac.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        # Listening for the paired iPhone, and for a phone that is pairing.
+        com.apple.security.network.server: true
+        com.apple.security.network.client: true
+        # Save… in the export sheet moves the exported files where the person chooses.
+        com.apple.security.files.user-selected.read-write: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.heartsync.HeartSyncChecker.mac
+        PRODUCT_NAME: HeartSync
+        PRODUCT_MODULE_NAME: HeartSyncMac
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: MacApp/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: MacApp/Resources/HeartSyncMac.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: YES
+        COMBINE_HIDPI_IMAGES: YES
+
   HeartSyncCheckerTests:
     type: bundle.unit-test
     platform: iOS
@@ -242,6 +321,11 @@ targets:
         BUNDLE_LOADER: "$(TEST_HOST)"
 
 schemes:
+  HeartSyncMac:
+    build:
+      targets:
+        HeartSyncMac: all
+
   HeartSyncWatch:
     build:
       targets:

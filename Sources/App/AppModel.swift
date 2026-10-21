@@ -18,7 +18,12 @@ final class AppModel {
     let healthKit: HealthKitManager
     let oura: OuraManager
     private let watchCompanion = WatchCompanionPublisher()
+    /// Keeps paired Macs' mirrors up to date while the app is in the foreground.
+    let macMirror = MacMirrorPublisher(phoneName: MacMirrorDeviceIdentity.deviceName)
     private let transports: TransportActions
+    /// Whether the scene is active, so a start that finishes after it became active can
+    /// begin Mac sync, and one during a background launch does not.
+    private var isInForeground = false
 
     /// The concrete services are the defaults; a test passes its own store and settings over
     /// temporary files and `TransportActions.inert` (or recording closures), so startup
@@ -403,6 +408,8 @@ final class AppModel {
         startDerivedMetrics()
         startMaintenance()
         startOuraSchedule()
+        macMirror.configure(store: store)
+        if isInForeground { macMirror.resume() }
         updateStartupPresentation()
         watchCompanion.publishNow()
     }
@@ -444,6 +451,7 @@ final class AppModel {
         #if DEBUG
         guard !Self.pairwiseDemoEnabled, !Self.chartGalleryEnabled else { return }
         #endif
+        isInForeground = true
         guard hasStarted else {
             await start()
             return
@@ -452,6 +460,7 @@ final class AppModel {
         // refresh in that window would publish an "unavailable" watch snapshot and recompute
         // estimates against a store that has not loaded.
         guard startupState == .ready else { return }
+        macMirror.resume()
         transports.reconnectBluetooth()
         if transports.isHealthKitAuthorized() {
             await transports.syncHealthKit()
@@ -622,6 +631,8 @@ final class AppModel {
         #if DEBUG
         guard !Self.pairwiseDemoEnabled, !Self.chartGalleryEnabled else { return }
         #endif
+        isInForeground = false
+        macMirror.suspend()
         transports.stopBluetoothScan()
         // Nothing waits in memory while the process may be suspended.
         flushBluetoothBuffer()

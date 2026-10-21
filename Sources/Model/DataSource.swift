@@ -2,6 +2,8 @@ import Foundation
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
 #endif
 
 /// Where a reading came from.
@@ -339,9 +341,16 @@ extension SourcePaletteSlot {
             let value = traits.userInterfaceStyle == .dark ? dark : light
             return UIColor(red: value.red, green: value.green, blue: value.blue, alpha: 1)
         })
+        #elseif canImport(AppKit)
+        // The Mac mirror app, and the macOS scratch test harness (AGENTS.md).
+        let light = self.light
+        let dark = self.dark
+        return Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let value = isDark ? dark : light
+            return NSColor(srgbRed: value.red, green: value.green, blue: value.blue, alpha: 1)
+        })
         #else
-        // Only the macOS scratch test harness (AGENTS.md) builds without UIKit. It draws
-        // nothing, so the light value keeps the model layer compiling there.
         return Color(red: light.red, green: light.green, blue: light.blue)
         #endif
     }

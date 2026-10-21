@@ -17,7 +17,14 @@ struct CompareView: View {
     @State private var revisitNotice: String?
     /// The metric shown in the detail column of the regular-width split view.
     @State private var selectedMetric: MetricKind?
+    #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    /// Metrics beside the selected metric's detail in a regular width.
+    private var usesSplitLayout: Bool { horizontalSizeClass == .regular }
+    #else
+    /// The Mac window's sidebar is already the outer split; Compare pushes inside it.
+    private let usesSplitLayout = false
+    #endif
 
     /// The span actually analysed. A saved session pins it; otherwise it rolls.
     private var period: ComparisonPeriod {
@@ -72,7 +79,7 @@ struct CompareView: View {
     var body: some View {
         // A regular width (iPad, or a large iPhone in landscape) shows metrics beside the
         // selected metric's detail. A compact width pushes, as before.
-        if horizontalSizeClass == .regular {
+        if usesSplitLayout {
             NavigationSplitView {
                 compareList(selection: $selectedMetric)
             } detail: {
@@ -155,12 +162,12 @@ struct CompareView: View {
             }
         }
         .navigationTitle("Compare")
-        .toolbarTitleDisplayMode(.inlineLarge)
+        .heartSyncTabTitle()
         .heartSyncScreenBackground()
         .toolbar {
             // Both menus trail: an inline-large title owns the leading edge, and a leading
             // item beside it is not shown.
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .heartSyncTrailing) {
                 Menu {
                     Button("Saved sessions\u{2026}", systemImage: "bookmark") { showingSessions = true }
                     Button("Save this period\u{2026}", systemImage: "bookmark.square") { savingSession = true }
@@ -175,7 +182,7 @@ struct CompareView: View {
                 }
                 .accessibilityIdentifier("compare.sessions")
             }
-            ToolbarItem(placement: .topBarTrailing) { sourceSelectionMenu }
+            ToolbarItem(placement: .heartSyncTrailing) { sourceSelectionMenu }
         }
         .sheet(isPresented: $showingSessions) {
             ComparisonSessionsView { session in openSession(session) }
@@ -243,7 +250,7 @@ struct CompareView: View {
                                 analyses: snapshot.analyses(for: kind),
                                 sourceIDs: snapshot.sourceIDs(for: kind)
                             )
-                            if horizontalSizeClass == .regular {
+                            if usesSplitLayout {
                                 // Selects into the split view's detail column.
                                 NavigationLink(value: kind) { row }
                             } else {

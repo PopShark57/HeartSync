@@ -41,7 +41,9 @@ final class HealthDatabase {
     /// - 3: `value` and `has_metadata` columns, so a reading without metadata is rebuilt
     ///   from its columns instead of decoding its JSON payload. Rows written before 3 have
     ///   NULL there and are decoded from the payload until maintenance backfills them.
-    static let schemaVersion = 3
+    /// - 4: the `change_log` table a paired Mac mirrors from (`setChangeLogging`). No
+    ///   trigger writes to it until a Mac is paired.
+    static let schemaVersion = 4
 
     let wasNew: Bool
     private(set) var requiresLegacyMigration = false
@@ -259,6 +261,20 @@ final class HealthDatabase {
                 try execute("PRAGMA user_version = 3")
             }
             version = 3
+        }
+        if version < 4 {
+            try transaction {
+                // AUTOINCREMENT, so a sequence number is never reused after the log is trimmed
+                // or cleared: a Mac's cursor can only point at entries it was sent.
+                try execute("""
+                    CREATE TABLE IF NOT EXISTS change_log (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        reading_id TEXT NOT NULL
+                    )
+                    """)
+                try execute("PRAGMA user_version = 4")
+            }
+            version = 4
         }
     }
 
@@ -693,10 +709,12 @@ final class HealthDatabase {
         completingLegacyMigration: Bool = false
     ) throws {
         try transaction {
-            try execute("DELETE FROM readings")
-            try execute("DELETE FROM sources")
-            for source in sources { try write(source) }
-            for reading in readings { try write(reading, mode: .append) }
+            try withChangeLogSuspended {
+                try execute("DELETE FROM readings")
+                try execute("DELETE FROM sources")
+                for source in sources { try write(source) }
+                for reading in readings { try write(reading, mode: .append) }
+            }
             if completingLegacyMigration {
                 try execute(
                     "INSERT OR REPLACE INTO metadata(key, value) VALUES ('legacy_migration', 'complete')"
@@ -836,8 +854,323 @@ final class HealthDatabase {
 
     func deleteAllReadings(sources: [DataSource]) throws {
         try transaction {
-            try execute("DELETE FROM readings")
+            try withChangeLogSuspended { try execute("DELETE FROM readings") }
             for source in sources { try write(source) }
+        }
+    }
+
+    // MARK: - Mac mirror: change log (iPhone)
+
+    /// Where a paired Mac can resume from.
+    ///
+    /// `epoch` names this log: it is new each time logging is switched on, so a Mac whose
+    /// cursor came from another log (another database file, or logging switched off and on)
+    /// cannot mistake it for this one. Every change after `floor` is in the log; a cursor
+    /// below it has missed entries and must start again from a snapshot. `latest` is the
+    /// newest sequence number ever assigned, which is where a snapshot taken now resumes.
+    struct ChangeLogPosition: Equatable, Sendable {
+        var epoch: String
+        var floor: Int64
+        var latest: Int64
+    }
+
+    private static let changeLogTriggers = [
+        "readings_log_insert": "AFTER INSERT ON readings BEGIN INSERT INTO change_log(reading_id) VALUES (NEW.id); END",
+        // Not on `value` or `has_metadata`: the schema-3 backfill fills those in for rows
+        // that have not changed, and logging it would resend a whole old history.
+        "readings_log_update": "AFTER UPDATE OF id, source_id, kind, start, end, midpoint, provenance, payload ON readings BEGIN INSERT INTO change_log(reading_id) VALUES (NEW.id); END",
+        "readings_log_delete": "AFTER DELETE ON readings BEGIN INSERT INTO change_log(reading_id) VALUES (OLD.id); END",
+    ]
+    static let changeLogEpochKey = "mirror_log_epoch"
+    static let changeLogFloorKey = "mirror_log_floor"
+
+    /// Whether every write to `readings` is being recorded for a Mac.
+    func isChangeLogging() throws -> Bool {
+        try count(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'readings_log_insert'",
+            []
+        ) > 0
+    }
+
+    /// Starts or stops recording reading changes for paired Macs.
+    ///
+    /// The triggers exist only while a Mac is paired, so a phone without one pays nothing
+    /// for the log. Switching on starts a new epoch whose floor is the newest sequence number,
+    /// so a Mac's first contact is a snapshot. Switching off removes the triggers and the log.
+    /// Doing either twice changes nothing.
+    func setChangeLogging(_ enabled: Bool) throws {
+        try transaction {
+            let active = try isChangeLogging()
+            if enabled {
+                guard !active else { return }
+                try createChangeLogTriggers()
+                try execute("DELETE FROM change_log")
+                try setMetadataValue(UUID().uuidString, forKey: Self.changeLogEpochKey)
+                try setMetadataValue(String(try latestChangeSequence()), forKey: Self.changeLogFloorKey)
+            } else {
+                guard active else { return }
+                for name in Self.changeLogTriggers.keys { try execute("DROP TRIGGER IF EXISTS \(name)") }
+                try execute("DELETE FROM change_log")
+                try execute(
+                    "DELETE FROM metadata WHERE key IN (?, ?)",
+                    bindings: [.text(Self.changeLogEpochKey), .text(Self.changeLogFloorKey)]
+                )
+            }
+        }
+    }
+
+    /// The log's position, or nil while nothing is being logged.
+    func changeLogPosition() throws -> ChangeLogPosition? {
+        try checkInjectedQueryFailure("read change log")
+        guard try isChangeLogging(),
+              let epoch = try metadataValue(Self.changeLogEpochKey),
+              let floor = try metadataValue(Self.changeLogFloorKey).flatMap(Int64.init)
+        else { return nil }
+        return ChangeLogPosition(epoch: epoch, floor: floor, latest: try latestChangeSequence())
+    }
+
+    /// Up to `limit` log entries after `cursor`: the distinct reading ids they name, in the
+    /// order first named, and the sequence number of the last entry read (`cursor` when
+    /// there were none). An id says only that the row changed; what it is now is
+    /// `readings(withIDs:)`, and an id with no row is a deletion.
+    func changes(after cursor: Int64, limit: Int) throws -> (ids: [UUID], through: Int64) {
+        try checkInjectedQueryFailure("read change log")
+        let statement = try prepare("SELECT seq, reading_id FROM change_log WHERE seq > ? ORDER BY seq LIMIT ?")
+        defer { sqlite3_finalize(statement) }
+        try bind([.int(Int(cursor)), .int(max(1, limit))], to: statement)
+        var ids: [UUID] = []
+        var seen: Set<UUID> = []
+        var through = cursor
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                through = sqlite3_column_int64(statement, 0)
+                if let text = sqlite3_column_text(statement, 1),
+                   let id = UUID(uuidString: String(cString: text)),
+                   seen.insert(id).inserted {
+                    ids.append(id)
+                }
+            case SQLITE_DONE:
+                return (ids, through)
+            default:
+                throw error("read change log")
+            }
+        }
+    }
+
+    /// `changes(after:limit:)`, but only while `cursor` is still a position in log `epoch`:
+    /// nil when logging is off, the epoch is another, or entries after `cursor` have been
+    /// trimmed (it is below the floor). The check and the read share one read transaction,
+    /// so a trim committed between them cannot make a session skip entries unnoticed.
+    func changesIfContinuous(after cursor: Int64, epoch: String, limit: Int) throws -> (ids: [UUID], through: Int64)? {
+        try readTransaction {
+            guard let position = try changeLogPosition(),
+                  position.epoch == epoch,
+                  cursor >= position.floor,
+                  cursor <= position.latest
+            else { return nil }
+            return try changes(after: cursor, limit: limit)
+        }
+    }
+
+    /// The stored rows among `ids`, in batches of `lookupBatchSize`. Ids with no row are
+    /// absent from the result.
+    func readings(withIDs ids: [UUID]) throws -> [Reading] {
+        try checkInjectedQueryFailure("decode rows")
+        let unique = Array(Set(ids))
+        var result: [Reading] = []
+        var start = 0
+        while start < unique.count {
+            let batch = unique[start..<min(start + Self.lookupBatchSize, unique.count)]
+            start += batch.count
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ", ")
+            result += try readingRows(
+                "SELECT \(Self.readingColumns) FROM readings WHERE id IN (\(placeholders))",
+                bindings: batch.map { .text($0.uuidString) }
+            )
+        }
+        return result
+    }
+
+    /// One keyset page of the whole table for a Mac's snapshot, in the `(end, rowid)` order
+    /// `forEachExportPage` uses, and the key to continue after (nil when this was the last).
+    ///
+    /// Each page is its own read. A row written between pages may be missed or sent twice;
+    /// both are harmless, because the snapshot resumes the log from the position read before
+    /// its first page, and the log names every row written since.
+    func snapshotPage(after key: SnapshotKey?, limit: Int) throws -> (rows: [Reading], next: SnapshotKey?) {
+        let size = max(1, limit)
+        var sql = "SELECT \(Self.readingColumns), rowid FROM readings"
+        var bindings: [Binding] = []
+        if let key {
+            sql += " WHERE (end, rowid) > (?, ?)"
+            bindings = [.double(key.end), .int(Int(key.rowid))]
+        }
+        sql += " ORDER BY end, rowid LIMIT ?"
+        bindings.append(.int(size))
+        var last: SnapshotKey?
+        let rows = try readingRows(sql, bindings: bindings) { statement in
+            last = SnapshotKey(end: sqlite3_column_double(statement, 4), rowid: sqlite3_column_int64(statement, 9))
+        }
+        return (rows, rows.count == size ? last : nil)
+    }
+
+    struct SnapshotKey: Equatable, Sendable {
+        var end: Double
+        var rowid: Int64
+    }
+
+    /// Drops entries every paired Mac has acknowledged, and the oldest beyond
+    /// `maximumEntries`, raising the floor past whatever went. A Mac whose cursor is then
+    /// below the floor is sent a snapshot. Returns the floor.
+    @discardableResult
+    func trimChangeLog(acknowledgedThrough acknowledged: Int64?, maximumEntries: Int) throws -> Int64? {
+        try transaction {
+            guard try isChangeLogging(),
+                  var floor = try metadataValue(Self.changeLogFloorKey).flatMap(Int64.init)
+            else { return nil }
+            if let acknowledged, acknowledged > floor {
+                try execute("DELETE FROM change_log WHERE seq <= ?", bindings: [.int(Int(acknowledged))])
+                floor = acknowledged
+            }
+            let excess = try count("SELECT COUNT(*) FROM change_log", []) - max(0, maximumEntries)
+            if excess > 0 {
+                let statement = try prepare("SELECT seq FROM change_log ORDER BY seq LIMIT 1 OFFSET ?")
+                defer { sqlite3_finalize(statement) }
+                try bind([.int(excess - 1)], to: statement)
+                if sqlite3_step(statement) == SQLITE_ROW {
+                    let through = sqlite3_column_int64(statement, 0)
+                    try execute("DELETE FROM change_log WHERE seq <= ?", bindings: [.int(Int(through))])
+                    floor = max(floor, through)
+                }
+            }
+            try setMetadataValue(String(floor), forKey: Self.changeLogFloorKey)
+            return floor
+        }
+    }
+
+    /// Runs a bulk delete without logging each row, then clears the log and raises the floor
+    /// past everything in it. For a reset or a migration, which can remove millions of rows:
+    /// one trigger insert per row would double the work, and every paired Mac needs a
+    /// snapshot afterwards anyway. Must run inside a write transaction.
+    private func withChangeLogSuspended(_ body: () throws -> Void) throws {
+        guard try isChangeLogging() else { return try body() }
+        for name in Self.changeLogTriggers.keys { try execute("DROP TRIGGER IF EXISTS \(name)") }
+        try body()
+        try createChangeLogTriggers()
+        // One throwaway entry moves the sequence on, so the floor lands above every cursor a
+        // Mac could hold, including one that was fully up to date before the delete.
+        try execute("INSERT INTO change_log(reading_id) VALUES ('')")
+        try execute("DELETE FROM change_log")
+        try setMetadataValue(String(try latestChangeSequence()), forKey: Self.changeLogFloorKey)
+    }
+
+    private func createChangeLogTriggers() throws {
+        for (name, body) in Self.changeLogTriggers.sorted(by: { $0.key < $1.key }) {
+            try execute("CREATE TRIGGER IF NOT EXISTS \(name) \(body)")
+        }
+    }
+
+    /// The newest sequence number ever assigned, from AUTOINCREMENT's own record, so it
+    /// survives the log being emptied. Zero before the first entry.
+    private func latestChangeSequence() throws -> Int64 {
+        let statement = try prepare("SELECT seq FROM sqlite_sequence WHERE name = 'change_log'")
+        defer { sqlite3_finalize(statement) }
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW: return sqlite3_column_int64(statement, 0)
+        case SQLITE_DONE: return 0
+        default: throw error("read change sequence")
+        }
+    }
+
+    // MARK: - Mac mirror: applying (Mac)
+
+    static let mirrorEpochKey = "mirror_epoch"
+    static let mirrorCursorKey = "mirror_cursor"
+
+    /// The log this mirror follows and how far it has applied it, or nil when it has none
+    /// (a new mirror, or a snapshot that did not finish).
+    func mirrorPosition() throws -> (epoch: String, cursor: Int64)? {
+        guard let epoch = try metadataValue(Self.mirrorEpochKey), !epoch.isEmpty,
+              let cursor = try metadataValue(Self.mirrorCursorKey).flatMap(Int64.init)
+        else { return nil }
+        return (epoch, cursor)
+    }
+
+    /// Where a batch sits in a snapshot.
+    enum MirrorSnapshotStep: Equatable, Sendable {
+        /// The first page: forget the position and start counting the rows the phone holds.
+        case begin
+        case page
+        /// The last page: delete every row the snapshot did not name, then take the position.
+        case end
+    }
+
+    /// Applies one batch from the phone in one transaction: the whole source list when sent,
+    /// rows written as they are on the phone (replacing any with the same id), and removals.
+    ///
+    /// Outside a snapshot the batch's position is recorded with it, so a crash between
+    /// batches resumes exactly after the last one applied. During a snapshot the position is
+    /// cleared at `begin` and written only at `end`, so a snapshot cut short starts again
+    /// rather than leaving rows the phone no longer has.
+    @discardableResult
+    func applyMirror(
+        sources: [DataSource]?,
+        readings: [Reading],
+        removingReadingIDs removals: [UUID],
+        snapshot: MirrorSnapshotStep?,
+        epoch: String,
+        cursor: Int64
+    ) throws -> DeletedRows {
+        try transaction {
+            if let sources {
+                try execute("DELETE FROM sources")
+                for source in sources { try write(source) }
+            }
+            if snapshot == .begin {
+                try execute("CREATE TEMP TABLE IF NOT EXISTS mirror_seen (id TEXT PRIMARY KEY NOT NULL)")
+                try execute("DELETE FROM temp.mirror_seen")
+                try execute(
+                    "DELETE FROM metadata WHERE key IN (?, ?)",
+                    bindings: [.text(Self.mirrorEpochKey), .text(Self.mirrorCursorKey)]
+                )
+            }
+            for reading in readings { try write(reading, mode: .upsert) }
+            if snapshot != nil {
+                for reading in readings {
+                    try execute(
+                        "INSERT OR IGNORE INTO temp.mirror_seen(id) VALUES (?)",
+                        bindings: [.text(reading.id.uuidString)]
+                    )
+                }
+            }
+            var removed = DeletedRows()
+            for id in removals {
+                removed.add(try delete("DELETE FROM readings WHERE id = ? RETURNING end", bindings: [.text(id.uuidString)]))
+            }
+            if snapshot == .end {
+                removed.add(try delete(
+                    "DELETE FROM readings WHERE id NOT IN (SELECT id FROM temp.mirror_seen) RETURNING end"
+                ))
+                try execute("DELETE FROM temp.mirror_seen")
+            }
+            if snapshot == nil || snapshot == .end {
+                try setMetadataValue(epoch, forKey: Self.mirrorEpochKey)
+                try setMetadataValue(String(cursor), forKey: Self.mirrorCursorKey)
+            }
+            return removed
+        }
+    }
+
+    /// Empties the mirror and forgets its position, for a Mac that is unpaired.
+    func clearMirror() throws {
+        try transaction {
+            try execute("DELETE FROM readings")
+            try execute("DELETE FROM sources")
+            try execute(
+                "DELETE FROM metadata WHERE key IN (?, ?)",
+                bindings: [.text(Self.mirrorEpochKey), .text(Self.mirrorCursorKey)]
+            )
         }
     }
 
@@ -857,12 +1190,15 @@ final class HealthDatabase {
     }
 
     func setMetadata(_ value: String, forKey key: String) throws {
-        try transaction {
-            try execute(
-                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
-                bindings: [.text(key), .text(value)]
-            )
-        }
+        try transaction { try setMetadataValue(value, forKey: key) }
+    }
+
+    /// `setMetadata` for a caller already inside a transaction.
+    private func setMetadataValue(_ value: String, forKey key: String) throws {
+        try execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+            bindings: [.text(key), .text(value)]
+        )
     }
 
     /// Rows that ended before `date`: what a shorter retention would delete.

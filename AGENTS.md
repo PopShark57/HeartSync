@@ -12,7 +12,7 @@ HeartSync is a SwiftUI iOS 18+ application for collecting and comparing health m
 
 All three paths normalize data into the same `DataSource` and `Reading` model. `AppModel` routes normalized readings into `HealthStore`, optional derived estimates, comparison analysis, and optional HealthKit write-back. The app is deliberately careful to distinguish measured, derived, and estimated data and to represent insufficient comparison evidence honestly.
 
-The repository contains iOS and watchOS applications, a watchOS WidgetKit complication extension, an iOS hosted Swift Testing bundle, an iOS UI-test bundle, and a separate device-performance test bundle. There is no server, reusable framework target, or local Swift package.
+The repository contains iOS, watchOS, and macOS applications, a watchOS WidgetKit complication extension, an iOS hosted Swift Testing bundle, an iOS UI-test bundle, and a separate device-performance test bundle. The macOS app is a read-only mirror of the iPhone's history, received over the local network (see Mac Mirror). There is no server, reusable framework target, or local Swift package.
 
 ## High-Level Architecture
 
@@ -52,6 +52,8 @@ HeartSyncApp
 | `Shared` | Versioned display payload, WatchConnectivity session, and complication projection compiled into both apps. |
 | `WatchApp` | Native watchOS SwiftUI dashboard and Compare pages, `WatchTheme` glass surfaces, resources, and entitlements. |
 | `WatchComplications` | WidgetKit measurement and stress complications, metric intent, resources, and App Group entitlement. |
+| `Sources/MacSync` | Mac mirror wire format, batch codec, pairing exchange, TLS-PSK transport, both session halves (compiled into the iPhone app and the Mac app), and the iPhone's publisher and pairing client. |
+| `MacApp` | macOS mirror app: Mac `AppModel`, sync listener and pairing window (`MacMirrorService`), Now/Devices/Sync screens, the Mac `ReadingsShareSheet`, resources, entitlements. |
 | `Sources/Health` | HealthKit authorization, anchored queries, unit/source conversion, background delivery, and measured-value write-back. |
 | `Sources/Oura` | OAuth, Keychain-backed credentials, API transport/DTOs, endpoint status, token-free cache, sync orchestration, and scalar mapping. |
 | `Sources/Analysis` | Comparison/windowing/statistics, HRV, estimators, and pairwise export. These are mostly pure or value-oriented. |
@@ -74,25 +76,26 @@ HeartSyncApp
 | `HeartSyncChecker` | iOS application | All of `Sources`, `Shared`, and the non-plist contents of `Resources` | Bundle ID `com.heartsync.HeartSyncChecker`; product/executable `HeartSync`; Swift module `HeartSyncChecker` |
 | `HeartSyncWatch` | watchOS application | `WatchApp/Sources`, `Shared`, selected model files, `ChartLookup` | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp`; product/module `HeartSyncWatch`; display name HeartSync |
 | `HeartSyncWatchComplications` | watchOS app extension | `WatchComplications/Sources`, selected shared/model files | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp.complications`; embedded in watch app |
+| `HeartSyncMac` | macOS 15 application | `MacApp/Sources`, `Sources/Model`, `Store`, `Analysis`, `MacSync` (less the phone-only files), `Bluetooth` (less `BluetoothManager`/`PeripheralState`), `Views` (less the transport and settings screens and `Oura/`), `DebugChartGallery` | Bundle ID `com.heartsync.HeartSyncChecker.mac`; product `HeartSync`; module `HeartSyncMac`; sandboxed |
 | `HeartSyncCheckerTests` | Hosted iOS unit-test bundle | All of `Tests` | Imports `@testable import HeartSyncChecker`; explicit host is `HeartSync.app/HeartSync` |
 | `HeartSyncCheckerUITests` | iOS UI-test bundle | All of `UITests` | Drives deterministic Debug-only launch scenarios; targets `HeartSyncChecker` |
 | `HeartSyncCheckerPerformanceTests` | Hosted iOS unit-test bundle | All of `PerformanceTests` | Manual physical-device release workload; explicit host is `HeartSync.app/HeartSync` |
 
-The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI, which is `.github/workflows/ios.yml` (unit, UI on an iPhone simulator, and the watch build on the iOS 18 and newest runtimes, warnings as errors; iPad is not run in CI because the owner uses only iPhone and Apple Watch). Debug and Release configurations are generated.
+The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncMac` builds/runs the Mac mirror; CI builds it with warnings as errors. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI, which is `.github/workflows/ios.yml` (unit, UI on an iPhone simulator, and the watch build on the iOS 18 and newest runtimes, warnings as errors; iPad is not run in CI because the owner uses only iPhone and Apple Watch). Debug and Release configurations are generated.
 
 The target/product/module naming difference is intentional and fragile: the target, scheme, and module are `HeartSyncChecker`, but the installed bundle and executable are `HeartSync`. Preserve `PRODUCT_NAME`, `PRODUCT_MODULE_NAME`, `TEST_HOST`, and `BUNDLE_LOADER` together.
 
 There are no:
 
-- macOS, visionOS, tvOS, or Mac Catalyst targets;
+- visionOS, tvOS, or Mac Catalyst targets (the macOS target is native SwiftUI, not Catalyst);
 - iOS widget extensions, notification extensions, or reusable framework targets;
 - `Package.swift`, `Package.resolved`, SwiftPM package dependencies, CocoaPods, or Carthage dependencies.
 
-The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, CryptoKit, Accessibility (Audio Graph descriptors), WatchConnectivity, WatchKit, WidgetKit, AppIntents, SQLite3, and FoundationModels (the Now brief only; iOS 26+, weak-linked, behind `#if canImport(FoundationModels)` so an SDK without it builds). Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
+The app uses only Apple system frameworks and libraries: SwiftUI, Observation, Charts, Combine, Foundation, OSLog, CoreBluetooth, HealthKit, AuthenticationServices, Security, UIKit, AppKit (the Mac app and colour resolution), Network (Mac sync), CryptoKit, Accessibility (Audio Graph descriptors), WatchConnectivity, WatchKit, WidgetKit, AppIntents, SQLite3, and FoundationModels (the Now brief only; iOS 26+, weak-linked, behind `#if canImport(FoundationModels)` so an SDK without it builds). Tests use Foundation, Swift Testing, and XCTest/XCUIAutomation for the UI bundle.
 
 ## Shared Versus Platform-Specific Code
 
-Every file under `Sources` is compiled into the iOS app module. `Shared` plus `MetricKind`, `DiscrepancySeverity`, `Provenance`, and the Foundation-only `Sources/Views/ChartLookup.swift` are also compiled directly into the watchOS app. There is no separate shared framework or package. The watch does not compile the iPhone store, transports, or views.
+Every file under `Sources` is compiled into the iOS app module. The Mac app compiles the subset listed in its target row; views it shares stay free of iOS-only API through `heartSyncInlineTitle()`, `heartSyncTabTitle()`, `ToolbarItemPlacement.heartSyncTrailing`, and `#if os(iOS)` around size classes. `Shared` plus `MetricKind`, `DiscrepancySeverity`, `Provenance`, and the Foundation-only `Sources/Views/ChartLookup.swift` are also compiled directly into the watchOS app. There is no separate shared framework or package. The watch does not compile the iPhone store, transports, or views.
 
 The complication extension compiles only its own sources, the watch snapshot/projection/cache,
 and the selected metric/provenance models. It does not compile `CompanionSession` and does not access HealthKit. App Group sharing is local to the watch, not a phone sync path.
@@ -308,6 +311,36 @@ The watch app's dashboard requires a snapshot from the paired iPhone and always 
 - `--watch-demo` in Debug displays synthetic dashboard data without activating connectivity.
   See `WatchApp/README.md` for build and hardware checks.
 
+## Mac Mirror
+
+`HeartSyncMac` keeps a read-only copy of the iPhone's history and draws it with the shared
+screens. `MacApp/README.md` describes the protocol; the rules:
+
+- The iPhone is the authority. The Mac applies what it is sent through
+  `HealthStore.applyMirrorBatch` (one transaction per batch, with its cursor) and never
+  validates, compacts, prunes, edits, or sends history back. Nothing on the Mac may write to the
+  phone; the only Mac-to-phone messages are state, acknowledgements, and goodbye.
+- Pairing is an X25519 exchange authenticated by a six-digit code compared on both screens,
+  with the phone committing to its key first (`MacMirrorPairing`). Each side confirms only
+  after its person does. Keep the commitment, the length-prefixed transcript, and the HMAC
+  confirmations; do not shorten the code or skip a confirmation.
+- Sync connections are TLS 1.2 with the pairing's pre-shared key. Never add a plain-TCP sync
+  path or accept a hello whose pairing identity differs from the stored one.
+- The change log exists only while a Mac is paired (`HealthStore.setMirrorChangeLogging`). Bulk
+  deletes (reset, legacy migration) suspend the triggers and raise the floor past every old
+  cursor (`withChangeLogSuspended`), which forces a snapshot. Any new bulk path that bypasses
+  the triggers must do the same, or a Mac keeps rows the phone deleted.
+- A snapshot resumes the log from the position read before its first page; its closing batch
+  deletes every row it did not name. Keep that order, or rows written during a snapshot are lost.
+- The phone syncs only in the foreground, browsing only when a Mac is paired, so the Local
+  Network prompt appears only once someone pairs. A Mac mirrors one iPhone; pairing another
+  or unpairing deletes the copy.
+- The Mac's screens never claim a value is live: there are no Live chips, and the sidebar
+  footer and Now subtitle say when the mirror last heard from the phone.
+- `MacMirrorProtocol.version` must change with any incompatible message or batch change; both
+  apps ship together and the Mac names a mismatch.
+- Not mirrored: the Oura dashboard cache, live Bluetooth state, settings, saved sessions.
+
 ## Oura Networking and OAuth
 
 Oura is the repository's only Internet API.
@@ -348,7 +381,7 @@ Permission handling is deliberately server-authoritative:
 - Reading and source mutations commit transactionally and incrementally. The database indexes stable ID, metric/time, source/time, and end time. Settings persistence remains one-second coalesced. Startup refuses to attach transports until the database and any pending legacy migration are conclusive; an unavailable protected file is retried rather than treated as empty.
 - Default reading retention is 30 days and can be configured by the existing settings model. A store that persists never prunes aged history until `confirmRetention(days:)` has run: the 30 days it starts with is a default, and so is what a failed, reset, or newer-schema settings file reports. `AppModel.applyRetentionSettings` confirms only from settings that loaded intact (or after the user chose a period in this session), and the last confirmed period is recorded in the database's `metadata` table, so a settings file lost and recreated with the default cannot shorten it: pruning is held (`retentionIsPaused`, a startup notice, and a Settings button) until the user chooses a period. Impossible-clock rows (`start > end`) are removed once at load. Before pruning, readings at least 14 days old are irreversibly compacted to one median per source/comparison window. New compacted rows preserve original count and standard deviation; migrated legacy medians represent unavailable facts as unknown. A compacted window is final: late rows and cloud revisions for it are rejected because the discarded distribution cannot be recombined without median-of-medians bias.
 
-`HealthDatabase` stores `health.sqlite3` plus its WAL/SHM companions under Application Support in the `HeartSync` directory. `PRAGMA user_version` is a migration ladder (`HealthDatabase.schemaVersion`, now 3; additive steps only, never lowered). Schema 3 added `value` and `has_metadata`, so a row without metadata is rebuilt from its columns instead of decoding JSON; older rows are decoded from the payload until maintenance backfills them in bounded batches. The payload stays authoritative. The connection keeps `synchronous = FULL` because HealthKit's anchor and Oura's cache advance on a returned commit. A store without persistence uses a private file in the temporary directory, not `:memory:`, so the reader pool can open it. A durable metadata marker makes the version-1 JSON migration retry across process termination. `ReadingArchive` continues to serialize the small ISO-8601 JSON archives atomically and supplies the legacy migration inputs:
+`HealthDatabase` stores `health.sqlite3` plus its WAL/SHM companions under Application Support in the `HeartSync` directory. `PRAGMA user_version` is a migration ladder (`HealthDatabase.schemaVersion`, now 4; additive steps only, never lowered). Schema 3 added `value` and `has_metadata`, so a row without metadata is rebuilt from its columns instead of decoding JSON; older rows are decoded from the payload until maintenance backfills them in bounded batches. Schema 4 added the Mac mirror's `change_log` table; its triggers exist only while a Mac is paired (see Mac Mirror). The payload stays authoritative. The connection keeps `synchronous = FULL` because HealthKit's anchor and Oura's cache advance on a returned commit. A store without persistence uses a private file in the temporary directory, not `:memory:`, so the reader pool can open it. A durable metadata marker makes the version-1 JSON migration retry across process termination. `ReadingArchive` continues to serialize the small ISO-8601 JSON archives atomically and supplies the legacy migration inputs:
 
 - `readings.json`
 - `sources.json`
@@ -415,7 +448,7 @@ Preserve measurement semantics:
 The application is SwiftUI-first and targets iOS 18:
 
 - Use Observation environment state, the iOS 18 `Tab` API, `NavigationStack`, `List`/`Form`, sheets, toolbars, `refreshable`, and Swift Charts consistently with nearby screens.
-- Liquid Glass: the theme owns every glass call. `HeartSyncCardBackground` (behind `metricCard()` and `ouraCard()`), `heartSyncGlassCapsule(tint:)`, `GlassChipRow`, `heartSyncButtonStyle(prominent:)`, `heartSyncChrome()`, and `heartSyncScreenBackground()` use glass on iOS 26+ behind `#if compiler(>=6.2)` (CI's macos-15 runner builds with Xcode 16) and `#available`, and fall back to the earlier material styling with the same geometry. Do not call `glassEffect` or the glass button styles directly from a screen. Tab roots use `.toolbarTitleDisplayMode(.inlineLarge)` so the title shares the toolbar row; that title owns the leading edge, so toolbar items on those screens go trailing (a `topBarLeading` item is not shown). The tab bar does not minimize on scroll: a minimized bar hides the other tabs, which UI tests and users reach for directly. Never tint glass with a colour that would change a semantic meaning (severity, source).
+- Liquid Glass: the theme owns every glass call. `HeartSyncCardBackground` (behind `metricCard()` and `ouraCard()`), `heartSyncGlassCapsule(tint:)`, `GlassChipRow`, `heartSyncButtonStyle(prominent:)`, `heartSyncChrome()`, and `heartSyncScreenBackground()` use glass on iOS 26+ behind `#if compiler(>=6.2)` (CI's macos-15 runner builds with Xcode 16) and `#available`, and fall back to the earlier material styling with the same geometry. Do not call `glassEffect` or the glass button styles directly from a screen. Tab roots use `heartSyncTabTitle()` (`.toolbarTitleDisplayMode(.inlineLarge)` on iOS) so the title shares the toolbar row; that title owns the leading edge, so toolbar items on those screens go trailing (a `topBarLeading` item is not shown). The tab bar does not minimize on scroll: a minimized bar hides the other tabs, which UI tests and users reach for directly. Never tint glass with a colour that would change a semantic meaning (severity, source).
 - Prefer existing semantic components in `Sources/Views/Components.swift` (including `FlowLayout` for wrapping chips) and the existing Oura card helpers before introducing another visual vocabulary. Content cards share one surface, `HeartSyncCardBackground`.
 - Chart heights, inks, band opacity, and `axisFormat(span:)` come from `HeartSyncTheme.Chart`. Size every history chart with `heartSyncChartHeight(_:)`, which grows with Dynamic Type and the available width, never a fixed `.frame(height:)`.
 - A chart whose automatic Audio Graph would name series by source ID gets an `AXChartDescriptorRepresentable` (`ChartAudioGraph.swift`) that names devices.
@@ -452,13 +485,13 @@ There are no storyboards or XIBs. Do not introduce UIKit architecture for an iso
 
 ## Platform Constraints and Capabilities
 
-- Minimum deployment targets: iOS 18.0 and watchOS 11.0.
+- Minimum deployment targets: iOS 18.0, watchOS 11.0, and macOS 15.0 (the Mac mirror).
 - Supported device families: iPhone and iPad.
 - Mac Catalyst is disabled. “Designed for iPhone/iPad” execution on Apple silicon is not a supported native macOS target and does not validate device integrations.
 - iPhone supports portrait and both landscape orientations. iPad declares all four orientations.
 - Real Bluetooth and meaningful HealthKit behavior require a physical iPhone; simulator builds only validate compilation, pure logic, mocked networking, and fixture-driven UI.
 - The app declares base HealthKit and HealthKit background-delivery entitlements; the HealthKit access array is empty. The background-delivery capability and provisioning remain unverified on a signed physical-device build.
-- The shipped plist contains Bluetooth and Health privacy descriptions, the Oura custom URL scheme, and `bluetooth-central` background mode.
+- The shipped plist contains Bluetooth, Health, and Local Network privacy descriptions, `NSBonjourServices` (`_heartsync._tcp`, `_heartsync-pair._tcp`), the Oura custom URL scheme, and `bluetooth-central` background mode. The Mac plist has the same Local Network keys; the Mac entitlements are App Sandbox, network server and client, and user-selected read-write files.
 - The watch app and its WidgetKit extension share one App Group for complications. There are no iPhone App Groups, Keychain sharing groups, iCloud/CloudKit containers, local/push notification code, notification extensions, or BGTaskScheduler registrations. The watch uses WatchConnectivity; it has no HealthKit, workout-processing, or route/location capability.
 
 Any new capability must be explicitly requested and must update `project.yml`, generated resource files, signing/provisioning, documentation, and validation. Do not infer that a capability exists because a system framework is imported.
@@ -670,6 +703,13 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
 - `Tests/HistoryReaderTests.swift`: covers off-main snapshots, reader visibility of commits, column and payload decoding, SQL source filters, failures and not-loaded history, temporary files, and the schema-3 migration and backfill.
 - `Tests/ResetAndIngestTests.swift`: covers reset order and exclusivity, batched Bluetooth ingest, batched existence checks, changed-source persistence, and launch-time transport setup.
 - `Tests/PeripheralStateTests.swift`: covers `PeripheralLink`, `RingLink`, and `PeripheralRecord`.
+- `Tests/MacMirrorTests.swift`: covers the change log (off until paired, writes named in
+  order, ignored duplicates, upserts, a reset raising the floor past old cursors, trimming and
+  the cap, a new epoch), the batch format (exact round trip, refusing corrupt, truncated, and
+  unknown content, frame headers), pairing (agreement, the commitment, fresh keys, both
+  confirmations, a decline on either side), and both session halves: a snapshot then changes,
+  a reset and a new epoch forcing a snapshot that sweeps, a wrong pairing refused, and a real
+  TLS-PSK session on the loopback interface with a wrong key refused.
 - `Tests/ColourVisionTests.swift`: tests that pin the Machado/CAM02-UCS validator to
   published values and enforce ΔE ≥ 15 in ordinary vision between all source slots, and
   under protan, deutan, and tritan simulation between the first six slots, against the
@@ -707,7 +747,7 @@ export, presentation-projection and watch-lifecycle suites. Adding `BluetoothMan
 `HealthKitManager` (and its `+Session`/`+WriteBack` files), `OuraManager`, `OuraData`, `AppModel`,
 `WatchCompanionPublisher`, `WatchSnapshotBuilder`, `BackgroundWork`, `BluetoothIngestBuffer`,
 `PeripheralState`, `HealthHistory`, `DerivedEstimates`, `HealthKitManager+Background`,
-and `Sources/Debug` lets the
+`Sources/MacSync` (all of it; Network exists on macOS), and `Sources/Debug` lets the
 `AppModel`, Oura orchestration, and HealthKit conversion suites run too, with two harness-only
 stand-ins: a `CompanionSession` stub (WatchConnectivity does not exist on macOS) and a copy of
 `Sources/Oura/OuraOAuth.swift` with its UIKit window lookup replaced. It cannot compile the SwiftUI
@@ -809,6 +849,7 @@ When a comment and implementation disagree, document the discrepancy and test ac
 - Do not claim proprietary/vendor BLE support beyond the topology-gated YCBT candidate, and do not describe that candidate as verified until a device run in `RELEASE_CHECKLIST.md` records it. Never select a vendor path from a device name, and never write to a characteristic before its session's gating says so.
 - Keep Apple Watch data on the HealthKit import. Do not send measurements into the iPhone store over WatchConnectivity or treat the wrist display snapshot as new measurements.
 - Do not claim App Groups, CloudKit, Keychain sharing, widgets, notifications, or background tasks that are not configured.
+- Do not describe Mac sync as verified between devices until a physical iPhone and Mac run passes `MacApp/README.md`'s checklist, and do not let the Mac write to the phone's history.
 - Do not use a simulator build as proof that BLE, HealthKit, background delivery, signing, OAuth presentation, or TCC/privacy behavior works.
 - Do not add broad abstractions, dependencies, style rewrites, or unrelated refactors for a narrowly scoped task.
 - Do not change signing, bundle identifiers, callback URLs, capability settings, medical/evidence language, or retention behavior as incidental cleanup.
