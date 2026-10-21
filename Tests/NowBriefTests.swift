@@ -52,7 +52,6 @@ struct NowBriefTests {
         ])
         #expect(facts.items.map(\.isEstimate) == [false, true, true, false])
         #expect(facts.items.map(\.isCurrent) == [true, true, false, false])
-        #expect(facts.items[1].numbers == ["42", "100"])
         #expect(facts.prompt.hasPrefix("Readings:\n- Heart rate is 72 bpm now"))
     }
 
@@ -75,15 +74,13 @@ struct NowBriefTests {
     @Test("Drafts the on-device model wrote for these facts are accepted")
     func acceptsGrounded() throws {
         let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
-        let drafts = [
-            "Your heart rate is 72 bpm right now. Estimated stress level is 42 out of 100 (normal) now, computed by HeartSync. Estimated blood pressure was 118/76 mmHg 2 hours ago, and blood oxygen was 96% 3 hours ago.",
-            "Your heart rate is 72 bpm right now, with 2 devices agreeing. Estimated blood pressure was 118/76 mmHg 2 hours ago, and blood oxygen was 96% 3 hours ago.",
-            "Heart rate is 72 bpm now. Estimated stress level is 42 out of 100 now, and SpO2 was 96 % when last reported, three hours ago.",
-        ]
-        for draft in drafts {
-            #expect(NowBriefCheck.accepted(draft, facts: facts) == draft)
+        for selection in ["0", "0,1,2", "1,3"] {
+            let rendered = try #require(NowBriefGenerator.render(selection: selection, facts: facts))
+            #expect(NowBriefCheck.accepted(rendered, facts: facts) == rendered)
         }
-        #expect(NowBriefCheck.numbers(in: "36,50 and 118/76, then 7.") == ["36.5", "118", "76", "7"])
+        for selection in ["0,0", "2,1", "-1", "99", "0,", "0, and healthy"] {
+            #expect(NowBriefGenerator.render(selection: selection, facts: facts) == nil)
+        }
     }
 
     @Test("A number is only accepted about the reading it belongs to")
@@ -104,14 +101,14 @@ struct NowBriefTests {
         let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
         #expect(NowBriefCheck.accepted("Your heart rate is an estimated 72 bpm.", facts: facts) == nil)
         #expect(NowBriefCheck.accepted("Blood pressure was 118/76 mmHg 2 hours ago.", facts: facts) == nil)
-        #expect(NowBriefCheck.accepted("Estimated blood pressure was 118/76 mmHg 2 hours ago.", facts: facts) != nil)
+        #expect(NowBriefCheck.accepted(facts.items[2].sentence, facts: facts) != nil)
     }
 
     @Test("A reading that is not live keeps its age")
     func ageIsKept() throws {
         let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
         #expect(NowBriefCheck.accepted("Blood oxygen is 96%.", facts: facts) == nil)
-        #expect(NowBriefCheck.accepted("Blood oxygen was 96% 3 hours ago.", facts: facts) != nil)
+        #expect(NowBriefCheck.accepted(facts.items[3].sentence, facts: facts) != nil)
     }
 
     @Test("Judgement, diagnosis, and readings the facts lack reject the paragraph")
@@ -120,7 +117,7 @@ struct NowBriefTests {
         #expect(NowBriefCheck.accepted("Your heart rate is a healthy 72 bpm.", facts: facts) == nil)
         #expect(NowBriefCheck.accepted("Your heart rate is 72 bpm, which is normal.", facts: facts) == nil)
         // The stress band's own word belongs to the stress reading only.
-        #expect(NowBriefCheck.accepted("Estimated stress level is 42 out of 100 (normal).", facts: facts) != nil)
+        #expect(NowBriefCheck.accepted(facts.items[1].sentence, facts: facts) != nil)
         #expect(NowBriefCheck.accepted("Estimated blood pressure of 118/76 mmHg 2 hours ago rules out hypertension.", facts: facts) == nil)
         #expect(NowBriefCheck.accepted("Consider seeing a doctor about your heart rate of 72 bpm.", facts: facts) == nil)
         // Temperature is not among these facts.
@@ -134,9 +131,10 @@ struct NowBriefTests {
         var cards = metrics
         cards.append(card(.hrvSDNN, [row(watch, 48, age: 5_400)], headline: 48))
         let facts = try #require(NowBriefFacts.build(metrics: cards, stressBand: .normal, now: now))
-        let split = NowBriefCheck.parts(of: "Heart rate is 72 bpm, and heart rate variability was 48 ms 2 hours ago.", facts: facts)
-        #expect(split.parts.map(\.kind) == [.heartRate, .hrvSDNN])
-        #expect(!split.unknownReadings)
+        let index = try #require(facts.items.firstIndex(where: { $0.kind == .hrvSDNN }))
+        let rendered = try #require(NowBriefGenerator.render(selection: "0,\(index)", facts: facts))
+        #expect(rendered.contains("HRV (SDNN)"))
+        #expect(rendered.contains("Heart rate is 72 bpm"))
     }
 
     @Test("Ages read in whole minutes, hours, or days")
@@ -154,4 +152,35 @@ struct NowBriefTests {
             #expect(await NowBriefGenerator.generate(facts) == nil)
         }
     }
+    @Test("Units, roles, missing values, pressure order and ages cannot be rewritten")
+    func bindsEveryField() throws {
+        let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
+        for draft in [
+            "Heart rate is 2 bpm now.", "Heart rate is 72 mmHg now.",
+            "Heart rate is bpm now; 2 devices agree.",
+            "Estimated blood pressure was 76/118 mmHg when last reported, 2 hours ago.",
+            "Estimated blood pressure was 118/76 mmHg when last reported, 76 hours ago."
+        ] { #expect(NowBriefCheck.accepted(draft, facts: facts) == nil) }
+    }
+
+    @Test("Display permission expires independently from generation throttling")
+    func invalidatesChangedFacts() throws {
+        let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
+        let brief = NowBriefDisplay(text: facts.lines.joined(separator: " "), facts: facts, generatedAt: now)
+        #expect(brief.isValid(for: facts, now: now, available: true))
+        #expect(!brief.isValid(for: facts, now: now.addingTimeInterval(181), available: true))
+        #expect(!brief.isValid(for: nil, now: now, available: true))
+        #expect(!brief.isValid(for: facts, now: now, available: false))
+        var changed = metrics
+        changed[1].comparison?.sourceCount = 3
+        let differentCount = NowBriefFacts.build(metrics: changed, stressBand: .normal, now: now)
+        #expect(differentCount?.key != facts.key)
+        #expect(!brief.isValid(for: differentCount, now: now, available: true))
+        changed = metrics
+        changed[2].rows[0].provenance = .measured
+        let measured = NowBriefFacts.build(metrics: changed, stressBand: .normal, now: now)
+        #expect(measured?.key != facts.key)
+        #expect(!brief.isValid(for: measured, now: now, available: true))
+    }
+
 }

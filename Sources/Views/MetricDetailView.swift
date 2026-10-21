@@ -303,7 +303,11 @@ struct MetricDetailView: View {
                 } footer: {
                     if !snapshot.points.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {
+                            #if os(macOS)
+                            Text("Click or drag across the chart to read each device's window median. Click empty chart area, or Clear selection, to remove it. Click a device below the chart to emphasise it; nothing is hidden. Use the chart's accessibility actions to step through windows.")
+                            #else
                             Text("Drag across the chart to read each device's window median. The selection stays when you lift your finger; touch empty chart area, or Clear selection, to remove it. Tap a device below the chart to emphasise it; nothing is hidden.")
+                            #endif
                             if !chart.bandPoints.isEmpty {
                                 Text("The shaded band spans the highest and lowest device reading in each \(WindowLabel.length(chart.bucketSize)) window, coloured by that window's agreement. A wide band means your devices disagree at that moment. Lines and band break where a device, or a second device to compare with, did not report.")
                             }

@@ -23,6 +23,13 @@ struct DevicesView: View {
     var body: some View {
         NavigationStack {
             List {
+                if let issue = model.store.sourceMetadataIssue {
+                    Section {
+                        Label("Device status could not be saved", systemImage: "exclamationmark.triangle")
+                        Text(issue).font(.caption)
+                        Text("The last saved status is shown. The next device update will retry.").font(.caption)
+                    }
+                }
                 if model.store.sources.isEmpty {
                     Section {
                         EmptyStateView(
@@ -543,6 +550,10 @@ struct DevicesView: View {
                         statusText: healthSourceStatus(source),
                         statusColor: .secondary
                     )
+                    .contextMenu { Button("Name and relationship…") { renamingSource = source } }
+                    .swipeActions(edge: .leading) {
+                        Button("Name and relationship…") { renamingSource = source }
+                    }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button(role: .destructive) { proposeRemoval(source) } label: {
                             Label("Remove", systemImage: "trash")
@@ -627,6 +638,7 @@ struct DevicesView: View {
                         statusText: model.oura.lastSyncSummary ?? "Connected",
                         statusColor: .green
                     )
+                    Button("Name and relationship…") { renamingSource = source }
                 } else {
                     Label("Connected", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
@@ -716,6 +728,8 @@ private struct RemovalProposal: Identifiable {
 
 /// One configured source in the list.
 private struct SourceRow: View {
+    @Environment(AppModel.self) private var model
+    private var sourceName: String { SourceLabels.name(for: source.id, in: model.store.sources) }
     var source: DataSource
     var statusText: String
     var statusColor: Color
@@ -728,7 +742,7 @@ private struct SourceRow: View {
             HStack(spacing: 10) {
                 SourceDot(color: source.color, size: 11)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(source.displayName)
+                    Text(sourceName)
                         .font(.subheadline.weight(.medium))
                     HStack(spacing: 6) {
                         Circle()
@@ -797,7 +811,7 @@ private struct SourceRow: View {
     /// words and spells out each metric chip with its full `MetricKind.title` rather than
     /// the abbreviation the chip shows.
     private var accessibilityDescription: String {
-        var parts: [String] = [source.displayName, statusText]
+        var parts: [String] = [sourceName, statusText]
         if let battery { parts.append(BatteryBadge.spoken(percent: battery, isCharging: batteryIsCharging)) }
         if let location = source.bodyLocation {
             parts.append("Reported placement \(location.title.lowercased())")
@@ -819,6 +833,8 @@ private struct RenameSourceView: View {
     @Environment(\.dismiss) private var dismiss
     var source: DataSource
     @State private var name: String = ""
+    @State private var relatedID = ""
+    @State private var originalRelatedID = ""
     @State private var failure: String?
 
     var body: some View {
@@ -837,8 +853,18 @@ private struct RenameSourceView: View {
                         }
                     }
                 }
+                Section {
+                    Picker("Same physical device as", selection: $relatedID) {
+                        Text("Independent device").tag("")
+                        ForEach(model.store.sources.filter { $0.id != source.id }) { other in
+                            Text(SourceLabels.name(for: other.id, in: model.store.sources)).tag(other.id)
+                        }
+                    }
+                } footer: {
+                    Text("Your confirmation changes duplicate-device warnings. It never merges readings or makes either source a reference standard.")
+                }
             }
-            .navigationTitle("Rename")
+            .navigationTitle("Name and relationship")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -853,11 +879,21 @@ private struct RenameSourceView: View {
                                 return
                             }
                         }
+                        if relatedID != originalRelatedID {
+                            if case .failed(let detail) = model.store.setRelationship(sourceID: source.id, sameDeviceAs: relatedID.isEmpty ? nil : relatedID) {
+                                failure = detail
+                                return
+                            }
+                        }
                         dismiss()
                     }
                 }
             }
-            .onAppear { name = source.displayName }
+            .onAppear {
+                name = source.displayName
+                relatedID = model.store.sources.first(where: { source.likelyRepresentsSameDevice(as: $0) })?.id ?? ""
+                originalRelatedID = relatedID
+            }
         }
     }
 }

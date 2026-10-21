@@ -17,6 +17,7 @@ struct ComparisonSessionTests {
             context: "walk",
             interval: DateInterval(start: anchor, end: anchor.addingTimeInterval(1_800)),
             sourceIDs: sourceIDs,
+            createdAt: anchor,
             lastViewedReadingCount: lastViewedReadingCount
         )
     }
@@ -169,4 +170,38 @@ struct ComparisonSessionTests {
         #expect(store.loadState == .notLoaded)
         #expect(await store.save(session()) == false)
     }
+    @MainActor
+    @Test("Failed edits leave memory equal to durable state, and retries retain identity")
+    func failedEditsAreNotPublished() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = ReadingArchive(directory: directory)
+        let store = ComparisonSessionStore(archive: archive)
+        await store.loadIfNeeded()
+        let draft = session()
+        await archive.injectFailureOnNextWriteForTesting()
+        #expect(await store.save(draft) == false)
+        #expect(store.sessions.isEmpty)
+        #expect(await store.save(draft))
+        #expect(store.sessions.count == 1)
+        let committed = store.sessions
+        await archive.injectFailureOnNextWriteForTesting()
+        #expect(await store.noteViewed(id: draft.id, readingCount: 99) == false)
+        #expect(store.sessions == committed)
+        await archive.injectFailureOnNextWriteForTesting()
+        #expect(await store.remove(id: draft.id) == false)
+        #expect(store.sessions == committed)
+        let reloaded = ComparisonSessionStore(archive: archive)
+        await reloaded.loadIfNeeded()
+        #expect(reloaded.sessions == committed)
+        async let note = store.noteViewed(id: draft.id, readingCount: 3, at: anchor.addingTimeInterval(60))
+        async let save = store.save(session())
+        #expect(await note)
+        #expect(await save)
+        #expect(store.sessions.count == 2)
+        let final = ComparisonSessionStore(archive: archive)
+        await final.loadIfNeeded()
+        #expect(final.sessions == store.sessions)
+    }
+
 }

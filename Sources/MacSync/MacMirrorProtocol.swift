@@ -143,6 +143,7 @@ enum MacMirrorError: Error, Equatable, LocalizedError {
     case peerEnded(MacMirrorGoodbye.Reason)
     case connectionFailed(String)
     case closed
+    case timedOut
     case pairing(String)
 
     var errorDescription: String? {
@@ -159,6 +160,8 @@ enum MacMirrorError: Error, Equatable, LocalizedError {
             String(localized: "macMirror.error.closing", defaultValue: "The other device closed the connection.", comment: "Mac sync error: the other side closed on purpose")
         case .connectionFailed(let detail):
             String(localized: "macMirror.error.connection", defaultValue: "Could not connect (\(detail)).", comment: "Mac sync error: network failure; the detail is technical")
+        case .timedOut:
+            String(localized: "The other device did not respond in time. Keep HeartSync open on both devices and try again.")
         case .closed:
             String(localized: "macMirror.error.closed", defaultValue: "The connection closed.", comment: "Mac sync error: the connection ended")
         case .pairing(let detail):

@@ -659,8 +659,8 @@ private struct BPCalibrationView: View {
                 let history = model.store.history
                 let inputs = await HealthHistory.offMain {
                     (
-                        DerivedEstimates.currentHeartRate(history: history, now: .now),
-                        DerivedEstimates.currentRMSSD(history: history, now: .now)
+                        try? DerivedEstimates.currentHeartRate(history: history, now: .now),
+                        try? DerivedEstimates.currentRMSSD(history: history, now: .now)
                     )
                 }
                 guard !Task.isCancelled else { return }

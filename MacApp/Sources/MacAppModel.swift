@@ -31,6 +31,7 @@ final class AppModel {
 
     private(set) var startupState: StartupState = .loading
     private var hasStarted = false
+    private let runServices: Bool
 
     /// The source the phone files HeartSync's own blood-pressure and stress estimates under
     /// (the iPhone `AppModel.estimateSourceID`), so the shared cards can label them.
@@ -46,13 +47,19 @@ final class AppModel {
     init(
         store: HealthStore? = nil,
         settings: AppSettings? = nil,
-        sessions: ComparisonSessionStore? = nil
+        sessions: ComparisonSessionStore? = nil,
+        mirror: MacMirrorService? = nil,
+        runServices: Bool = true
     ) {
-        let persist = !Self.mirrorDemoEnabled
+        let arguments = ProcessInfo.processInfo.arguments
+        let testing = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        let fixture = arguments.contains("--mirror-empty") || arguments.contains("--mirror-unavailable")
+        self.runServices = runServices && !testing && !fixture
+        let persist = !Self.mirrorDemoEnabled && !testing && !fixture
         self.store = store ?? HealthStore(persistenceEnabled: persist)
         self.settings = settings ?? AppSettings(persistenceEnabled: persist)
         self.sessions = sessions ?? ComparisonSessionStore(persistenceEnabled: persist)
-        mirror = MacMirrorService(macName: MacMirrorDeviceIdentity.deviceName)
+        self.mirror = mirror ?? MacMirrorService(macName: MacMirrorDeviceIdentity.deviceName)
     }
 
     func start() async {
@@ -60,6 +67,14 @@ final class AppModel {
         hasStarted = true
         startupState = .loading
         #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--mirror-unavailable") {
+            startupState = .temporarilyUnavailable("Synthetic unavailable storage for UI testing.")
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("--mirror-empty") {
+            startupState = .ready
+            return
+        }
         if Self.mirrorDemoEnabled {
             // A month of in-memory readings, as if mirrored, for judging the Mac's screens.
             // Nothing is saved and nothing listens on the network.
@@ -79,7 +94,7 @@ final class AppModel {
             )
             return
         }
-        mirror.start(store: store)
+        if runServices { await mirror.start(store: store) }
         startupState = .ready
     }
 }

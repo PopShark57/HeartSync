@@ -15,6 +15,7 @@ struct CompareView: View {
     @State private var showingSessions = false
     @State private var savingSession = false
     @State private var revisitNotice: String?
+    @State private var visitWriteFailed = false
     /// The metric shown in the detail column of the regular-width split view.
     @State private var selectedMetric: MetricKind?
     #if os(iOS)
@@ -184,6 +185,11 @@ struct CompareView: View {
             }
             ToolbarItem(placement: .heartSyncTrailing) { sourceSelectionMenu }
         }
+        .alert("Could not record this visit", isPresented: $visitWriteFailed) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("The saved session is unchanged. Reopen it to retry recording which readings you have viewed.")
+        }
         .sheet(isPresented: $showingSessions) {
             ComparisonSessionsView { session in openSession(session) }
         }
@@ -253,6 +259,7 @@ struct CompareView: View {
                             if usesSplitLayout {
                                 // Selects into the split view's detail column.
                                 NavigationLink(value: kind) { row }
+                                    .accessibilityIdentifier("compare.metric.\(kind.rawValue)")
                             } else {
                                 NavigationLink {
                                     // The session, not only the picker value: with a session
@@ -261,6 +268,7 @@ struct CompareView: View {
                                 } label: {
                                     row
                                 }
+                                .accessibilityIdentifier("compare.metric.\(kind.rawValue)")
                             }
                         }
                     }
@@ -302,11 +310,12 @@ struct CompareView: View {
                 currentReadingCount: summary.count,
                 currentFingerprint: summary.fingerprint
             )
-            await model.sessions.noteViewed(
+            let saved = await model.sessions.noteViewed(
                 id: session.id,
                 readingCount: summary.count,
                 fingerprint: summary.fingerprint
             )
+            if !saved { visitWriteFailed = true }
         }
     }
 
@@ -329,7 +338,7 @@ struct CompareView: View {
                     Button {
                         settings.snapshot.setComparisonHidden(!hidden, forSource: source.id)
                     } label: {
-                        Label(source.displayName, systemImage: hidden ? "circle" : "checkmark.circle.fill")
+                        Label(SourceLabels.name(for: source.id, in: model.store.enabledSources), systemImage: hidden ? "circle" : "checkmark.circle.fill")
                     }
                 }
                 if !settings.snapshot.comparisonHidden.isEmpty {
@@ -716,13 +725,13 @@ private struct ReadyPairFindingRow: View {
         let source = model.store.source(id: id)
         return HStack(spacing: 5) {
             SourceDot(color: source?.color ?? .gray, size: 7)
-            Text(source?.displayName ?? id).font(.caption).lineLimit(1)
+            Text(SourceLabels.name(for: id, in: model.store.enabledSources)).font(.caption).lineLimit(1)
         }
     }
 
     private func explanation(_ statistics: PairwiseSummaryStatistics) -> String {
-        let nameA = model.store.displayName(forSource: analysis.sourceA)
-        let nameB = model.store.displayName(forSource: analysis.sourceB)
+        let nameA = SourceLabels.name(for: analysis.sourceA, in: model.store.enabledSources)
+        let nameB = SourceLabels.name(for: analysis.sourceB, in: model.store.enabledSources)
         switch statistics.classification {
         case .noApparentDifference:
             return "This ready pair is within the fixed tolerance for the selected observations."

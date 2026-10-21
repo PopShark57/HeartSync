@@ -37,6 +37,7 @@ struct MacDevicesView: View {
 }
 
 private struct MacDeviceRow: View {
+    @Environment(AppModel.self) private var model
     let source: DataSource
 
     var body: some View {
@@ -44,7 +45,7 @@ private struct MacDeviceRow: View {
             SourceSymbolGlyph(symbol: source.symbol, color: source.color)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(source.displayName)
+                    Text(SourceLabels.name(for: source.id, in: model.store.sources))
                         .font(.body.weight(.semibold))
                     if !source.isEnabled {
                         Text("Paused")

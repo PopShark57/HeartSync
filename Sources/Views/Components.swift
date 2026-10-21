@@ -20,6 +20,8 @@ struct SourceDot: View {
 
 /// One source's reading of one metric, in a row: dot, name, value, freshness.
 struct SourceValueRow: View {
+    @Environment(AppModel.self) private var model
+    private var sourceName: String { SourceLabels.name(for: source.id, in: model.store.enabledSources) }
     var source: DataSource
     var kind: MetricKind
     var value: Double
@@ -40,7 +42,7 @@ struct SourceValueRow: View {
             SourceDot(color: source.color)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(source.displayName)
+                Text(sourceName)
                     .font(.subheadline.weight(.medium))
                     .lineLimit(1)
                 HStack(spacing: 4) {
@@ -78,7 +80,7 @@ struct SourceValueRow: View {
     /// VoiceOver reads the row as one sentence; the visual layout splits the same facts
     /// across three columns, which otherwise arrive as disconnected fragments.
     private var accessibilityDescription: String {
-        var parts: [String] = [source.displayName, kind.formatWithUnit(value)]
+        var parts: [String] = [sourceName, kind.formatWithUnit(value)]
         if provenance != .measured { parts.append(provenance.title) }
         if let timestamp { parts.append(timestamp.formatted(.relative(presentation: .named))) }
         if let delta = deltaFromWindowConsensus, abs(delta) >= 0.05 {

@@ -59,6 +59,21 @@ jobs:
             SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Test Mac orchestration and native UI
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project HeartSyncChecker.xcodeproj \
+            -scheme HeartSyncMac \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/HeartSyncMac-DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/mac.xcresult" \
+            -parallel-testing-enabled NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=
+
       # A warning introduced by a change fails the build; the project is warning-free.
       - name: Build app and test bundles, warnings as errors
         run: |
@@ -103,6 +118,7 @@ jobs:
             -destination "platform=iOS Simulator,id=$HEARTSYNC_SIMULATOR_ID" \
             -derivedDataPath "$RUNNER_TEMP/HeartSyncChecker-DerivedData" \
             -only-testing:HeartSyncCheckerTests \
+            -parallel-testing-enabled NO \
             -resultBundlePath "$RUNNER_TEMP/unit.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 
@@ -116,6 +132,7 @@ jobs:
             -destination "platform=iOS Simulator,id=$HEARTSYNC_SIMULATOR_ID" \
             -derivedDataPath "$RUNNER_TEMP/HeartSyncChecker-DerivedData" \
             -only-testing:HeartSyncCheckerUITests \
+            -parallel-testing-enabled NO \
             -resultBundlePath "$RUNNER_TEMP/ui.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 
@@ -128,6 +145,7 @@ jobs:
         with:
           name: HeartSyncChecker-tests-${{ matrix.runner }}
           path: |
+            ${{ runner.temp }}/mac.xcresult
             ${{ runner.temp }}/unit.xcresult
             ${{ runner.temp }}/ui.xcresult
           if-no-files-found: ignore

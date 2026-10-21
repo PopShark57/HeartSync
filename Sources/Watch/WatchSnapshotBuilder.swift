@@ -46,16 +46,27 @@ enum WatchSnapshotBuilder {
             let snapshot = WatchSnapshot(generatedAt: now, availability: .unavailable, metrics: [])
             return Payload(snapshot: snapshot, data: try? snapshot.encoded())
         }
+        do { return try buildPayload(history: store, now: now, cache: cache) }
+        catch {
+            cache?.removeAll()
+            let snapshot = WatchSnapshot(generatedAt: now, availability: .unavailable, metrics: [])
+            return Payload(snapshot: snapshot, data: try? snapshot.encoded())
+        }
+    }
+
+    private static func buildPayload(history store: HealthHistory, now: Date, cache: WatchChartCache?) throws -> Payload {
         let sources = store.enabledSources
+        let newest = try store.query { try $0.latestReadings(sourceIDs: Set(sources.map(\.id))) }.get()
+        let latestBySource = Dictionary(grouping: newest, by: \.sourceID)
         let enabledIDs = sources.map(\.id).sorted().joined(separator: ",")
-        let metrics = MetricKind.allCases.compactMap { kind -> WatchMetric? in
+        let metrics = try MetricKind.allCases.compactMap { kind throws -> WatchMetric? in
             let latest = sources.compactMap { source -> (source: DataSource, reading: WatchSourceReading)? in
-                guard let reading = store.latest(kind: kind, sourceID: source.id),
+                guard let reading = latestBySource[source.id]?.first(where: { $0.kind == kind }),
                       reading.start <= now.addingTimeInterval(60)
                 else { return nil }
                 return (source, WatchSourceReading(
                     id: watchID(for: source),
-                    sourceName: displayName(source),
+                    sourceName: SourceLabels.boundedName(for: source.id, in: store.enabledSources),
                     value: reading.value,
                     timestamp: reading.start,
                     provenance: reading.provenance,
@@ -75,7 +86,7 @@ enum WatchSnapshotBuilder {
             let shownSources = shown.map(\.source).sorted { $0.id < $1.id }
             // Anything that changes what a cached period would draw or compare.
             let fingerprint = enabledIDs + "|" + shownSources
-                .map { "\($0.id)\u{001F}\($0.displayName)\u{001F}\($0.colorIndex)" }
+                .map { "\($0.id)\u{001F}\(SourceLabels.name(for: $0.id, in: sources))\u{001F}\($0.colorIndex)" }
                 .joined(separator: "\u{001E}")
 
             let ranges = WatchChartRange.available(for: kind)
@@ -92,7 +103,7 @@ enum WatchSnapshotBuilder {
             // One read for every period that needs building: the longest, sliced for the
             // others. The periods all end now, so each shorter one is a suffix of it.
             if let longest = stale.max(by: { $0.duration < $1.duration }) {
-                let all = store.readings(kind: kind, in: interval(for: longest, now: now))
+                let all = try store.readingsOutcome(kind: kind, in: interval(for: longest, now: now)).get()
                 for range in stale {
                     let result = period(
                         kind: kind,
@@ -241,7 +252,7 @@ enum WatchSnapshotBuilder {
             let slot = DataSource.paletteSlots[((source.colorIndex % count) + count) % count]
             return WatchChartSeries(
                 id: watchID(for: source),
-                sourceName: displayName(source),
+                sourceName: SourceLabels.boundedName(for: source.id, in: store.enabledSources),
                 color: WatchColor(red: slot.dark.red, green: slot.dark.green, blue: slot.dark.blue),
                 symbol: symbol.rawValue,
                 isEstimated: estimated,
@@ -286,8 +297,8 @@ enum WatchSnapshotBuilder {
         let plotted = analysis.plotSample(limit: 32, extremes: 4)
             .suffix(WatchChart.maximumDifferencePoints)
         return WatchPairAgreement(
-            sourceA: String(store.displayName(forSource: analysis.sourceA).prefix(100)),
-            sourceB: String(store.displayName(forSource: analysis.sourceB).prefix(100)),
+            sourceA: SourceLabels.boundedName(for: analysis.sourceA, in: store.enabledSources),
+            sourceB: SourceLabels.boundedName(for: analysis.sourceB, in: store.enabledSources),
             pairedWindows: analysis.pairedWindowCount,
             meanBias: statistics.meanBias,
             lowerLimit: statistics.limitsOfAgreement.lowerBound,
@@ -368,11 +379,6 @@ enum WatchSnapshotBuilder {
 
     private static func watchID(for source: DataSource) -> String {
         UUID(stableFrom: source.id).uuidString
-    }
-
-    private static func displayName(_ source: DataSource) -> String {
-        let name = String(source.displayName.prefix(100))
-        return name.isEmpty ? "Unknown device" : name
     }
 
     private static func offset(_ date: Date, from start: Date) -> Int {

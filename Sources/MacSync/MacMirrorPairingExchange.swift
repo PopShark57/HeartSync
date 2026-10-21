@@ -30,14 +30,16 @@ enum MacMirrorPairingExchange {
     static func runPhone(
         channel: any MacMirrorFrameChannel,
         identity: MacMirrorPairing.Identity,
+        handshakeTimeout: Duration = .seconds(30),
+        confirmationTimeout: Duration = .seconds(120),
         confirm: @escaping Confirm
     ) async throws -> MacMirrorPairingRecord {
         let initiator = MacMirrorPairing.Initiator(identity: identity)
         try await channel.send(.json(.pairCommit, initiator.commit))
-        let share = try await expect(.pairKey, MacMirrorPairing.KeyShare.self, from: channel)
+        let share = try await expect(.pairKey, MacMirrorPairing.KeyShare.self, from: channel, timeout: handshakeTimeout)
         let (reveal, agreement) = try initiator.receive(share)
         try await channel.send(.json(.pairReveal, reveal))
-        try await settle(agreement, role: .phone, peer: agreement.mac, channel: channel, confirm: confirm)
+        try await settle(agreement, role: .phone, peer: agreement.mac, channel: channel, timeout: confirmationTimeout, confirm: confirm)
         return MacMirrorPairingRecord(agreement: agreement, role: .phone)
     }
 
@@ -45,18 +47,21 @@ enum MacMirrorPairingExchange {
     static func runMac(
         channel: any MacMirrorFrameChannel,
         identity: MacMirrorPairing.Identity,
+        handshakeTimeout: Duration = .seconds(30),
+        confirmationTimeout: Duration = .seconds(120),
         confirm: @escaping Confirm
     ) async throws -> MacMirrorPairingRecord {
         var responder = MacMirrorPairing.Responder(identity: identity)
-        let commit = try await expect(.pairCommit, MacMirrorPairing.Commit.self, from: channel)
+        let commit = try await expect(.pairCommit, MacMirrorPairing.Commit.self, from: channel, timeout: handshakeTimeout)
         try await channel.send(.json(.pairKey, try responder.receive(commit)))
-        let reveal = try await expect(.pairReveal, MacMirrorPairing.Reveal.self, from: channel)
+        let reveal = try await expect(.pairReveal, MacMirrorPairing.Reveal.self, from: channel, timeout: handshakeTimeout)
         let agreement = try responder.receive(reveal)
-        try await settle(agreement, role: .mac, peer: agreement.phone, channel: channel, confirm: confirm)
+        try await settle(agreement, role: .mac, peer: agreement.phone, channel: channel, timeout: confirmationTimeout, confirm: confirm)
         return MacMirrorPairingRecord(agreement: agreement, role: .mac)
     }
 
     private enum Step: Sendable {
+        case timeout
         case person(Bool)
         case peer(Result<MacMirrorFrame, MacMirrorError>)
     }
@@ -67,6 +72,7 @@ enum MacMirrorPairingExchange {
         role: MacMirrorPairing.Role,
         peer: MacMirrorPairing.Identity,
         channel: any MacMirrorFrameChannel,
+        timeout: Duration,
         confirm: @escaping Confirm
     ) async throws {
         let otherRole: MacMirrorPairing.Role = role == .phone ? .mac : .phone
@@ -74,6 +80,10 @@ enum MacMirrorPairingExchange {
         let ownConfirmation = agreement.confirmation(from: role)
         let failure: MacMirrorError? = await withTaskGroup(of: Step.self) { group in
             group.addTask { .person(await confirm(code, peer)) }
+            group.addTask {
+                do { try await Task.sleep(for: timeout) } catch { return .timeout }
+                return .timeout
+            }
             group.addTask {
                 do { return .peer(.success(try await channel.receive())) }
                 catch let error as MacMirrorError { return .peer(.failure(error)) }
@@ -83,6 +93,10 @@ enum MacMirrorPairingExchange {
             var confirmedThere = false
             while let step = await group.next() {
                 switch step {
+                case .timeout:
+                    channel.cancel()
+                    group.cancelAll()
+                    return .timedOut
                 case .person(true):
                     confirmedHere = true
                     do { try await channel.send(.json(.pairConfirm, ownConfirmation)) }
@@ -119,7 +133,7 @@ enum MacMirrorPairingExchange {
                     group.cancelAll()
                     return error
                 }
-                if confirmedHere && confirmedThere { return nil }
+                if confirmedHere && confirmedThere { group.cancelAll(); return nil }
             }
             return MacMirrorError.closed
         }
@@ -129,9 +143,10 @@ enum MacMirrorPairingExchange {
     private static func expect<T: Decodable>(
         _ type: MacMirrorFrameType,
         _: T.Type,
-        from channel: any MacMirrorFrameChannel
+        from channel: any MacMirrorFrameChannel,
+        timeout: Duration
     ) async throws -> T {
-        let frame = try await channel.receive()
+        let frame = try await channel.receive(timeout: timeout)
         if frame.type == .pairCancel { throw declinedByPeer }
         return try frame.decode(type, as: T.self)
     }

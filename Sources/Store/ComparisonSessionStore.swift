@@ -27,6 +27,7 @@ final class ComparisonSessionStore {
     private let archive: ReadingArchive
     private let archiveName: String
     private var loadTask: Task<Void, Never>?
+    private var mutationTail: Task<Bool, Never>?
 
     init(
         persistenceEnabled: Bool = true,
@@ -64,43 +65,50 @@ final class ComparisonSessionStore {
         loadState = .loaded
     }
 
+    /// Queue edits on the main actor, but publish only after the atomic archive write.
+    /// Each edit reads the state committed by its predecessor, including after a failure.
+    private func mutate(_ edit: @escaping @MainActor ([ComparisonSession]) -> [ComparisonSession]?) async -> Bool {
+        let previous = mutationTail
+        let task = Task { @MainActor in
+            _ = await previous?.value
+            guard self.loadState == .loaded, let proposed = edit(self.sessions) else { return false }
+            if self.persistenceEnabled {
+                guard await self.archive.write(proposed, to: self.archiveName) else { return false }
+            }
+            self.sessions = proposed
+            return true
+        }
+        mutationTail = task
+        return await task.value
+    }
+
     @discardableResult
     func save(_ session: ComparisonSession) async -> Bool {
-        var updated = sessions
-        if let index = updated.firstIndex(where: { $0.id == session.id }) {
-            updated[index] = session
-        } else {
-            updated.insert(session, at: 0)
+        await mutate { sessions in
+            var updated = sessions.filter { $0.id != session.id }
+            updated.append(session)
+            updated.sort { $0.createdAt > $1.createdAt }
+            return Array(updated.prefix(Self.maximumSessions))
         }
-        updated.sort { $0.createdAt > $1.createdAt }
-        if updated.count > Self.maximumSessions { updated.removeLast(updated.count - Self.maximumSessions) }
-        sessions = updated
-        return await persist()
     }
 
     @discardableResult
     func remove(id: UUID) async -> Bool {
-        guard sessions.contains(where: { $0.id == id }) else { return false }
-        sessions.removeAll { $0.id == id }
-        return await persist()
+        await mutate { sessions in
+            guard sessions.contains(where: { $0.id == id }) else { return nil }
+            return sessions.filter { $0.id != id }
+        }
     }
 
-    /// Records that a session was opened, so the next revisit can disclose what changed.
     @discardableResult
     func noteViewed(id: UUID, readingCount: Int, fingerprint: Int64? = nil, at date: Date = .now) async -> Bool {
-        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return false }
-        sessions[index].lastViewedReadingCount = readingCount
-        sessions[index].lastViewedFingerprint = fingerprint
-        sessions[index].lastViewedAt = date
-        return await persist()
-    }
-
-    private func persist() async -> Bool {
-        guard persistenceEnabled else { return false }
-        guard loadState == .loaded else {
-            logger.error("Refusing to save comparison sessions: the archive has not loaded")
-            return false
+        await mutate { sessions in
+            var updated = sessions
+            guard let index = updated.firstIndex(where: { $0.id == id }) else { return nil }
+            updated[index].lastViewedReadingCount = readingCount
+            updated[index].lastViewedFingerprint = fingerprint
+            updated[index].lastViewedAt = date
+            return updated
         }
-        return await archive.write(sessions, to: archiveName)
     }
 }

@@ -3,27 +3,18 @@ import Foundation
 import FoundationModels
 #endif
 
-/// Turns `NowBriefFacts` into a short paragraph with Apple's on-device language model.
+/// Uses Apple's on-device model to select complete, deterministically rendered facts.
 ///
 /// Runs entirely on the device: the readings never leave it. Available on iOS 26 and later
 /// with Apple Intelligence enabled; elsewhere, and whenever the model declines, fails, or
 /// writes something `NowBriefCheck` rejects, there is simply no brief. Builds made with an SDK
 /// that has no Foundation Models (CI's Xcode 16) compile the unavailable path only.
 enum NowBriefGenerator {
-    /// The model's standing instructions. The rules restate what every card already does:
-    /// estimates stay estimates, old readings keep their age, and nothing is diagnosed.
+    /// The model selects sentence indices, never medical values or prose.
     static let instructions = """
-        Summarise the readings below for the top of a health dashboard, in two or three flowing sentences under 55 words.
-        Include each value and unit exactly as given, in the order given. Readings after the fourth may be joined into one short clause or left out.
-        Call a reading an estimate only if its line says "Estimated", and always if it does. Keep the time since a reading was last reported wherever the readings give it.
-        Add nothing: no other numbers, no judgement of whether a value is good or bad, no advice, no diagnosis, no causes.
-        No greeting, list, or headings.
-
-        Example readings:
-        - Heart rate is 64 bpm now.
-        - Estimated blood pressure was 121/79 mmHg when last reported, 4 hours ago.
-        - Blood oxygen was 98% when last reported, 5 hours ago.
-        Example summary: Your heart rate is 64 bpm right now. Estimated blood pressure was 121/79 mmHg 4 hours ago, and blood oxygen was 98% 5 hours ago.
+        Choose up to four of the supplied reading sentences, in their given order.
+        Return only their zero-based indices separated by commas, for example: 0,1,2.
+        Do not rewrite any reading or add prose.
         """
 
     /// Sampling temperatures for successive attempts: a draft that fails `NowBriefCheck` is
@@ -39,6 +30,16 @@ enum NowBriefGenerator {
         return false
     }
 
+    /// The model selects clauses; every displayed character is rendered from the facts.
+    static func render(selection: String, facts: NowBriefFacts) -> String? {
+        let tokens = selection.split(separator: ",", omittingEmptySubsequences: false)
+        let indices = tokens.compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        guard indices.count == tokens.count, (1...4).contains(indices.count),
+              indices == indices.sorted(), Set(indices).count == indices.count,
+              indices.allSatisfy({ facts.items.indices.contains($0) }) else { return nil }
+        return NowBriefCheck.accepted(indices.map { facts.items[$0].sentence }.joined(separator: " "), facts: facts)
+    }
+
     /// The accepted brief for `facts`, or nil.
     static func generate(_ facts: NowBriefFacts) async -> String? {
         #if canImport(FoundationModels)
@@ -50,10 +51,10 @@ enum NowBriefGenerator {
                 let session = LanguageModelSession(instructions: instructions)
                 do {
                     let response = try await session.respond(
-                        to: facts.prompt,
+                        to: facts.lines.enumerated().map { "\($0.offset): \($0.element)" }.joined(separator: "\n"),
                         options: GenerationOptions(temperature: temperature, maximumResponseTokens: 140)
                     )
-                    if let accepted = NowBriefCheck.accepted(response.content, facts: facts) { return accepted }
+                    if let accepted = render(selection: response.content, facts: facts) { return accepted }
                 } catch {
                     // A guardrail refusal, an unsupported language, or a busy model: no brief.
                     return nil

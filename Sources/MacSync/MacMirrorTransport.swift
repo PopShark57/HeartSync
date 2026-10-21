@@ -60,21 +60,17 @@ final class MacMirrorChannel: @unchecked Sendable {
     /// Starts the connection and waits until it is ready. A connection that waits (no route,
     /// refused) or fails, including a TLS handshake with the wrong key, throws.
     func open() async throws {
-        let gate = MirrorResumeOnce()
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            connection.stateUpdateHandler = { state in
+        try await perform(timeout: 15) { (finish: @escaping @Sendable (Result<Void, any Error>) -> Void) in
+            self.connection.stateUpdateHandler = { state in
                 switch state {
-                case .ready:
-                    gate.run { continuation.resume() }
+                case .ready: finish(.success(()))
                 case .waiting(let error), .failed(let error):
-                    gate.run { continuation.resume(throwing: MacMirrorError.connectionFailed(Self.describe(error))) }
-                case .cancelled:
-                    gate.run { continuation.resume(throwing: MacMirrorError.closed) }
-                default:
-                    break
+                    finish(.failure(MacMirrorError.connectionFailed(Self.describe(error))))
+                case .cancelled: finish(.failure(MacMirrorError.closed))
+                default: break
                 }
             }
-            connection.start(queue: queue)
+            self.connection.start(queue: self.queue)
         }
     }
 
@@ -84,21 +80,18 @@ final class MacMirrorChannel: @unchecked Sendable {
     }
 
     func send(_ frame: MacMirrorFrame) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            connection.send(content: frame.encoded, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: MacMirrorError.connectionFailed(Self.describe(error)))
-                } else {
-                    continuation.resume()
-                }
+        try await perform(timeout: 30) { (finish: @escaping @Sendable (Result<Void, any Error>) -> Void) in
+            self.connection.send(content: frame.encoded, completion: .contentProcessed { error in
+                if let error { finish(.failure(MacMirrorError.connectionFailed(Self.describe(error)))) }
+                else { finish(.success(())) }
             })
         }
     }
 
     func receive() async throws -> MacMirrorFrame {
-        let header = try await receive(exactly: MacMirrorFrame.headerLength)
+        let header = try await receive(exactly: MacMirrorFrame.headerLength, timeout: nil)
         let (type, length) = try MacMirrorFrame.parseHeader(header)
-        let body = length == 0 ? Data() : try await receive(exactly: length)
+        let body = length == 0 ? Data() : try await receive(exactly: length, timeout: 30)
         return MacMirrorFrame(type: type, body: body)
     }
 
@@ -114,19 +107,38 @@ final class MacMirrorChannel: @unchecked Sendable {
         connection.cancel()
     }
 
-    private func receive(exactly count: Int) async throws -> Data {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, any Error>) in
-            connection.receive(minimumIncompleteLength: count, maximumLength: count) { content, _, isComplete, error in
-                if let error {
-                    continuation.resume(throwing: MacMirrorError.connectionFailed(Self.describe(error)))
-                } else if let content, content.count == count {
-                    continuation.resume(returning: content)
-                } else if isComplete {
-                    continuation.resume(throwing: MacMirrorError.closed)
-                } else {
-                    continuation.resume(throwing: MacMirrorError.malformed("short read"))
-                }
+    private func receive(exactly count: Int, timeout: TimeInterval?) async throws -> Data {
+        try await perform(timeout: timeout) { finish in
+            self.connection.receive(minimumIncompleteLength: count, maximumLength: count) { content, _, isComplete, error in
+                if let error { finish(.failure(MacMirrorError.connectionFailed(Self.describe(error)))) }
+                else if let content, content.count == count { finish(.success(content)) }
+                else if isComplete { finish(.failure(MacMirrorError.closed)) }
+                else { finish(.failure(MacMirrorError.malformed("short read"))) }
             }
+        }
+    }
+
+    /// Cancellation resumes the waiter itself, including cancellation before installation.
+    /// The late Network callback and the deadline race through the same locked gate.
+    private func perform<Value: Sendable>(
+        timeout: TimeInterval?,
+        _ begin: @Sendable (@escaping @Sendable (Result<Value, any Error>) -> Void) -> Void
+    ) async throws -> Value {
+        let pending = MirrorPending<Value>()
+        let deadline = DispatchWorkItem { [self] in
+            if pending.finish(.failure(MacMirrorError.timedOut)) { connection.cancel() }
+        }
+        defer { deadline.cancel() }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                guard pending.install(continuation) else { return }
+                if let timeout { queue.asyncAfter(deadline: .now() + timeout, execute: deadline) }
+                begin { _ = pending.finish($0) }
+            }
+        } onCancel: { [self] in
+            _ = pending.finish(.failure(CancellationError()))
+            connection.cancel()
         }
     }
 
@@ -140,16 +152,31 @@ final class MacMirrorChannel: @unchecked Sendable {
     }
 }
 
-/// Lets several callbacks race to resume one continuation; only the first runs.
-private final class MirrorResumeOnce: @unchecked Sendable {
+/// A result may arrive before the continuation; both installation orders are safe.
+private final class MirrorPending<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private var done = false
+    private var continuation: CheckedContinuation<Value, any Error>?
+    private var result: Result<Value, any Error>?
 
-    func run(_ body: () -> Void) {
-        let first = lock.withLock {
-            defer { done = true }
-            return !done
+    func install(_ continuation: CheckedContinuation<Value, any Error>) -> Bool {
+        let completed = lock.withLock { () -> Result<Value, any Error>? in
+            if let result { return result }
+            self.continuation = continuation
+            return nil
         }
-        if first { body() }
+        if let completed { continuation.resume(with: completed); return false }
+        return true
+    }
+
+    @discardableResult
+    func finish(_ result: Result<Value, any Error>) -> Bool {
+        let outcome = lock.withLock { () -> (Bool, CheckedContinuation<Value, any Error>?) in
+            guard self.result == nil else { return (false, nil) }
+            self.result = result
+            defer { continuation = nil }
+            return (true, continuation)
+        }
+        outcome.1?.resume(with: result)
+        return outcome.0
     }
 }

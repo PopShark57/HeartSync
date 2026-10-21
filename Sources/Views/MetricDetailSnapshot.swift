@@ -272,7 +272,7 @@ struct MetricDetailSnapshot {
             .compactMap { store.source(id: $0) }
             .sorted { $0.displayName < $1.displayName }
         self.sourcesInRange = sources
-        self.series = Self.makeSeries(for: sources)
+        self.series = Self.makeSeries(for: sources, labels: SourceLabels.make(for: store.enabledSources))
         // A reading whose device record is gone still draws, under the store's fallback
         // name; every other label is the legend's own.
         var fallbackLabels: [String: String] = [:]
@@ -376,28 +376,11 @@ struct MetricDetailSnapshot {
     /// Labels are disambiguated only where they collide. A user with one "Polar H10" sees
     /// "Polar H10"; a user whose ring is visible over both Bluetooth and Apple Health sees
     /// the transport, and if that still collides, a short stable-ID suffix.
-    static func makeSeries(for sources: [DataSource]) -> [SourceSeries] {
-        var nameCounts: [String: Int] = [:]
-        for source in sources { nameCounts[source.displayName, default: 0] += 1 }
-
-        // Second pass over the colliding names only, to see whether transport separates them.
-        var transportCounts: [String: Int] = [:]
-        for source in sources where (nameCounts[source.displayName] ?? 0) > 1 {
-            transportCounts["\(source.displayName)\u{001F}\(source.transport.title)", default: 0] += 1
-        }
-
+    static func makeSeries(for sources: [DataSource], labels suppliedLabels: [String: String]? = nil) -> [SourceSeries] {
+        let labels = suppliedLabels ?? SourceLabels.make(for: sources)
         let symbols = Self.symbols(for: sources)
         return sources.enumerated().map { index, source in
-            let label: String
-            if (nameCounts[source.displayName] ?? 0) <= 1 {
-                label = source.displayName
-            } else if (transportCounts["\(source.displayName)\u{001F}\(source.transport.title)"] ?? 0) <= 1 {
-                label = "\(source.displayName) (\(source.transport.title))"
-            } else if let model = source.model, !model.isEmpty {
-                label = "\(source.displayName) (\(source.transport.title), \(model))"
-            } else {
-                label = "\(source.displayName) (\(source.transport.title), \(Self.shortIdentifier(source.id)))"
-            }
+            let label = labels[source.id] ?? source.displayName
             return SourceSeries(
                 sourceID: source.id,
                 label: label,
