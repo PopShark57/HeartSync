@@ -3,35 +3,10 @@ import SwiftUI
 struct WatchDashboardView: View {
     let connection: CompanionSession
     var openCompare: () -> Void
+    @State private var showsSyncDetails = false
 
     var body: some View {
         List {
-            Button(action: openCompare) {
-                Label("Compare devices", systemImage: "square.split.2x1")
-                    .font(.headline)
-            }
-            .watchGlassButton()
-            .listRowBackground(Color.clear)
-            .accessibilityHint("Open comparison charts for metrics reported by two or more sources")
-
-            // At the top rather than in the toolbar: a toolbar item on a page of the vertical
-            // TabView, each page with its own NavigationStack, crashes watchOS ("Layout requested
-            // for visible navigation bar … when the top item belongs to a different navigation
-            // bar").
-            Button {
-                connection.requestSyncAll()
-            } label: {
-                Label(connection.isSyncingAll ? "Syncing…" : "Sync all sources", systemImage: "arrow.triangle.2.circlepath")
-            }
-            .watchGlassButton()
-            .listRowBackground(Color.clear)
-            .disabled(connection.isSyncingAll || !connection.isReachable)
-            .accessibilityHint("Asks iPhone to sync Apple Health and Oura, reconnect Bluetooth devices, and import readings stored on rings")
-            if let report = connection.lastSyncReport {
-                WatchSyncReportView(report: report)
-                    .listRowBackground(Color.clear)
-            }
-
             if let snapshot = connection.snapshot {
                 Section {
                     if snapshot.availability == .unavailable {
@@ -66,6 +41,36 @@ struct WatchDashboardView: View {
                     Label("Welcome to HeartSync", systemImage: "heart.fill")
                     Text("Open HeartSync on your paired iPhone to receive your latest readings.")
                         .font(.caption)
+                }
+            }
+
+            Button(action: openCompare) {
+                Label("Compare devices", systemImage: "square.split.2x1")
+                    .font(.headline)
+            }
+            .watchGlassButton()
+            .listRowBackground(Color.clear)
+            .accessibilityHint("Open comparison charts for metrics reported by two or more sources")
+
+            // Actions stay in the list rather than in the toolbar: a toolbar item on a page of the vertical
+            // TabView, each page with its own NavigationStack, crashes watchOS ("Layout requested
+            // for visible navigation bar … when the top item belongs to a different navigation
+            // bar").
+            Button {
+                connection.requestSyncAll()
+            } label: {
+                Label(connection.isSyncingAll ? "Syncing…" : "Sync all sources", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .watchGlassButton()
+            .listRowBackground(Color.clear)
+            .disabled(connection.isSyncingAll || !connection.isReachable)
+            .accessibilityHint("Asks iPhone to sync Apple Health and Oura, reconnect Bluetooth devices, and import readings stored on rings")
+            if let report = connection.lastSyncReport {
+                Button(showsSyncDetails ? "Hide sync details" : "Last sync details") { showsSyncDetails.toggle() }
+                    .listRowBackground(Color.clear)
+                if showsSyncDetails {
+                    WatchSyncReportView(report: report)
+                        .listRowBackground(Color.clear)
                 }
             }
 

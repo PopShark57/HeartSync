@@ -201,6 +201,7 @@ final class AppModel {
     private(set) var startupNotice: String?
 
     /// The latest stress assessment, or why there is none. Nil until the first estimate pass.
+    private(set) var derivedHistoryIssue: String?
     private(set) var stress: Result<StressModel.Assessment, StressModel.Unavailable>?
 
     /// A stress check the user started from a ring's Devices row.
@@ -857,11 +858,14 @@ final class AppModel {
         // Computed from a read taken before a reset: writing it would restore estimates of
         // history that no longer exists.
         guard epoch == dataEpoch else { return }
-        stressBaseline = result.stressBaseline
-        stressBaselineEpoch = epoch
-        stress = result.stressAssessment
+        derivedHistoryIssue = result.historyErrors.first
+        if result.successfulKinds.contains(.stress) {
+            stressBaseline = result.stressBaseline
+            stressBaselineEpoch = epoch
+            stress = result.stressAssessment
+        }
         let slot = StressModel.slot(at: now)
-        lastScoredSlot = slot
+        if result.historyErrors.isEmpty { lastScoredSlot = slot }
         applyDerivedEstimates(result, now: now)
         logStress(result.stressAssessment, slot: slot)
     }
@@ -920,27 +924,33 @@ final class AppModel {
 
     private func applyDerivedEstimates(_ result: DerivedEstimates.Result, now: Date) {
         let startOfToday = Calendar.current.startOfDay(for: now)
-        store.reconcileEstimates(
-            kinds: [.vo2Max],
-            keeping: Set(result.vo2Max.map(\.id)),
-            currentSince: settings.snapshot.vo2MaxEstimateEnabled ? startOfToday : nil
-        )
+        if result.successfulKinds.contains(.vo2Max) {
+            store.reconcileEstimates(
+                kinds: [.vo2Max],
+                keeping: Set(result.vo2Max.map(\.id)),
+                currentSince: settings.snapshot.vo2MaxEstimateEnabled ? startOfToday : nil
+            )
+        }
         // Scoped to the synthetic estimate source. A ring reports its blood pressure as an
         // estimate under its own source, and that must never be swept up here.
-        store.reconcileEstimates(
-            kinds: [.bloodPressureSystolic, .bloodPressureDiastolic],
-            keeping: Set(result.bloodPressure.map(\.id)),
-            currentSince: settings.canEstimateBloodPressure ? now.addingTimeInterval(-300) : nil,
-            sourceID: Self.estimateSourceID
-        )
+        if result.successfulKinds.contains(.bloodPressureSystolic) {
+            store.reconcileEstimates(
+                kinds: [.bloodPressureSystolic, .bloodPressureDiastolic],
+                keeping: Set(result.bloodPressure.map(\.id)),
+                currentSince: settings.canEstimateBloodPressure ? now.addingTimeInterval(-300) : nil,
+                sourceID: Self.estimateSourceID
+            )
+        }
         // The stress index for this five-minute slot: withdrawn when it can no longer be
         // computed (exercise, or the signals went stale), so it never outlives its evidence.
-        store.reconcileEstimates(
-            kinds: [.stress],
-            keeping: Set(result.stress.map(\.id)),
-            currentSince: now.addingTimeInterval(-300),
-            sourceID: Self.estimateSourceID
-        )
+        if result.successfulKinds.contains(.stress) {
+            store.reconcileEstimates(
+                kinds: [.stress],
+                keeping: Set(result.stress.map(\.id)),
+                currentSince: now.addingTimeInterval(-300),
+                sourceID: Self.estimateSourceID
+            )
+        }
         let produced = result.all
         guard !produced.isEmpty else { return }
         // Estimates are revisable documents, not append-only measurements. Stable IDs make

@@ -60,9 +60,9 @@ struct StressModelTests {
         _ store: HealthStore,
         at time: Date? = nil,
         previous: (score: Double, at: Date)? = nil
-    ) -> Result<StressModel.Assessment, StressModel.Unavailable> {
-        let baseline = StressModel.Baseline.build(history: store.history, now: now, estimateSourceID: estimateSource, timeZone: Self.utc)
-        return StressModel.assess(
+    ) throws -> Result<StressModel.Assessment, StressModel.Unavailable> {
+        let baseline = try StressModel.Baseline.build(history: store.history, now: now, estimateSourceID: estimateSource, timeZone: Self.utc)
+        return try StressModel.assess(
             history: store.history,
             baseline: baseline,
             now: time ?? now,
@@ -154,28 +154,28 @@ struct StressModelTests {
     }
 
     @Test("A heart rate above half of heart-rate reserve is read as exercise, not stress")
-    func exerciseIsNotStress() {
+    func exerciseIsNotStress() throws {
         let store = seededStore()
         addCurrent(store, heartRate: 150, rmssd: 20)
-        #expect(assess(store) == .failure(.likelyExercise(heartRate: 150)))
+        #expect(try assess(store) == .failure(.likelyExercise(heartRate: 150)))
     }
 
     @Test("Without a current heart rate or HRV there is no score")
-    func nothingCurrent() {
+    func nothingCurrent() throws {
         let store = seededStore()
         // The seeded watch SDNN an hour back still counts (SDNN is usable for four hours);
         // six hours on, nothing does.
         #expect((try? assess(store).get()) != nil)
-        #expect(assess(store, at: now.addingTimeInterval(6 * 3_600)) == .failure(.noCurrentSignal))
+        #expect(try assess(store, at: now.addingTimeInterval(6 * 3_600)) == .failure(.noCurrentSignal))
     }
 
     @Test("Without history to compare with there is no score")
-    func noBaseline() {
+    func noBaseline() throws {
         let store = HealthStore(persistenceEnabled: false)
         store.upsert(strap)
         store.upsert(watch)
         addCurrent(store, heartRate: 70, rmssd: 40)
-        #expect(assess(store) == .failure(.insufficientEvidence))
+        #expect(try assess(store) == .failure(.insufficientEvidence))
     }
 
     @Test("Each device's HRV is judged on its own scale")

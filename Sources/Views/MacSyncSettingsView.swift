@@ -10,6 +10,14 @@ struct MacSyncSettingsView: View {
     var body: some View {
         let mirror = model.macMirror
         Form {
+            if let issue = mirror.discoveryIssue {
+                Section {
+                    Label(issue, systemImage: "network.slash")
+                    Text("Check Wi-Fi and HeartSync's Local Network access in Settings.")
+                        .font(.caption)
+                    Button("Retry discovery") { mirror.retryDiscovery() }
+                }
+            }
             if mirror.pairingsUnavailable {
                 Section {
                     Label("Paired Macs can't be read until the iPhone is unlocked.", systemImage: "lock.fill")
@@ -166,10 +174,18 @@ private struct MacPairingSheet: View {
             Section {
                 if client.found.isEmpty {
                     HStack(spacing: 12) {
-                        ProgressView()
-                        Text("Looking for Macs…")
+                        if client.discovery == .searching { ProgressView() }
+                        Text(client.discovery == .searching ? "Looking for Macs…" : "No Macs found yet")
                             .foregroundStyle(.secondary)
                     }
+                }
+                if case .unavailable(let detail) = client.discovery {
+                    Label(detail, systemImage: "network.slash")
+                    Text("Check Wi-Fi and Local Network access for HeartSync in Settings. This error can also mean the network is unavailable.")
+                        .font(.caption)
+                }
+                if client.discovery != .searching {
+                    Button("Search Again") { client.tryAgain() }
                 }
                 ForEach(client.found) { mac in
                     Button {

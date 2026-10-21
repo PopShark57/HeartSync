@@ -10,6 +10,13 @@ struct MacSyncView: View {
         let mirror = model.mirror
         NavigationStack {
             Form {
+                if mirror.cleanupPending || mirror.issue != nil && mirror.pairing == nil {
+                    Section("Pairing change needs attention") {
+                        Text(mirror.issue ?? "Deletion is pending. Sync is stopped.")
+                        Button("Retry pairing change") { Task { await mirror.retryPendingChange() } }
+                            .disabled(mirror.isChangingPairing)
+                    }
+                }
                 if mirror.pairingUnavailable {
                     Section {
                         Label("The pairing could not be read from the Keychain.", systemImage: "lock.fill")
@@ -36,7 +43,7 @@ struct MacSyncView: View {
                 titleVisibility: .visible
             ) {
                 Button("Unpair and Delete the Copy", role: .destructive) {
-                    unpairFailed = !mirror.unpair()
+                    Task { unpairFailed = await mirror.unpair() == false }
                 }
             } message: {
                 Text("The iPhone's history is deleted from this Mac. Nothing on the iPhone is deleted, and you can pair again later to copy it back.")
@@ -44,7 +51,7 @@ struct MacSyncView: View {
             .alert("The pairing could not be removed", isPresented: $unpairFailed) {
                 Button("OK", role: .cancel) {}
             } message: {
-                Text("The Keychain could not be updated. Try again.")
+                Text(mirror.issue ?? "The pairing change could not finish. Try again.")
             }
         }
     }
@@ -82,8 +89,11 @@ struct MacSyncView: View {
                 Label(issue, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                     .font(.callout)
+                Button("Retry connection") { mirror.retryKeychain() }
+                    .disabled(mirror.isChangingPairing)
             }
             Button("Unpair…", role: .destructive) { confirmingUnpair = true }
+                .disabled(mirror.isChangingPairing)
         }
     }
 
@@ -97,6 +107,7 @@ struct MacSyncView: View {
                      : "Pairing another iPhone deletes this copy and starts again with that iPhone's history.")
                     .foregroundStyle(.secondary)
                 Button("Pair with iPhone…") { mirror.openPairingWindow() }
+                    .disabled(mirror.cleanupPending || mirror.isChangingPairing || mirror.pairingUnavailable)
                     .heartSyncButtonStyle(prominent: mirror.pairing == nil)
             case .waiting:
                 HStack(spacing: 12) {

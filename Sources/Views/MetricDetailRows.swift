@@ -9,6 +9,8 @@ import SwiftUI
 /// with one median. These say "windows", keep the original sample count in its own row, and
 /// say "unknown" where the archive genuinely no longer knows.
 struct PerSourceStatsRow: View {
+    @Environment(AppModel.self) private var model
+    private var sourceName: String { SourceLabels.name(for: entry.source.id, in: model.store.enabledSources) }
     var kind: MetricKind
     var entry: SourceStats
 
@@ -16,7 +18,7 @@ struct PerSourceStatsRow: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 SourceDot(color: entry.source.color)
-                Text(entry.source.displayName)
+                Text(sourceName)
                     .font(.subheadline.weight(.medium))
                 Spacer()
                 Text(kind.formatWithUnit(entry.typicalWindowValue))
@@ -61,7 +63,7 @@ struct PerSourceStatsRow: View {
         )
         let base = String(
             localized: "detail.spoken.base",
-            defaultValue: "\(entry.source.displayName), typical \(kind.formatWithUnit(entry.typicalWindowValue)) across \(windows), lowest window median \(kind.format(entry.lowestWindowValue)), highest window median \(kind.format(entry.highestWindowValue))",
+            defaultValue: "\(sourceName), typical \(kind.formatWithUnit(entry.typicalWindowValue)) across \(windows), lowest window median \(kind.format(entry.lowestWindowValue)), highest window median \(kind.format(entry.highestWindowValue))",
             comment: "Spoken description of a device row. Arguments: device name, typical value with unit, a phrase such as '3 windows', lowest median, highest median."
         )
         let depth = entry.originalSampleCount.map { count in
@@ -100,13 +102,15 @@ struct PerSourceStatsRow: View {
 /// over-limit wording is kept for the case where a window reaches this row without having
 /// gone through `HRVAccumulator.emitIfReady`.
 struct HRVQualityRow: View {
+    @Environment(AppModel.self) private var model
+    private var sourceName: String { SourceLabels.name(for: entry.source.id, in: model.store.enabledSources) }
     var entry: HRVQualityEntry
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 SourceDot(color: entry.source.color, size: 8)
-                Text(entry.source.displayName)
+                Text(sourceName)
                     .font(.caption.weight(.medium))
                 Spacer()
                 Text(entry.quality.measuredAt, format: .relative(presentation: .numeric))
@@ -179,13 +183,13 @@ struct PairwiseAnalysisRow: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 SourceDot(color: model.store.source(id: analysis.sourceA)?.color ?? .gray, size: 8)
-                Text("A  \(model.store.displayName(forSource: analysis.sourceA))")
+                Text("A  \(SourceLabels.name(for: analysis.sourceA, in: model.store.enabledSources))")
                     .font(.caption.weight(.medium))
                 Text("vs")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                 SourceDot(color: model.store.source(id: analysis.sourceB)?.color ?? .gray, size: 8)
-                Text("B  \(model.store.displayName(forSource: analysis.sourceB))")
+                Text("B  \(SourceLabels.name(for: analysis.sourceB, in: model.store.enabledSources))")
                     .font(.caption.weight(.medium))
                 Spacer()
             }

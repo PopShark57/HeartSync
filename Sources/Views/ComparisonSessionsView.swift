@@ -12,6 +12,8 @@ struct ComparisonSessionsView: View {
     /// Called with the session the user chose to open.
     var open: (ComparisonSession) -> Void
 
+    @State private var deleteFailed = false
+
     var body: some View {
         NavigationStack {
             List {
@@ -21,6 +23,7 @@ struct ComparisonSessionsView: View {
                             .foregroundStyle(.orange)
                         Text(model.sessions.loadIssue ?? "The sessions archive could not be read. Existing bytes were preserved and nothing new will be written until it loads.")
                             .font(.caption)
+                        Button("Try Again") { Task { await model.sessions.loadIfNeeded() } }
                     }
                 }
 
@@ -46,12 +49,21 @@ struct ComparisonSessionsView: View {
                         }
                         .onDelete { offsets in
                             let doomed = offsets.map { model.sessions.sessions[$0].id }
-                            Task { for id in doomed { await model.sessions.remove(id: id) } }
+                            Task {
+                                for id in doomed {
+                                    if await model.sessions.remove(id: id) == false { deleteFailed = true }
+                                }
+                            }
                         }
                     } footer: {
                         Text("A session stores the period, the devices, and your own label — never a copy of the readings or of the result. Re-opening one re-runs the analysis against your current data, so a session is not a fixed record. Export a pair from its detail screen for that.")
                     }
                 }
+            }
+            .alert("Could not delete session", isPresented: $deleteFailed) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("The saved-sessions file could not be written. The session is still saved; try deleting it again.")
             }
             .navigationTitle("Saved sessions")
             .heartSyncInlineTitle()
@@ -189,6 +201,8 @@ struct SaveComparisonSessionView: View {
     @State private var title = ""
     @State private var context = ""
     @State private var saveFailed = false
+    @State private var isSaving = false
+    @State private var draftID = UUID()
 
     var body: some View {
         NavigationStack {
@@ -225,7 +239,7 @@ struct SaveComparisonSessionView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(end <= start || includedSourceIDs.isEmpty)
+                        .disabled(isSaving || end <= start || includedSourceIDs.isEmpty)
                 }
             }
             .alert("Could not save", isPresented: $saveFailed) {
@@ -242,7 +256,10 @@ struct SaveComparisonSessionView: View {
     }
 
     private func save() {
+        guard !isSaving else { return }
+        isSaving = true
         let session = ComparisonSession(
+            id: draftID,
             title: title,
             context: context,
             interval: DateInterval(start: start, end: max(start, end)),
@@ -250,6 +267,7 @@ struct SaveComparisonSessionView: View {
             metric: metric
         )
         Task {
+            defer { isSaving = false }
             if await model.sessions.save(session) {
                 dismiss()
             } else {

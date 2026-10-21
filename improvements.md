@@ -3,7 +3,395 @@
 Newest review first. Earlier reviews and their implementation notes are retained below as
 history; their "Observed behavior" paragraphs describe the checkout they reviewed.
 
-## What is still open (checked 2026-10-21)
+## Implementation follow-up (2026-10-21)
+
+Implemented the local review's items **73–87**, together with the remaining code/product
+follow-ups beneath items 1–72. The original observations below remain historical evidence.
+Hardware, platform-permission, accessibility, and performance release checks still require
+actual runs; implementation does not complete those gates.
+
+| Items | Implemented behavior |
+| --- | --- |
+| 73, 80 | Apple Intelligence selects sentence indices. HeartSync renders complete canonical facts, binding values to units, ordered pressure components, ages, provenance and device counts. Display permission checks current facts, availability and a three-minute lifetime independently of generation throttling. |
+| 74–76 | Mac pairing changes journal their intent in the existing device-only Keychain item before erasing SQLite. Startup retries unfinished operations before accepting sync. Session generations reject obsolete writes and callbacks; retired receivers are drained before store handoff. Network operations close on cancellation, use exactly-once continuation gates, and bound connect, handshake, frame, acknowledgement and confirmation waits. Established idle sync remains open. |
+| 77 | Saved-session mutations are serialized, written atomically, then published. Failed save/delete/view-note operations retain the committed state. The save sheet retains one draft ID and disables duplicate submissions; load/delete/view-note failures have recovery wording. |
+| 78 | Derived computations and stress-baseline reads propagate failures. Only metrics with successfully read inputs reconcile estimates; failed passes preserve the previous baseline and leave the slot retryable, with a visible retry action. |
+| 79 | Watch construction uses query outcomes, publishes unavailable on failure, and clears failed chart-cache work so storage recovery can rebuild immediately. |
+| 81 | Pairing discovery distinguishes searching, no results and network failure; it offers retry and qualified Local Network guidance. Both phone browsers recover with bounded backoff while active, and listener/browser callbacks reject obsolete generations. |
+| 82 | Shared source-label policy is used by legends, statistics, source selection, pair rows, Now rows, spoken descriptions and watch payloads. Same-name/same-model sources retain stable qualifiers; bounded watch names keep an identifier. |
+| 83 | Mac launch runs the bounded export-directory sweep off the main actor with a launch cutoff. |
+| 84 | XcodeGen defines native Mac unit and UI targets, and CI runs both. Injected pairing-storage, listener-construction and erase seams support failure tests. Shared protocol/session tests compile into both app test targets. |
+| 85 | Empty Now screens offer direct setup/pairing and history actions. iPhone wording distinguishes paused sources, inactive Bluetooth, older history and first readings, reusing existing collection/navigation actions. |
+| 86 | Watch readings precede comparison and sync controls. Completed sync details expand from a compact button below the readings; every transport outcome remains available. |
+| 87 | Mac chart help uses click/drag language. Navigate exposes Command-1 through Command-4; pair export exposes Shift-Command-E. The existing minimum window size is unchanged. |
+| 23 | Health and Oura support durable aliases and explicit same-device/independent relationships. These choices survive transport updates and only affect presentation/warnings; sources and readings never merge. |
+| 48, 49, 56 | Source-status write failures are visible and return an outcome. Watch latest values use one grouped indexed request. Analysis observes source definitions separately from battery/last-seen status, and status-only writes do not advance its generation. Device-status screens still observe the metadata they draw. |
+
+Reviewed and retained the pre-existing string-catalog refresh: obsolete workout strings are
+removed, the source language remains English, and the two changed English entries preserve
+their values with positional placeholders. No translations were discarded.
+
+Validation details and remaining release gates: [roadmap validation](docs/validation/roadmap-73-87.md).
+
+## Review across iOS, macOS, and watchOS (2026-10-21)
+
+Reviewed checkout `b7b9f54`, including the new Mac mirror. This is a fresh, targeted
+code and product review across the three applications, their shared persistence and
+analysis, transport orchestration, tests, and build configuration. It is not a claim that
+every source line was exhaustively audited. The older reviews and their completion notes
+remain below; items **73–87** are new follow-ups.
+
+**My opinion:** the strongest parts are the explicit provenance, honest comparison evidence,
+shared analysis, and detailed recovery work already in place. Keep those. The next iteration
+should concentrate on failure behavior and trustworthy summaries, then make setup and the
+Mac/watch interfaces feel more direct. Another visual redesign would be lower value than
+fixing the cases where a successful-looking screen disagrees with durable data.
+
+### Suggested order
+
+P1 means a correctness or data-lifecycle issue to address before relying on the affected
+feature. P2 means a concrete reliability, usability, or validation improvement. P3 is polish.
+These priorities describe the code paths below, not measured incident frequency.
+
+| Item | Priority | Improvement | Basis |
+| --- | --- | --- | --- |
+| 73 | P1 | Bind AI summary values to their roles and units | Reproduced against production validator |
+| 74 | P1 | Make Mac unpair/replacement handle deletion failure | Confirmed control flow |
+| 75 | P1 | Reject cancelled or superseded Mac receiver batches before commit | Reproduced with controlled in-flight frame |
+| 76 | P1 | Make network waits cancellable and pairing time-bounded | Confirmed missing cancellation/deadline handling |
+| 77 | P1 | Keep failed saved-session edits from becoming apparent successes | Reproduced with archive write failure |
+| 78 | P1 | Preserve estimates and baselines when history reads fail | Failed-read result reproduced; reconciliation traced |
+| 79 | P2 | Distinguish watch query failure from an empty health history | Reproduced with unavailable history |
+| 80 | P2 | Retire stale AI briefs when their supporting facts change | Confirmed view lifecycle |
+| 81 | P2 | Give local-network discovery a visible failure and retry path | Confirmed state handling gaps |
+| 82 | P2 | Disambiguate duplicate source names outside chart legends | Observed in the Mac demo and shared row code |
+| 83 | P2 | Sweep abandoned exports on Mac launch too | Confirmed entry-point difference |
+| 84 | P2 | Test Mac orchestration in its own target | Confirmed test/configuration gap |
+| 85 | P2 | Make first-run and no-data screens actionable and state-specific | Code-derived product proposal |
+| 86 | P3 | Put readings ahead of persistent sync controls on the watch | Code-derived product proposal |
+| 87 | P3 | Finish adapting shared interaction language to the Mac | Observed Mac copy; product proposal |
+
+Start with 74–76 together because stopping a session, clearing a mirror, and replacing a
+pairing are one lifecycle. Fix 73 before expanding the AI brief. Then address 77–80 and add
+the missing failure tests. The remaining items can be smaller product-quality changes.
+
+### 73. Bind AI summary values to their roles and units
+
+**Evidence:** [NowBrief.swift](Sources/Views/NowBrief.swift), `NowBriefCheck.accepted`, checks
+that the numbers in a metric's clause are a *subset* of its permitted numbers. The permitted
+set includes measurement values, ages, and device counts. The check does not validate units
+or the order of systolic and diastolic values.
+
+A temporary executable linked against the built Mac app's actual module accepted all three
+of these invalid drafts:
+
+- Facts: heart rate **72 bpm**, **2 devices** agree. Accepted: **“Heart rate is 2 bpm now.”**
+- Same facts. Accepted: **“Heart rate is 72 mmHg now.”**
+- Facts: estimated blood pressure **118/76 mmHg**, 2 hours ago. Accepted:
+  **“Estimated blood pressure was 76/118 mmHg 2 hours ago.”**
+
+These are validator reproductions, not a claim that the model generated these drafts in
+the walkthrough. A numeric whitelist cannot establish that a sentence preserved a fact.
+
+**Improve:** render the numerical clauses deterministically, or use a constrained structured
+response whose metric, value, unit, age, and provenance fields are checked individually
+before rendering. Keep model-written connective prose outside those fields. Add regression
+cases for swapped values, wrong units, counts used as values, missing values, and changed
+ages. More forbidden words alone will not repair this.
+
+### 74. Treat deletion of a Mac's mirror as a fallible operation
+
+**Evidence:** [MacMirrorService.swift](MacApp/Sources/MacMirrorService.swift), `unpair()` and
+`finishPairing`, ignore the Boolean returned by
+[HealthStore.clearMirror](Sources/Store/HealthStore.swift). `unpair()` can remove the key,
+leave all history intact after a database failure, and still return `true`. The UI says
+**“Unpair and Delete the Copy”**, but its failure alert only covers Keychain failure.
+Replacing a different phone's pairing similarly proceeds after a failed clear. When the
+old pairing could not be read, `previous == nil` also skips the different-phone check.
+
+**Improve:** stop and invalidate the old session first, then make pairing replacement and
+mirror erasure a recoverable operation with an explicit pending/error state. Do not claim
+the copy was deleted until the database transaction succeeds. Account for a Keychain update
+and SQLite erase being two separate durable operations: a crash between them needs a
+restart recovery path, not merely a different ordering.
+
+**Acceptance:** inject a failed clear during unpair and phone replacement, restart between
+each durable step, and confirm that the old history is neither silently retained under a
+new phone nor reported as deleted. Preserve an understandable retry action.
+
+### 75. Check receiver cancellation immediately before applying a batch
+
+**Evidence:** [MacMirrorSession.swift](Sources/MacSync/MacMirrorSession.swift),
+`MacMirrorReceiver.run`, checks cancellation at the top of its loop, then awaits receipt and
+off-main decoding before committing. There is no cancellation/session-generation check
+after those suspensions. [MacMirrorService](MacApp/Sources/MacMirrorService.swift) cancels
+the old task/channel when replacing a connection or unpairing, but the task tag only guards
+cleanup at the end; it does not guard database writes or progress callbacks.
+
+**Reproduction:** a controlled channel delivered the in-flight frame after cancelling the
+real receiver task and clearing its in-memory store. The receiver then committed the frame:
+the empty mirror contained **one reading** again. This isolates the receiver behavior; it
+does not establish how often that timing occurs on a real network.
+
+**Improve:** carry a service/session generation through the receiver and check it, together
+with task cancellation, immediately before each commit and UI callback. Drain the previous
+receiver before clearing or handing the store to a replacement. Apply the same generation
+discipline to pairing completion callbacks.
+
+**Acceptance:** hold decoding/receipt across unpair, replacement, and reconnect; release it
+afterwards and assert that obsolete work changes neither rows, cursor, sources, nor status.
+
+### 76. Make network cancellation close the actual connection
+
+**Evidence:** [MacMirrorTransport.swift](Sources/MacSync/MacMirrorTransport.swift),
+`open`, `send`, and `receive`, bridge callbacks with continuations but have no task
+cancellation handlers. Calling `Task.cancel()` alone does not cancel an `NWConnection`.
+[MacMirrorPublisher.suspend/forget](Sources/MacSync/MacMirrorPublisher.swift) cancel tasks,
+while the channel is local to the suspended task. The pairing client and Mac pairing window
+also cancel an exchange task without owning its channel. Before the confirmation phase,
+the exchange can be awaiting a peer frame with no cancellation handler. The TCP connection
+timeout is not a pairing-message or human-confirmation deadline.
+
+**Improve:** make each connection's lifetime belong to its task, close it on cancellation,
+and resume each continuation exactly once. Add bounded handshake, frame, acknowledgement,
+and pairing-confirmation waits with useful retry messages. Preserve idle sync waiting for
+changes; an established idle connection does not need an arbitrary whole-session timeout.
+
+**Acceptance:** cancel during connect, key exchange, confirmation, batch receipt, and ack.
+Both ends must finish promptly, disappear from active-session state, and allow an immediate
+retry. Include a peer that accepts TCP but never sends the next protocol frame.
+
+### 77. Make saved-session edits honest about durability
+
+**Evidence:** [ComparisonSessionStore.swift](Sources/Store/ComparisonSessionStore.swift)
+mutates `sessions` before awaiting `persist()`. A failed `save`, `remove`, or `noteViewed`
+does not roll memory back. [ComparisonSessionsView.swift](Sources/Views/ComparisonSessionsView.swift)
+discards deletion results, and the save sheet remains open after failure with a new UUID
+created on every retry.
+
+**Reproduction using the real store and its archive failure seam:** failed save returned
+`false` but left **1** session in memory and **0** after reload. Failed delete returned
+`false`, showed **0** in memory, and restored **1** after reload.
+
+**Improve:** serialize session mutations, durably write the proposed state before publishing
+it, or use a revision-aware rollback. Retain one draft ID while a save is retried; disable
+duplicate submissions; show deletion errors and a retry for an unreadable sessions archive.
+
+**Acceptance:** save/delete/view-note failures and concurrent edits must leave the visible
+list consistent with the stored archive. Retrying a failed save must create one session.
+
+### 78. A failed history read must not withdraw valid estimates
+
+**Evidence:** [DerivedEstimates.swift](Sources/Analysis/DerivedEstimates.swift) uses
+`HealthHistory.readings`, which converts read errors to empty arrays, and optional-shaped
+latest results. [StressModel.Baseline.build](Sources/Analysis/StressModel.swift) similarly
+accepts failed reads as empty evidence.
+[AppModel.recomputeDerivedMetrics/applyDerivedEstimates](Sources/App/AppModel.swift) then
+caches the result and reconciles existing estimates against its possibly empty keep sets.
+
+The harness supplied a loaded-but-unavailable `HealthHistory` to the real computation. It
+returned **zero readings and a newly built baseline**, with no error in the result. In the
+iPhone caller, that result can withdraw current HeartSync estimates and cache an empty or
+partial stress baseline for its six-hour lifetime. This is distinct from legitimately stale
+signals or exercise making a stress estimate unavailable.
+
+**Improve:** return explicit query outcomes from the computation and baseline builder.
+Preserve affected stored estimates, keep any usable previous baseline, and expose a retryable
+history error when required reads fail. Reconcile only metrics whose inputs were read
+successfully. Do not mark the current slot successfully processed on a read failure.
+
+**Acceptance:** inject failures separately into current signals and baseline/history reads.
+Assert no withdrawal caused solely by the failure, no six-hour poisoned baseline, and a
+successful recomputation once storage recovers.
+
+### 79. Do not publish query failures as an empty watch snapshot
+
+**Evidence:** [WatchSnapshotBuilder.makePayload](Sources/Watch/WatchSnapshotBuilder.swift)
+checks `loadState`, then calls `HealthHistory.latest` and `readings`. Those convenience
+methods discard query failures. A loaded store whose reads fail can therefore produce
+`.ready` with no metrics, or incomplete comparison data that looks like insufficient
+overlap. [WatchDashboardView](WatchApp/Sources/WatchDashboardView.swift) presents an empty
+ready snapshot as **“No readings yet”** and tells the user to connect a source. A new empty
+snapshot can also replace the previous complication values.
+
+**Reproduction:** the real builder, compiled from its unchanged source with the shared
+snapshot types, returned **`availability=ready, metrics=0`** for a loaded-but-unavailable
+history. This was a standalone logic check, not a WatchConnectivity delivery test.
+
+**Improve:** use outcome-returning queries throughout snapshot construction. If required
+queries fail, send an explicitly unavailable state or preserve a clearly labelled last
+successful snapshot; do not manufacture successful empty evidence. Avoid caching failed
+periods for the normal chart-refresh interval.
+
+**Acceptance:** after a successful publication, inject latest/range query failures and check
+the watch UI, complication projection, and subsequent recovery independently.
+
+### 80. Retire a brief when it no longer describes the cards
+
+**Evidence:** [DashboardView.refreshBrief](Sources/Views/DashboardView.swift) and
+[MacNowView.refreshBrief](MacApp/Sources/MacNowView.swift) leave the previous brief visible
+until another generation succeeds. Nil facts, unavailable Apple Intelligence, cancellation,
+or a rejected generation leave it unchanged. The three-minute throttle is intentional, but
+there is no expiry or current-facts check at display time. The fact key also omits estimate
+provenance and the agreeing-device count, though both appear in its sentences.
+
+**Improve:** separate generation throttling from permission to display old prose. Invalidate
+immediately when its metric, provenance, freshness category, or evidence count changes;
+otherwise show its age and bound its lifetime. Include those semantic fields in the key.
+An optional brief can disappear while regenerating without taking away any card.
+
+**Acceptance:** change measured to estimated, two agreeing devices to three, current to old,
+and available to unavailable; force generation failure and verify that obsolete present-tense
+claims do not remain indefinitely.
+
+### 81. Explain local-network discovery failures and offer retry
+
+**Evidence:** [MacMirrorPairingClient.start](Sources/MacSync/MacMirrorPairingClient.swift)
+sets browse-results handling but no browser state handler. Permission denial or a failed
+browser can leave the pairing sheet saying **“Looking for Macs…”** indefinitely.
+[MacMirrorPublisher.browserFailed](Sources/MacSync/MacMirrorPublisher.swift) clears the
+browser and records issues but schedules no retry; recovery depends on a later foreground
+resume. The Mac listener already has a delayed restart path.
+
+**Improve:** model searching, permission/restriction failure, network unavailable, and no
+results distinctly. Surface a retry/restart action and relevant Local Network guidance.
+Handle both `.waiting` and `.failed` where appropriate and use bounded backoff for automatic
+recovery while the app remains active. Do not promise that a particular error always proves
+permission denial.
+
+**Acceptance:** deny network access, restore it without relaunching, change Wi-Fi, and
+retry after a browser failure on both devices. Verify the words against real platform errors.
+
+### 82. Use the same unambiguous source labels in rows, charts, and speech
+
+**Observed on Mac:** the gallery legend distinguished **“Polar H10 (Bluetooth, Chest strap,
+right)”** and **“…left”**, but per-device statistics showed **“Polar H10”** twice and a pair
+row read **“A Polar H10 vs B Polar H10.”** Its accessibility description was also ambiguous.
+
+**Evidence:** [MetricDetailRows.swift](Sources/Views/MetricDetailRows.swift) uses raw
+`displayName`/`store.displayName`, while
+[MetricDetailView.legendEntries](Sources/Views/MetricDetailView.swift) uses the disambiguated
+series label. Watch source and pair labels are also based on the raw name in
+[WatchSnapshotBuilder](Sources/Watch/WatchSnapshotBuilder.swift).
+
+**Improve:** centralize a presentation label for the visible source set and reuse it in
+statistics, pair selection, chart readouts, and VoiceOver. Retain stable IDs as identity and
+keep the existing A/B sign convention. Aliases for Health/Oura remain useful product work
+from item 23; they do not replace automatic duplicate-name handling.
+
+**Acceptance:** two same-named Bluetooth devices, and a same-named Health/Oura pair, remain
+distinguishable without relying on colour or remembering a legend several screens away.
+
+### 83. Sweep abandoned exports on the Mac as well as the iPhone
+
+**Evidence:** [HeartSyncApp.swift](Sources/App/HeartSyncApp.swift) calls
+`ExportDirectory.sweep(createdBefore:)` at launch.
+[HeartSyncMacApp.swift](MacApp/Sources/HeartSyncMacApp.swift) does not, although the shared
+pairwise screen creates the same temporary export directories on Mac. Normal sheet dismissal
+cleans them; a crash or force quit can leave exported readings behind until the system
+eventually removes temporary files.
+
+**Improve:** run the existing bounded sweep from the Mac startup path, using the launch-time
+cutoff and keeping it off the main actor. Verify that Save and Share finish consuming files
+before ordinary dismissal cleanup.
+
+**Acceptance:** abandon a fixture export by ending the demo process, relaunch, and verify
+that only old HeartSync export directories are removed and an active export remains usable.
+
+### 84. Add a real Mac application test target
+
+**Evidence:** [project.yml](project.yml) defines hosted iOS unit/UI/performance bundles but
+no Mac test bundle. [CI](.github/workflows/ios.yml) builds the Mac and runs iOS tests.
+[MacMirrorTests.swift](Tests/MacMirrorTests.swift) usefully covers shared codecs, pairing,
+and sender/receiver sessions, including loopback TLS, but does not compile or exercise
+`MacApp/Sources/MacMirrorService.swift`, the Mac composition root, or the native export UI.
+
+**Improve:** add a small Mac test target and narrow injected seams for pairing storage,
+listeners/channels, and mirror erasure. Cover items 74–76 there. Add a short native UI smoke
+test for initial setup, navigation, export Save/Cancel, unavailable storage, and keyboard
+access. Keep most analysis tests shared rather than duplicating them.
+
+**Release gate:** complete [MacApp/README.md](MacApp/README.md)'s physical iPhone/Mac checklist
+and record actual device/OS/build, first-copy size and time, incremental recovery, and
+deletion/unpair results. A successful Mac build or loopback test does not complete that gate.
+
+### 85. Make no-data screens lead to the right next action
+
+**Evidence:** the initial [iPhone Now screen](Sources/Views/DashboardView.swift) lists ways
+to add data but offers no setup action. With sources but no recent metrics, it says the
+devices are connected even though that branch does not inspect connection/paused state.
+The initial [Mac Now screen](MacApp/Sources/MacNowView.swift) tells the reader to choose
+iPhone Sync in the sidebar without a direct pairing action.
+
+**Product proposal:** add a primary setup action from each empty dashboard. On iPhone, lead
+with Apple Health and Bluetooth, keeping the advanced Oura setup clearly optional. Distinguish
+paused sources, disconnected sensors, old history, and a source genuinely waiting for its
+first reading; offer Resume, Reconnect, View history, or setup as appropriate. Reuse the
+existing transport actions and navigation rather than creating a second onboarding state.
+
+**Acceptance:** a fresh install reaches a useful setup screen in one action; an existing
+offline source is never described as connected merely because it remains in the source list.
+
+### 86. Keep the watch's first screen focused on a quick reading
+
+**Evidence:** [WatchDashboardView](WatchApp/Sources/WatchDashboardView.swift) puts Compare,
+Sync all sources, and every line of the last sync report before its readings. A sync report
+persists after completion. This is a code-derived layout concern, not a completed small-watch
+or physical-device usability test.
+
+**Product proposal:** try a compact sync status with expandable details, or move completed
+report details below the readings, while keeping refresh and comparison easy to reach.
+Retain all per-transport outcomes and the distinction between a sync reply and the later
+snapshot. Measure how much scrolling it takes to reach heart rate on a 40 mm watch at large
+text sizes before deciding on the final arrangement. Keep the watch display-only.
+
+### 87. Finish the Mac interaction vocabulary
+
+**Observed on Mac:** metric detail instructs the reader to **“lift your finger”** and
+**“touch empty chart area”**. Shared analysis is valuable, but its instructions still describe
+the phone interaction. [MetricDetailView.swift](Sources/Views/MetricDetailView.swift) owns
+that copy; [HeartSyncMacApp.swift](MacApp/Sources/HeartSyncMacApp.swift) currently adds no
+app-specific navigation commands.
+
+**Product proposal:** use platform-appropriate click/drag language, add discoverable keyboard
+navigation and export shortcuts, and verify focus/selection through the metric and pair
+charts. Keep data semantics, chart projections, and accessibility descriptions shared.
+Test narrow windows and increased text size before changing the existing minimum window
+size. This can be an incremental Mac polish pass.
+
+### Validation and limits of this review
+
+- Generated the project with XcodeGen and built using Xcode **27.2 (27B48)**. The Mac Debug
+  build with Swift warnings treated as errors succeeded, signed ad hoc for the walkthrough.
+- Launched the Mac with **`--mirror-demo`** and inspected Now, Compare, heart-rate detail,
+  and iPhone Sync through the native accessibility tree and dashboard screenshot. The demo
+  uses synthetic in-memory readings and starts no sync listener. The duplicate-name and
+  phone-specific-copy observations above come from that walkthrough.
+- The iOS test command completed compilation of the app, hosted unit/UI bundles, embedded
+  watch app, and complication extension. Its first execution attempt failed preparing the
+  newly created iPhone simulator: **“Timed out trying to boot simulator after waiting
+  60.00s.”** The retry stalled before recording any test cases and was interrupted after
+  more than eight minutes. Watch simulator installation/launch commands also stalled and
+  were stopped. **No hosted unit/UI test pass or iOS/watch UI walkthrough is claimed.**
+  Simulator services were not reset. Do not read build completion as a passing test suite.
+- Temporary checks in `/tmp` linked against the actual built Mac module, using synthetic
+  values and the existing write-failure seam. They reproduced item 73's three accepted bad
+  drafts, item 77's save/delete memory-versus-disk mismatch, item 75's post-cancellation
+  commit, item 79's false-ready empty watch snapshot, and item 78's empty derived result/fresh
+  baseline from unavailable history. For item 79, the unchanged watch builder and shared
+  payload source were compiled into the harness because they are not part of the Mac target.
+  The controlled receiver check tests application logic, not live network race frequency.
+- Xcode's App Intents metadata tool emitted its **“Metadata extraction skipped, no
+  AppIntents.framework dependency found”** warning for targets without App Intents. No new
+  source warnings were introduced; no implementation files were edited.
+- No physical iPhone/watch/ring, live Oura account, Local Network/TCC pairing, HealthKit
+  authorization/background delivery, real complication delivery, energy profile, or
+  representative-device performance workload was exercised. The existing release checklists
+  remain necessary. Current remote CI status was not queried.
+- The pre-existing `Resources/Localizable.xcstrings` worktree change was preserved. This
+  review changes only this roadmap; previous completion/CI claims below are historical.
+
+## Previous status snapshot: items 1–72 (checked 2026-10-21)
 
 Every numbered item, 1–72, has been implemented, removed, or superseded. Each review's
 "Left" notes were checked against `main` at commit `d99146e`. This is what remains.

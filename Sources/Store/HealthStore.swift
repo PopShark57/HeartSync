@@ -82,7 +82,21 @@ extension HealthStoreQueryOutcome where Value: RangeReplaceableCollection {
 final class HealthStore {
     private let logger = Logger(subsystem: "com.heartsync.HeartSyncChecker", category: "Store")
 
-    private(set) var sources: [DataSource] = []
+    private(set) var sources: [DataSource] = [] {
+        didSet {
+            let projection = sources.map { source in
+                var value = source
+                value.batteryPercent = nil
+                value.batteryIsCharging = nil
+                value.lastSeenAt = nil
+                return value
+            }
+            if projection != analysisSources { analysisSources = projection }
+        }
+    }
+    /// Collection metadata does not invalidate projections that only analyse measurements.
+    private(set) var analysisSources: [DataSource] = []
+    private(set) var sourceMetadataIssue: String?
     private var dataGeneration = 0
     /// Observed invalidation token for bounded external display projections.
     var changeToken: Int { dataGeneration }
@@ -187,7 +201,7 @@ final class HealthStore {
     /// observes the same state the store's own queries observe.
     var history: HealthHistory {
         HealthHistory(
-            sources: sources,
+            sources: analysisSources,
             changeToken: dataGeneration,
             removalGeneration: removalGeneration,
             recentRemovals: recentRemovals,
@@ -279,8 +293,9 @@ final class HealthStore {
                     ? "Multiple reported devices: \(known.sorted().joined(separator: ", "))"
                     : known.first ?? existing.model
             }
-            existing.upstreamDeviceRelationshipID = source.upstreamDeviceRelationshipID
-                ?? existing.upstreamDeviceRelationshipID
+            if existing.relationshipIsUserChosen != true {
+                existing.upstreamDeviceRelationshipID = source.upstreamDeviceRelationshipID ?? existing.upstreamDeviceRelationshipID
+            }
             existing.identifiesHealthKitWriter = source.identifiesHealthKitWriter
                 ?? existing.identifiesHealthKitWriter
             if let types = source.writerProductTypes {
@@ -382,8 +397,9 @@ final class HealthStore {
         }
     }
 
-    func updateBattery(_ percent: Int, isCharging: Bool? = nil, forSource id: String) {
-        mutateSource(id) {
+    @discardableResult
+    func updateBattery(_ percent: Int, isCharging: Bool? = nil, forSource id: String) -> SourceMutationResult {
+        metadataMutation(id) {
             $0.batteryPercent = percent
             $0.batteryIsCharging = isCharging
             $0.lastSeenAt = .now
@@ -394,13 +410,44 @@ final class HealthStore {
         mutateSource(id) { $0.bodyLocation = location }
     }
 
-    func markSeen(sourceID: String, at date: Date = .now) {
-        guard let date = boundedLastSeen(date) else { return }
-        mutateSource(sourceID) { $0.lastSeenAt = date }
+    @discardableResult
+    func markSeen(sourceID: String, at date: Date = .now) -> SourceMutationResult {
+        guard let date = boundedLastSeen(date) else { return .unchanged }
+        return metadataMutation(sourceID) { $0.lastSeenAt = date }
+    }
+
+    private func metadataMutation(_ id: String, mutation: (inout DataSource) -> Void) -> SourceMutationResult {
+        let result = mutateSource(id, affectsAnalysis: false, mutation: mutation)
+        if case .failed(let detail) = result { sourceMetadataIssue = detail }
+        else { sourceMetadataIssue = nil }
+        return result
+    }
+
+    /// Relationships affect warning language only; this never merges sources or readings.
+    @discardableResult
+    func setRelationship(sourceID: String, sameDeviceAs relatedID: String?) -> SourceMutationResult {
+        guard let index = sources.firstIndex(where: { $0.id == sourceID }) else { return .unchanged }
+        var proposed = sources
+        if let relatedID {
+            guard let other = proposed.firstIndex(where: { $0.id == relatedID }), other != index else { return .unchanged }
+            let key = proposed[other].upstreamDeviceRelationshipID.flatMap { $0.isEmpty ? nil : $0 }
+                ?? "user.device.\(min(sourceID, relatedID))"
+            proposed[index].upstreamDeviceRelationshipID = key
+            proposed[other].upstreamDeviceRelationshipID = key
+            proposed[other].relationshipIsUserChosen = true
+        } else { proposed[index].upstreamDeviceRelationshipID = "" }
+        proposed[index].relationshipIsUserChosen = true
+        guard proposed != sources else { return .unchanged }
+        if persistenceEnabled, loadState != .loaded { return .failed(Self.notLoadedDetail) }
+        let changed = proposed.filter { candidate in sources.first(where: { $0.id == candidate.id }) != candidate }
+        if let detail = persistSourcesIfReady(changed) { return .failed(detail) }
+        sources = proposed
+        dataGeneration &+= 1
+        return .applied
     }
 
     @discardableResult
-    private func mutateSource(_ id: String, mutation: (inout DataSource) -> Void) -> SourceMutationResult {
+    private func mutateSource(_ id: String, affectsAnalysis: Bool = true, mutation: (inout DataSource) -> Void) -> SourceMutationResult {
         guard let index = sources.firstIndex(where: { $0.id == id }) else { return .unchanged }
         var updated = sources[index]
         mutation(&updated)
@@ -408,7 +455,7 @@ final class HealthStore {
         if persistenceEnabled, loadState != .loaded { return .failed(Self.notLoadedDetail) }
         if let detail = persistSourcesIfReady([updated]) { return .failed(detail) }
         sources[index] = updated
-        dataGeneration &+= 1
+        if affectsAnalysis { dataGeneration &+= 1 }
         return .applied
     }
 

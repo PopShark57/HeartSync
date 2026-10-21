@@ -292,6 +292,32 @@ struct AppModelDerivedMetricTests {
         #expect(estimate?.provenance == .estimated)
         #expect(estimate?.metadata?.modelledBy == ReadingMetadata.heartSyncModel)
     }
+    @Test("History failure preserves estimates and leaves the slot retryable")
+    func failedHistoryDoesNotWithdrawEstimates() async throws {
+        let model = makeModel()
+        model.settings.snapshot.vo2MaxEstimateEnabled = true
+        model.settings.profile.birthDate = Calendar.current.date(byAdding: .year, value: -40, to: .now)
+        model.settings.snapshot.bloodPressureIndexEnabled = true
+        model.settings.profile.bpCalibration = UserProfile.BPCalibration(systolic: 120, diastolic: 80, referenceRestingHR: 60, referenceRMSSD: 40, takenAt: .now)
+        model.ensureEstimateSourceExists()
+        model.store.upsert(DataSource(id: "strap", displayName: "Strap", transport: .bluetooth))
+        let stamp = Date.now.addingTimeInterval(-30)
+        let previous = [MetricKind.stress, .bloodPressureSystolic, .bloodPressureDiastolic, .vo2Max].map { kind in
+            Reading(sourceID: kind == .vo2Max ? "strap" : AppModel.estimateSourceID, kind: kind,
+                    value: kind == .bloodPressureSystolic ? 120 : kind == .bloodPressureDiastolic ? 80 : 42,
+                    start: stamp, provenance: .estimated, metadata: ReadingMetadata(modelledBy: ReadingMetadata.heartSyncModel))
+        }
+        model.store.append(contentsOf: previous)
+        model.store.injectQueryFailureForTesting()
+        await model.recomputeDerivedMetrics()
+        #expect(model.derivedHistoryIssue != nil)
+        model.store.injectQueryFailureForTesting(false)
+        #expect(Set(model.store.readings.map(\.id)) == Set(previous.map(\.id)))
+        let retry = try #require(model.scoreCurrentSlotIfDue())
+        await retry.value
+        #expect(model.derivedHistoryIssue == nil)
+    }
+
 }
 
 @Suite("AppModel refresh and Oura rate limits")

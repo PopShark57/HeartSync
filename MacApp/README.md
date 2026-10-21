@@ -37,7 +37,16 @@ deletes is deleted on the Mac at the next sync.
   two seconds. Backgrounding ends the session; the Mac keeps its position.
 
 A Mac mirrors one iPhone. Pairing a different iPhone deletes the copy first; unpairing
-deletes it. The iPhone can pair several Macs.
+deletes it. A pairing change is recorded in the Keychain before the mirror is erased. If
+SQLite erasure or the final Keychain write fails, sync stops and iPhone Sync offers a retry.
+Startup completes a pending erase before accepting another phone's history. The existing
+array-form pairing records remain readable. The iPhone can pair several Macs.
+
+Every stopped receiver is invalidated and drained before its store is cleared or handed to
+a replacement. Connection setup has a 15-second deadline; protocol frames, sends and
+acknowledgements have 30 seconds; code confirmation has two minutes. Cancellation closes
+the underlying connection. An established connection waiting for new history has no idle
+whole-session deadline.
 
 Not mirrored: Oura's dashboard cache (sleep stages, scores), live Bluetooth state such as
 streaming and HRV quality, the iPhone's settings, and its saved sessions. The Mac's
@@ -63,6 +72,21 @@ open /tmp/HeartSyncMac-Run/Build/Products/Debug/HeartSync.app
 
 `--mirror-demo` (Debug) fills an in-memory mirror with the chart gallery's month of data and
 starts no listener: `open …/HeartSync.app --args --mirror-demo`.
+
+The `HeartSyncMac` scheme includes native unit and UI smoke tests. Run them with local ad-hoc
+signing (the UI runner needs a runnable signature and macOS automation authorization):
+
+```sh
+xcodebuild test -project HeartSyncChecker.xcodeproj -scheme HeartSyncMac \
+  -destination 'platform=macOS' -derivedDataPath /tmp/HeartSyncMac-Tests \
+  -parallel-testing-enabled NO \
+  SWIFT_TREAT_WARNINGS_AS_ERRORS=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=
+```
+
+Navigate offers Command-1 (Now), Command-2 (Compare), Command-3 (Devices), and Command-4
+(iPhone Sync). In a pair detail, Shift-Command-E opens export. Save uses the native destination
+picker; Cancel keeps the prepared export available until the export sheet is dismissed.
+Launch sweeps only HeartSync export folders from before that launch, off the main actor.
 
 The App ID is `com.heartsync.HeartSyncChecker.mac` under team `7RLDYXQTNX`. It is sandboxed
 with the incoming and outgoing network entitlements and user-selected file access (Save in the

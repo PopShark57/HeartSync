@@ -129,6 +129,8 @@ struct DataSource: Identifiable, Codable, Hashable, Sendable {
     /// re-reports its own name on every sync, which would undo the user's alias. Optional
     /// keeps older source archives backward-decodable.
     var displayNameIsUserChosen: Bool?
+    /// Optional for archives predating user-confirmed source relationships.
+    var relationshipIsUserChosen: Bool?
 
     init(
         id: String,

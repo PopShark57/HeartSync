@@ -18,9 +18,9 @@ struct NowBriefView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Label {
                 #if os(macOS)
-                Text("Written on this Mac by Apple Intelligence from the readings below, \(generatedAt, style: .time). Not medical advice.")
+                Text("From the readings below, selected on this Mac by Apple Intelligence at \(generatedAt, style: .time). Not medical advice.")
                 #else
-                Text("Written on this iPhone by Apple Intelligence from the readings below, \(generatedAt, style: .time). Not medical advice.")
+                Text("From the readings below, selected on this iPhone by Apple Intelligence at \(generatedAt, style: .time). Not medical advice.")
                 #endif
             } icon: {
                 Image(systemName: "sparkles")
@@ -37,6 +37,8 @@ struct NowBriefView: View {
 
 /// One source in the Sources header, with a status it can support.
 struct SourceChip: View {
+    @Environment(AppModel.self) private var model
+    private var sourceName: String { SourceLabels.name(for: source.id, in: model.store.enabledSources) }
     var source: DataSource
     var status: SourceChipStatus
     var now: Date
@@ -45,7 +47,7 @@ struct SourceChip: View {
         let title = status.title(relativeTo: now)
         HStack(spacing: 6) {
             SourceDot(color: source.color, size: 8)
-            Text(source.displayName)
+            Text(sourceName)
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
             Text(title)
@@ -66,7 +68,7 @@ struct SourceChip: View {
     }
 
     private func accessibilityText(_ title: String) -> String {
-        var parts = [source.displayName, title.lowercased()]
+        var parts = [sourceName, title.lowercased()]
         if let battery = source.batteryPercent {
             parts.append(BatteryBadge.spoken(percent: battery, isCharging: source.batteryIsCharging ?? false).lowercased())
         }

@@ -46,18 +46,40 @@ enum MacMirrorPairingStore {
         case unavailable
     }
 
-    static func load() -> Outcome {
+    /// A single Keychain item journals the operation before SQLite is erased. Old array
+    /// records still decode; a pending operation is never exposed as an active pairing.
+    struct PendingChange: Codable, Equatable, Sendable {
+        var replacement: MacMirrorPairingRecord?
+    }
+    struct State: Codable, Equatable, Sendable {
+        var records: [MacMirrorPairingRecord]
+        var pending: PendingChange? = nil
+    }
+
+    static func loadState() -> State? {
         switch Keychain.lookup(.macMirrorPairings) {
         case .found(let text):
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            // An undecodable value is treated as none, as a corrupt Oura credential is.
-            return .records((try? decoder.decode([MacMirrorPairingRecord].self, from: Data(text.utf8))) ?? [])
-        case .notFound:
-            return .records([])
-        case .unavailable:
-            return .unavailable
+            let data = Data(text.utf8)
+            if let state = try? decoder.decode(State.self, from: data) { return state }
+            if let records = try? decoder.decode([MacMirrorPairingRecord].self, from: data) { return State(records: records) }
+            return nil // Unknown bytes must never authorize a replacement over old history.
+        case .notFound: return State(records: [])
+        case .unavailable: return nil
         }
+    }
+
+    static func saveState(_ state: State) -> Bool {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(state), let text = String(data: data, encoding: .utf8) else { return false }
+        return Keychain.set(text, for: .macMirrorPairings)
+    }
+
+    static func load() -> Outcome {
+        guard let state = loadState(), state.pending == nil else { return .unavailable }
+        return .records(state.records)
     }
 
     @discardableResult

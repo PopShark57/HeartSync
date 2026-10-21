@@ -10,6 +10,8 @@ import SwiftUI
 /// cannot contradict each other about the same devices at the same moment.
 struct DashboardView: View {
     @Environment(AppModel.self) private var model
+    var openSetup: () -> Void = {}
+    var openHistory: () -> Void = {}
     @State private var now = Date.now
     /// Resolved off the render path. It used to be rebuilt inside `body`, and `body` re-ran
     /// on every Bluetooth reading, so one 1 Hz strap re-read the store once a second on the
@@ -20,15 +22,14 @@ struct DashboardView: View {
     /// Bumped by the retry button so the load key changes and the query runs again.
     @State private var retryToken = 0
     /// The on-device summary above the cards, with the facts it was written from.
-    @State private var brief: GeneratedBrief?
+    @State private var brief: NowBriefDisplay?
+    @State private var lastBriefAttempt: Date?
 
-    private struct GeneratedBrief: Equatable {
-        var text: String
-        var key: String
-        var generatedAt: Date
+    private struct BriefRequest: Hashable {
+        var facts: NowBriefFacts?
+        var period: Int
     }
 
-    /// A new brief is asked for at most this often, however the readings move.
     private static let briefInterval: TimeInterval = 180
 
     /// Clock for the freshness cutoff, not for the timestamps.
@@ -52,11 +53,14 @@ struct DashboardView: View {
         NavigationStack {
             Group {
                 if model.store.sources.isEmpty {
-                    EmptyStateView(
-                        systemImage: "sensor.tag.radiowaves.forward",
-                        title: "No devices yet",
-                        message: "Add a Bluetooth sensor, connect Apple Health, or link your Oura account to start collecting readings."
-                    )
+                    ContentUnavailableView {
+                        Label("No devices yet", systemImage: "sensor.tag.radiowaves.forward")
+                    } description: {
+                        Text("Start with Apple Health for your Watch, or add a Bluetooth sensor. Oura setup is optional.")
+                    } actions: {
+                        Button("Set up Apple Health or Bluetooth", action: openSetup)
+                            .accessibilityIdentifier("now.setup")
+                    }
                 } else if let snapshot {
                     if let failure = snapshot.queryFailure, snapshot.metrics.isEmpty {
                         // A failed read is not "waiting for data": that would be a claim
@@ -66,17 +70,34 @@ struct DashboardView: View {
                                 .accessibilityIdentifier("now.unavailable")
                         }
                     } else if snapshot.metrics.isEmpty {
-                        EmptyStateView(
-                            systemImage: "hourglass",
-                            title: "Waiting for data",
-                            message: "Your devices are connected but haven't reported anything yet. Wearables often take a minute to start streaming."
-                        )
+                        ContentUnavailableView {
+                            Label(emptyTitle, systemImage: "hourglass")
+                        } description: {
+                            Text(emptyMessage)
+                        } actions: {
+                            Button("Manage sources", action: openSetup)
+                            Button("View history", action: openHistory)
+                            if model.store.enabledSources.isEmpty {
+                                Button("Resume sources") {
+                                    for source in model.store.sources { _ = model.store.setEnabled(true, forSource: source.id) }
+                                    model.bluetooth.reconnectKnownDevices()
+                                    Task { await model.refresh() }
+                                }
+                            } else if model.store.enabledSources.contains(where: { $0.transport == .bluetooth }) {
+                                Button("Reconnect sensors") { model.bluetooth.reconnectKnownDevices() }
+                            }
+                        }
                     } else {
                         let facts = NowBriefFacts.build(metrics: snapshot.metrics, stressBand: stressBand, now: now)
                         ScrollView {
                             VStack(alignment: .leading, spacing: 16) {
-                                if let brief {
+                                if let brief, brief.isValid(for: facts, now: now, available: NowBriefGenerator.isAvailable) {
                                     NowBriefView(text: brief.text, generatedAt: brief.generatedAt)
+                                }
+                                if let issue = model.derivedHistoryIssue {
+                                    Label(issue, systemImage: "exclamationmark.triangle")
+                                        .font(.caption).foregroundStyle(.orange)
+                                    Button("Retry estimates") { Task { await model.recomputeDerivedMetrics() } }
                                 }
                                 sourcesHeader
                                 // One column on iPhone; as many 320-point columns as fit on
@@ -100,7 +121,7 @@ struct DashboardView: View {
                             .padding(.bottom, 24)
                         }
                         // Keyed by what the brief would say, not by every reading.
-                        .task(id: facts?.key) { await refreshBrief(facts) }
+                        .task(id: BriefRequest(facts: facts, period: Int(now.timeIntervalSince1970 / Self.briefInterval))) { await refreshBrief(facts) }
                     }
                 } else {
                     ProgressView()
@@ -153,19 +174,36 @@ struct DashboardView: View {
         }
     }
 
+    private var emptyTitle: String {
+        model.store.enabledSources.isEmpty ? "Sources are paused" : "No recent readings"
+    }
+
+    private var emptyMessage: String {
+        if model.store.enabledSources.isEmpty { return "Resume collection when you are ready. Your saved history is still available." }
+        let sensors = model.store.enabledSources.filter { $0.transport == .bluetooth }
+        if sensors.contains(where: { !model.bluetooth.connectionState(forSource: $0.id).isActive }) {
+            return "A Bluetooth sensor is disconnected. Bring it nearby and reconnect, or open your saved history."
+        }
+        if (model.store.readingCountOutcome.value ?? 0) > 0 { return "Your recent cards are empty. Open Compare to browse older history, or manage your sources." }
+        return "Waiting for the first reading. Check source status and import progress in Devices."
+    }
+
     private var stressBand: StressModel.Band? {
         guard case .success(let assessment) = model.stress else { return nil }
         return assessment.band
     }
 
     /// Asks the on-device model for a new brief when the facts changed, no more often than
-    /// `briefInterval`. Until a new one is accepted the previous brief stays, with its time.
+    /// `briefInterval`. Obsolete prose loses display permission immediately.
     private func refreshBrief(_ facts: NowBriefFacts?) async {
-        guard let facts, facts.key != brief?.key, NowBriefGenerator.isAvailable else { return }
-        let wait = brief.map { max(2, Self.briefInterval - Date.now.timeIntervalSince($0.generatedAt)) } ?? 1
-        try? await Task.sleep(for: .seconds(wait))
-        guard !Task.isCancelled, let text = await NowBriefGenerator.generate(facts), !Task.isCancelled else { return }
-        brief = GeneratedBrief(text: text, key: facts.key, generatedAt: .now)
+        if brief?.isValid(for: facts, now: .now, available: NowBriefGenerator.isAvailable) != true { brief = nil }
+        guard let facts, NowBriefGenerator.isAvailable else { return }
+        let wait = lastBriefAttempt.map { max(1, Self.briefInterval - Date.now.timeIntervalSince($0)) } ?? 1
+        do { try await Task.sleep(for: .seconds(wait)) } catch { return }
+        guard !Task.isCancelled else { return }
+        lastBriefAttempt = .now
+        guard let text = await NowBriefGenerator.generate(facts), !Task.isCancelled else { return }
+        brief = NowBriefDisplay(text: text, facts: facts, generatedAt: .now)
     }
 
     /// What moved the current stress level most, when the latest assessment scored.

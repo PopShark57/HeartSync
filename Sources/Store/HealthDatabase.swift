@@ -570,6 +570,24 @@ final class HealthDatabase {
         ).first
     }
 
+    /// One grouped request, with an indexed seek per source/metric. It decodes only the
+    /// winning rows, rather than scanning and ranking a month of high-frequency history.
+    func latestReadings(sourceIDs: Set<String>) throws -> [Reading] {
+        guard !sourceIDs.isEmpty else { return [] }
+        let pairs = sourceIDs.sorted().flatMap { id in MetricKind.allCases.map { (id, $0.rawValue) } }
+        let values = Array(repeating: "(?, ?)", count: pairs.count).joined(separator: ",")
+        let bindings = pairs.flatMap { [Binding.text($0.0), .text($0.1)] }
+        return try readingRows(
+            """
+            WITH wanted(source_id, kind) AS (VALUES \(values))
+            SELECT \(Self.readingColumns) FROM readings WHERE rowid IN (
+                SELECT (SELECT rowid FROM readings r WHERE r.source_id = wanted.source_id
+                    AND r.kind = wanted.kind ORDER BY r.end DESC, r.rowid DESC LIMIT 1) FROM wanted
+            )
+            """, bindings: bindings
+        )
+    }
+
     /// Stored rows and the earliest observation for one source, answered from the
     /// `(source_id, midpoint)` index without decoding a payload. This is exactly the set
     /// `removeSource(id:)` deletes, so a confirmation can state it before anything happens.

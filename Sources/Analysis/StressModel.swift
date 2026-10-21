@@ -142,26 +142,26 @@ enum StressModel {
             return (mean, sd)
         }
 
-        /// Reads history once and summarises it. A failed read leaves that part empty; the
-        /// assessment then has less evidence and says so through its confidence.
+        /// Reads and summarises history. A failed query throws so callers keep their last
+        /// usable baseline instead of caching missing evidence for six hours.
         static func build(
             history: HealthHistory,
             now: Date,
             estimateSourceID: String,
             timeZone: TimeZone = .current
-        ) -> Baseline {
+        ) throws -> Baseline {
             let utcOffset = timeZone.secondsFromGMT(for: now)
             var baseline = Baseline(builtAt: now, utcOffset: utcOffset)
             let month = DateInterval(start: now.addingTimeInterval(-hrvSpan), end: now)
 
-            func usable(_ kind: MetricKind) -> [Reading] {
-                history.readings(kind: kind, in: month).filter {
+            func usable(_ kind: MetricKind) throws -> [Reading] {
+                try history.readingsOutcome(kind: kind, in: month).get().filter {
                     $0.sourceID != estimateSourceID && $0.metadata?.modelledBy == nil && $0.isPlausible
                 }
             }
 
             for kind in [MetricKind.hrvRMSSD, .hrvSDNN] {
-                let bySource = Dictionary(grouping: usable(kind).filter { $0.value > 0 }, by: \.sourceID)
+                let bySource = Dictionary(grouping: try usable(kind).filter { $0.value > 0 }, by: \.sourceID)
                 for (sourceID, readings) in bySource {
                     if let robust = Robust(readings.map { log($0.value) }) {
                         baseline.hrv[HRVKey(sourceID: sourceID, kind: kind)] = robust
@@ -170,18 +170,18 @@ enum StressModel {
             }
 
             let hourRange = DateInterval(start: now.addingTimeInterval(-heartRateSpan), end: now)
-            baseline.heartRateByHour = history.hourOfDayMomentsOutcome(
+            baseline.heartRateByHour = try history.hourOfDayMomentsOutcome(
                 kind: .heartRate,
                 range: hourRange,
                 utcOffset: utcOffset,
                 maximumDuration: MetricKind.heartRate.comparisonWindow
-            ).value ?? [:]
+            ).get()
 
-            let resting = usable(.restingHeartRate).map(\.value)
+            let resting = try usable(.restingHeartRate).map(\.value)
             baseline.restingHeartRate = Robust(resting, minimumCount: 3)?.median
-            baseline.respiratoryRate = Robust(usable(.respiratoryRate).filter { $0.provenance != .estimated }.map(\.value))
-            baseline.spo2 = Robust(usable(.spo2).filter { $0.provenance != .estimated }.map(\.value))
-            for (sourceID, readings) in Dictionary(grouping: usable(.bodyTemperature), by: \.sourceID) {
+            baseline.respiratoryRate = Robust(try usable(.respiratoryRate).filter { $0.provenance != .estimated }.map(\.value))
+            baseline.spo2 = Robust(try usable(.spo2).filter { $0.provenance != .estimated }.map(\.value))
+            for (sourceID, readings) in Dictionary(grouping: try usable(.bodyTemperature), by: \.sourceID) {
                 if let robust = Robust(readings.map(\.value)) { baseline.temperature[sourceID] = robust }
             }
             return baseline
@@ -363,14 +363,14 @@ enum StressModel {
         estimateSourceID: String,
         previous: (score: Double, at: Date)? = nil,
         timeZone: TimeZone = .current
-    ) -> Result<Assessment, Unavailable> {
-        let recent = { (kind: MetricKind, age: TimeInterval) -> [Reading] in
-            history.readings(kind: kind, in: DateInterval(start: now.addingTimeInterval(-age), end: now.addingTimeInterval(60)))
+    ) throws -> Result<Assessment, Unavailable> {
+        let recent = { (kind: MetricKind, age: TimeInterval) throws -> [Reading] in
+            try history.readingsOutcome(kind: kind, in: DateInterval(start: now.addingTimeInterval(-age), end: now.addingTimeInterval(60))).get()
                 .filter { $0.sourceID != estimateSourceID && $0.metadata?.modelledBy == nil && $0.isPlausible }
         }
 
         // Current heart rate: the consensus of the newest comparison window, across devices.
-        let heartRateReadings = recent(.heartRate, heartRateMaxAge)
+        let heartRateReadings = try recent(.heartRate, heartRateMaxAge)
         let heartRate = ComparisonEngine.windows(from: heartRateReadings, kind: .heartRate).last?.consensus
             ?? heartRateReadings.filter { $0.provenance != .estimated }.max { $0.end < $1.end }?.value
 
@@ -395,7 +395,7 @@ enum StressModel {
         var hrvFreshness = 0.0
         var bestHRVFreshness = 0.0
         for (kind, maxAge) in [(MetricKind.hrvRMSSD, rmssdMaxAge), (.hrvSDNN, sdnnMaxAge)] {
-            let latest = Dictionary(grouping: recent(kind, maxAge).filter { $0.value > 0 }, by: \.sourceID)
+            let latest = Dictionary(grouping: try recent(kind, maxAge).filter { $0.value > 0 }, by: \.sourceID)
                 .compactMapValues { $0.max { $0.end < $1.end } }
             for (sourceID, reading) in latest {
                 guard let robust = baseline.hrv[HRVKey(sourceID: sourceID, kind: kind)] else { continue }
@@ -436,7 +436,7 @@ enum StressModel {
 
         // 3. Respiration.
         if let robust = baseline.respiratoryRate,
-           let reading = recent(.respiratoryRate, respirationMaxAge).filter({ $0.provenance != .estimated }).max(by: { $0.end < $1.end }) {
+           let reading = try recent(.respiratoryRate, respirationMaxAge).filter({ $0.provenance != .estimated }).max(by: { $0.end < $1.end }) {
             let fresh = freshness(age: now.timeIntervalSince(reading.end), maxAge: respirationMaxAge)
             components.append(Component(
                 signal: .respiration,
@@ -446,7 +446,7 @@ enum StressModel {
         }
 
         // 4. Temperature: a rise only, against each source's own level.
-        let temperatures = Dictionary(grouping: recent(.bodyTemperature, temperatureMaxAge), by: \.sourceID)
+        let temperatures = Dictionary(grouping: try recent(.bodyTemperature, temperatureMaxAge), by: \.sourceID)
             .compactMapValues { $0.max { $0.end < $1.end } }
         let thermal = temperatures.compactMap { sourceID, reading -> (z: Double, fresh: Double)? in
             guard let robust = baseline.temperature[sourceID] else { return nil }
@@ -459,7 +459,7 @@ enum StressModel {
 
         // 5. SpO2: a fall only.
         if let robust = baseline.spo2,
-           let reading = recent(.spo2, spo2MaxAge).filter({ $0.provenance != .estimated }).max(by: { $0.end < $1.end }) {
+           let reading = try recent(.spo2, spo2MaxAge).filter({ $0.provenance != .estimated }).max(by: { $0.end < $1.end }) {
             let fresh = freshness(age: now.timeIntervalSince(reading.end), maxAge: spo2MaxAge)
             components.append(Component(
                 signal: .oxygenation,

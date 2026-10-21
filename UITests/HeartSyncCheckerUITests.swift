@@ -61,6 +61,15 @@ final class HeartSyncCheckerUITests: XCTestCase {
         return chart
     }
 
+    func testNowSetupIsOneAction() {
+        let application = launch("empty")
+        let setup = application.buttons["now.setup"]
+        XCTAssertTrue(setup.waitForExistence(timeout: 5))
+        setup.tap()
+        XCTAssertTrue(application.navigationBars["Devices"].waitForExistence(timeout: 5))
+        XCTAssertTrue(scrollToElement(application.buttons["Connect Apple Health"], in: application))
+    }
+
     override func tearDownWithError() throws {
         // A test that rotated the device must not leave the next one in landscape. The device
         // object is main-actor isolated; XCTest runs UI-test teardown on the main thread. The

@@ -277,6 +277,34 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         COMBINE_HIDPI_IMAGES: YES
 
+  HeartSyncMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: MacTests
+      - path: Tests/MacMirrorTests.swift
+    dependencies:
+      - target: HeartSyncMac
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.heartsync.HeartSyncMacTests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/HeartSync.app/Contents/MacOS/HeartSync"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+  HeartSyncMacUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: MacUITests
+    dependencies:
+      - target: HeartSyncMac
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.heartsync.HeartSyncMacUITests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: HeartSyncMac
+
   HeartSyncCheckerTests:
     type: bundle.unit-test
     platform: iOS
@@ -325,6 +353,12 @@ schemes:
     build:
       targets:
         HeartSyncMac: all
+        HeartSyncMacTests: [test]
+        HeartSyncMacUITests: [test]
+    test:
+      targets:
+        - HeartSyncMacTests
+        - HeartSyncMacUITests
 
   HeartSyncWatch:
     build:

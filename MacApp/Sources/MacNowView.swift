@@ -10,17 +10,18 @@ import SwiftUI
 /// from the phone instead.
 struct MacNowView: View {
     @Environment(AppModel.self) private var model
+    var openSync: () -> Void = {}
     @State private var now = Date.now
     @State private var snapshot: DashboardSnapshot?
     @State private var lastLoadedAt: Date?
     @State private var lastRetryToken = 0
     @State private var retryToken = 0
-    @State private var brief: GeneratedBrief?
+    @State private var brief: NowBriefDisplay?
+    @State private var lastBriefAttempt: Date?
 
-    private struct GeneratedBrief: Equatable {
-        var text: String
-        var key: String
-        var generatedAt: Date
+    private struct BriefRequest: Hashable {
+        var facts: NowBriefFacts?
+        var period: Int
     }
 
     private static let briefInterval: TimeInterval = 180
@@ -36,29 +37,33 @@ struct MacNowView: View {
         NavigationStack {
             Group {
                 if model.store.sources.isEmpty {
-                    EmptyStateView(
-                        systemImage: "iphone.and.arrow.forward",
-                        title: model.mirror.pairing == nil ? "Not paired with an iPhone" : "Nothing mirrored yet",
-                        message: model.mirror.pairing == nil
-                            ? "Choose iPhone Sync in the sidebar and pair with HeartSync on your iPhone."
-                            : "Open HeartSync on the iPhone, on the same network, to copy its history here."
-                    )
+                    ContentUnavailableView {
+                        Label(model.mirror.pairing == nil ? "Not paired with an iPhone" : "Nothing mirrored yet", systemImage: "iphone.and.arrow.forward")
+                    } description: {
+                        Text("Open HeartSync on your iPhone on the same network, then pair to copy its history here.")
+                    } actions: {
+                        Button("Pair with iPhone…", action: openSync)
+                            .accessibilityIdentifier("mac.now.pair")
+                    }
                 } else if let snapshot {
                     if let failure = snapshot.queryFailure, snapshot.metrics.isEmpty {
                         List {
                             HistoryUnavailableView(error: failure) { retryToken &+= 1 }
                         }
                     } else if snapshot.metrics.isEmpty {
-                        EmptyStateView(
-                            systemImage: "hourglass",
-                            title: "No recent readings",
-                            message: "The mirror holds no reading from the last week. Older history is on the Compare screen."
-                        )
+                        ContentUnavailableView {
+                            Label("No recent readings", systemImage: "hourglass")
+                        } description: {
+                            Text("The mirror holds no reading from the last week.")
+                        } actions: {
+                            NavigationLink("View history") { CompareView() }
+                            Button("iPhone Sync", action: openSync)
+                        }
                     } else {
                         let facts = NowBriefFacts.build(metrics: snapshot.metrics, stressBand: nil, now: now)
                         ScrollView {
                             VStack(alignment: .leading, spacing: 16) {
-                                if let brief {
+                                if let brief, brief.isValid(for: facts, now: now, available: NowBriefGenerator.isAvailable) {
                                     NowBriefView(text: brief.text, generatedAt: brief.generatedAt)
                                 }
                                 LazyVGrid(
@@ -72,7 +77,7 @@ struct MacNowView: View {
                             }
                             .padding(20)
                         }
-                        .task(id: facts?.key) { await refreshBrief(facts) }
+                        .task(id: BriefRequest(facts: facts, period: Int(now.timeIntervalSince1970 / Self.briefInterval))) { await refreshBrief(facts) }
                     }
                 } else {
                     ProgressView()
@@ -115,10 +120,13 @@ struct MacNowView: View {
     }
 
     private func refreshBrief(_ facts: NowBriefFacts?) async {
-        guard let facts, facts.key != brief?.key, NowBriefGenerator.isAvailable else { return }
-        let wait = brief.map { max(2, Self.briefInterval - Date.now.timeIntervalSince($0.generatedAt)) } ?? 1
-        try? await Task.sleep(for: .seconds(wait))
-        guard !Task.isCancelled, let text = await NowBriefGenerator.generate(facts), !Task.isCancelled else { return }
-        brief = GeneratedBrief(text: text, key: facts.key, generatedAt: .now)
+        if brief?.isValid(for: facts, now: .now, available: NowBriefGenerator.isAvailable) != true { brief = nil }
+        guard let facts, NowBriefGenerator.isAvailable else { return }
+        let wait = lastBriefAttempt.map { max(1, Self.briefInterval - Date.now.timeIntervalSince($0)) } ?? 1
+        do { try await Task.sleep(for: .seconds(wait)) } catch { return }
+        guard !Task.isCancelled else { return }
+        lastBriefAttempt = .now
+        guard let text = await NowBriefGenerator.generate(facts), !Task.isCancelled else { return }
+        brief = NowBriefDisplay(text: text, facts: facts, generatedAt: .now)
     }
 }

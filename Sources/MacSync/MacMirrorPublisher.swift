@@ -26,6 +26,10 @@ final class MacMirrorPublisher {
     private(set) var status: [String: PeerStatus] = [:]
     /// Set when the Keychain could not be read, so the pairings are unknown, not absent.
     private(set) var pairingsUnavailable = false
+    private(set) var discoveryIssue: String?
+    @ObservationIgnored private var browseRetry: Task<Void, Never>?
+    @ObservationIgnored private var browseAttempt = 0
+    @ObservationIgnored private var browserGeneration = UUID()
 
     @ObservationIgnored private let logger = Logger(subsystem: "com.heartsync.HeartSyncChecker", category: "MacMirror")
     @ObservationIgnored private weak var store: HealthStore?
@@ -64,6 +68,9 @@ final class MacMirrorPublisher {
     /// Background: end every session and stop browsing. Each Mac keeps its position.
     func suspend() {
         isActive = false
+        browserGeneration = UUID()
+        browseRetry?.cancel()
+        browseRetry = nil
         browser?.cancel()
         browser = nil
         endpoints.removeAll()
@@ -80,6 +87,13 @@ final class MacMirrorPublisher {
         var updated = pairings.filter { $0.peer.id != record.peer.id }
         updated.append(record)
         guard MacMirrorPairingStore.save(updated) else { return false }
+        for old in pairings where old.peer.id == record.peer.id {
+            sessions[old.identity]?.task.cancel()
+            sessions[old.identity] = nil
+            status[old.identity] = nil
+            defaults.removeObject(forKey: Self.ackKey(old.identity))
+            defaults.removeObject(forKey: Self.syncedKey(old.identity))
+        }
         pairings = updated
         status[record.identity] = PeerStatus()
         applyChangeLogging()
@@ -99,6 +113,9 @@ final class MacMirrorPublisher {
         defaults.removeObject(forKey: Self.syncedKey(record.identity))
         applyChangeLogging()
         if pairings.isEmpty {
+            browserGeneration = UUID()
+            browseRetry?.cancel()
+            browseRetry = nil
             browser?.cancel()
             browser = nil
         }
@@ -139,6 +156,8 @@ final class MacMirrorPublisher {
     private func startBrowsingIfNeeded() {
         if pairingsUnavailable { reloadPairings() }
         guard isActive, browser == nil, !pairings.isEmpty else { return }
+        let tag = UUID()
+        browserGeneration = tag
         let parameters = NWParameters()
         parameters.includePeerToPeer = true
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: MacMirrorProtocol.syncService, domain: nil), using: parameters)
@@ -149,24 +168,62 @@ final class MacMirrorPublisher {
                 else { return nil }
                 return (macID, result.endpoint)
             }
-            Task { @MainActor in self?.update(found) }
+            Task { @MainActor in
+                guard self?.browserGeneration == tag else { return }
+                self?.update(found)
+            }
         }
         browser.stateUpdateHandler = { [weak self] state in
-            guard case .failed(let error) = state else { return }
-            let detail = error.localizedDescription
-            Task { @MainActor in self?.browserFailed(detail) }
+            switch state {
+            case .waiting(let error), .failed(let error):
+                let detail = error.localizedDescription
+                Task { @MainActor in
+                    guard self?.browserGeneration == tag else { return }
+                    self?.browserFailed(detail)
+                }
+            case .ready:
+                Task { @MainActor in
+                    guard self?.browserGeneration == tag else { return }
+                    self?.discoveryIssue = nil
+                    self?.browseAttempt = 0
+                }
+            default: break
+            }
         }
         self.browser = browser
         browser.start(queue: .main)
     }
 
     private func browserFailed(_ detail: String) {
+        discoveryIssue = detail
+        browserGeneration = UUID()
         logger.error("Mac sync browsing failed: \(detail, privacy: .public)")
         browser?.cancel()
         browser = nil
         for record in pairings {
             status[record.identity, default: PeerStatus()].issue = detail
+            status[record.identity]?.isReachable = false
         }
+        endpoints.removeAll()
+        browseRetry?.cancel()
+        let delay = min(120, 5 * pow(2, Double(min(browseAttempt, 5))))
+        browseAttempt += 1
+        browseRetry = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, self.isActive else { return }
+            self.browseRetry = nil
+            self.startBrowsingIfNeeded()
+        }
+    }
+
+    func retryDiscovery() {
+        browseRetry?.cancel()
+        browseRetry = nil
+        browserGeneration = UUID()
+        browser?.cancel()
+        browser = nil
+        browseAttempt = 0
+        startBrowsingIfNeeded()
     }
 
     private func update(_ found: [(String, NWEndpoint)]) {
@@ -206,8 +263,14 @@ final class MacMirrorPublisher {
                         channel: channel,
                         pairing: record,
                         phoneName: self.phoneName,
-                        onProgress: { [weak self] in self?.status[record.identity, default: PeerStatus()].progress = $0 },
-                        onAcknowledged: { [weak self] cursor in self?.acknowledged(cursor, for: record) },
+                        onProgress: { [weak self] progress in
+                            guard self?.sessions[record.identity]?.tag == tag, !Task.isCancelled else { return }
+                            self?.status[record.identity, default: PeerStatus()].progress = progress
+                        },
+                        onAcknowledged: { [weak self] cursor in
+                            guard self?.sessions[record.identity]?.tag == tag, !Task.isCancelled else { return }
+                            self?.acknowledged(cursor, for: record)
+                        },
                         waitForChange: { [weak self] in await self?.waitForChange() ?? false }
                     )
                     await channel.close(.closing)

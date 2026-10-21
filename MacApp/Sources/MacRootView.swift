@@ -65,13 +65,38 @@ struct MacRootView: View {
         } detail: {
             switch screen ?? .now {
             case .now:
-                MacNowView()
+                MacNowView { screen = .sync }
             case .compare:
                 CompareView()
             case .devices:
                 MacDevicesView()
             case .sync:
                 MacSyncView()
+            }
+        }
+        .focusedSceneValue(\.heartSyncNavigate, { destination in screen = destination })
+    }
+}
+
+struct HeartSyncNavigationKey: FocusedValueKey {
+    typealias Value = (MacRootView.Screen) -> Void
+}
+
+extension FocusedValues {
+    var heartSyncNavigate: HeartSyncNavigationKey.Value? {
+        get { self[HeartSyncNavigationKey.self] }
+        set { self[HeartSyncNavigationKey.self] = newValue }
+    }
+}
+
+struct HeartSyncNavigationCommands: Commands {
+    @FocusedValue(\.heartSyncNavigate) private var navigate
+    var body: some Commands {
+        CommandMenu("Navigate") {
+            ForEach(Array(MacRootView.Screen.allCases.enumerated()), id: \.element.id) { index, screen in
+                Button(screen.title) { navigate?(screen) }
+                    .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+                    .disabled(navigate == nil)
             }
         }
     }

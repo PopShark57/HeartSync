@@ -12,6 +12,23 @@ protocol MacMirrorFrameChannel: AnyObject, Sendable {
 
 extension MacMirrorChannel: MacMirrorFrameChannel {}
 
+extension MacMirrorFrameChannel {
+    func receive(timeout: Duration) async throws -> MacMirrorFrame {
+        try await withTaskCancellationHandler {
+            try await withThrowingTaskGroup(of: MacMirrorFrame.self) { group in
+                group.addTask { try await self.receive() }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    self.cancel()
+                    throw MacMirrorError.timedOut
+                }
+                defer { group.cancelAll() }
+                return try await group.next()!
+            }
+        } onCancel: { self.cancel() }
+    }
+}
+
 /// Where a session has got to, for the status line on each device.
 enum MacMirrorProgress: Equatable, Sendable {
     case connecting
@@ -60,7 +77,7 @@ final class MacMirrorSender {
             pairingIdentity: pairing.identity,
             phoneName: phoneName
         )))
-        let state = try await channel.receive().decode(.state, as: MacMirrorState.self)
+        let state = try await channel.receive(timeout: .seconds(30)).decode(.state, as: MacMirrorState.self)
         guard state.protocolVersion == MacMirrorProtocol.version else {
             throw MacMirrorError.peerEnded(.versionMismatch)
         }
@@ -172,7 +189,7 @@ final class MacMirrorSender {
     }
 
     private func acknowledged(over channel: any MacMirrorFrameChannel, expecting cursor: Int64) async throws -> Int64 {
-        let ack = try await channel.receive().decode(.ack, as: MacMirrorAck.self)
+        let ack = try await channel.receive(timeout: .seconds(30)).decode(.ack, as: MacMirrorAck.self)
         guard ack.cursor == cursor else { throw MacMirrorError.malformed("acknowledged \(ack.cursor), sent \(cursor)") }
         return ack.cursor
     }
@@ -208,10 +225,16 @@ final class MacMirrorReceiver {
         channel: any MacMirrorFrameChannel,
         pairing: MacMirrorPairingRecord,
         onPhone: @escaping @MainActor (String) -> Void = { _ in },
-        onProgress: @escaping @MainActor (MacMirrorProgress) -> Void = { _ in }
+        onProgress: @escaping @MainActor (MacMirrorProgress) -> Void = { _ in },
+        isCurrent: @escaping @MainActor () -> Bool = { true }
     ) async throws {
+        func checkCurrent() throws {
+            try Task.checkCancellation()
+            guard isCurrent() else { throw CancellationError() }
+        }
+        try checkCurrent()
         onProgress(.connecting)
-        let hello = try await channel.receive().decode(.hello, as: MacMirrorHello.self)
+        let hello = try await channel.receive(timeout: .seconds(30)).decode(.hello, as: MacMirrorHello.self)
         guard hello.protocolVersion == MacMirrorProtocol.version else {
             try? await channel.send(.json(.goodbye, MacMirrorGoodbye(reason: .versionMismatch, detail: nil)))
             throw MacMirrorError.peerEnded(.versionMismatch)
@@ -220,6 +243,7 @@ final class MacMirrorReceiver {
             try? await channel.send(.json(.goodbye, MacMirrorGoodbye(reason: .notPaired, detail: nil)))
             throw MacMirrorError.peerEnded(.notPaired)
         }
+        try checkCurrent()
         onPhone(hello.phoneName)
         let position = store.mirrorPosition
         try await channel.send(.json(.state, MacMirrorState(
@@ -232,9 +256,10 @@ final class MacMirrorReceiver {
         var inSnapshot = false
         var snapshotTotal = 0
         var snapshotApplied = 0
+        var hasReceivedBatch = false
         while !Task.isCancelled {
             let frame: MacMirrorFrame
-            do { frame = try await channel.receive() }
+            do { frame = try await (inSnapshot || !hasReceivedBatch ? channel.receive(timeout: .seconds(30)) : channel.receive()) }
             catch MacMirrorError.closed { return }
             if frame.type == .goodbye { return }
             guard frame.type == .batch else { throw MacMirrorError.malformed("expected a batch, received \(frame.type)") }
@@ -243,6 +268,8 @@ final class MacMirrorReceiver {
                 Result { try MacMirrorBatchCodec.decode(body) }
             }.get()
 
+            try checkCurrent()
+            hasReceivedBatch = true
             switch batch.snapshot {
             case .begin:
                 inSnapshot = true
@@ -271,7 +298,9 @@ final class MacMirrorReceiver {
                 )))
                 throw error
             }
+            try checkCurrent()
             try await channel.send(.json(.ack, MacMirrorAck(cursor: batch.cursor)))
+            try checkCurrent()
 
             switch batch.snapshot {
             case .begin, .page:

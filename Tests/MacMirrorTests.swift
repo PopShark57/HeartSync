@@ -2,7 +2,11 @@ import CryptoKit
 import Foundation
 import Network
 import Testing
+#if canImport(HeartSyncMac)
+@testable import HeartSyncMac
+#else
 @testable import HeartSyncChecker
+#endif
 
 /// Mac sync: the phone's change log, the batch format, pairing, and both session halves
 /// against each other, in memory and over a real TLS connection on the loopback interface.
@@ -544,4 +548,114 @@ struct MacMirrorSessionTests {
         impostor.cancel()
         #expect(await refusal.value)
     }
+}
+
+/// Deliberately ignores cancellation while receipt is held: a late framework callback
+/// must be harmless even when it wins a race with cancel().
+private final class HeldBatchChannel: MacMirrorFrameChannel, @unchecked Sendable {
+    private let lock = NSLock()
+    private var hello: MacMirrorFrame?
+    private var waiter: CheckedContinuation<MacMirrorFrame, any Error>?
+    var isWaiting: Bool { lock.withLock { waiter != nil } }
+    init(hello: MacMirrorFrame) { self.hello = hello }
+    func send(_ frame: MacMirrorFrame) async throws {}
+    func cancel() {}
+    func receive() async throws -> MacMirrorFrame {
+        if let first = lock.withLock({ let value = hello; hello = nil; return value }) { return first }
+        return try await withCheckedThrowingContinuation { continuation in
+            lock.withLock { waiter = continuation }
+        }
+    }
+    func release(_ frame: MacMirrorFrame) {
+        let continuation = lock.withLock { let value = waiter; waiter = nil; return value }
+        continuation?.resume(returning: frame)
+    }
+}
+
+@Suite("Mac receiver invalidation and network lifetime")
+@MainActor
+struct MirrorInvalidationTests {
+    @Test("An in-flight batch cannot restore data after cancellation or session replacement")
+    func obsoleteBatch() async throws {
+        for cancelled in [true, false] {
+            let store = HealthStore(persistenceEnabled: false)
+            let record = pairing()
+            let channel = HeldBatchChannel(hello: try .json(.hello, MacMirrorHello(protocolVersion: MacMirrorProtocol.version, pairingIdentity: record.identity, phoneName: "Old phone")))
+            var current = true
+            var updates = 0
+            let task = Task {
+                try await MacMirrorReceiver(store: store).run(channel: channel, pairing: record, onProgress: { _ in updates += 1 }, isCurrent: { current })
+            }
+            for _ in 0..<1_000 where !channel.isWaiting { await Task.yield() }
+            #expect(channel.isWaiting)
+            let before = updates
+            if cancelled { task.cancel() } else { current = false }
+            #expect(store.clearMirror())
+            let frame = MacMirrorFrame(type: .batch, body: try MacMirrorBatchCodec.encode(MacMirrorBatch(epoch: "old", cursor: 10, snapshot: .begin, sources: [.init(id: "old", displayName: "Old", transport: .bluetooth)], readings: [.init(sourceID: "old", kind: .heartRate, value: 72, start: .now.addingTimeInterval(-30))], removedIDs: [])))
+            channel.release(frame)
+            do { try await task.value; Issue.record("Obsolete receiver unexpectedly succeeded") }
+            catch is CancellationError {} catch { Issue.record("Unexpected error: \(error)") }
+            #expect(store.readings.isEmpty)
+            #expect(store.sources.isEmpty)
+            #expect(store.mirrorPosition == nil)
+            #expect(updates == before)
+        }
+    }
+
+    @Test("A stalled peer frame has a bounded deadline and closes its channel")
+    func peerFrameDeadline() async throws {
+        let (a, b) = PipeChannel.pair()
+        do { _ = try await a.receive(timeout: .milliseconds(50)); Issue.record("Expected timeout") }
+        catch {}
+        do { _ = try await b.receive(); Issue.record("Peer was not closed") } catch {}
+    }
+
+    @Test("Cancelling an actual Network receive closes the connection promptly")
+    func networkReceiveCancellation() async throws {
+        let listener = try NWListener(using: MacMirrorTransport.pairingParameters(), on: .any)
+        let accepted = AcceptedConnections()
+        listener.newConnectionHandler = { connection in Task { @MainActor in accepted.push(connection) } }
+        let ready = AsyncStream<UInt16>.makeStream()
+        listener.stateUpdateHandler = { state in
+            if case .ready = state, let port = listener.port?.rawValue { ready.continuation.yield(port) }
+        }
+        listener.start(queue: .main)
+        defer { listener.cancel() }
+        var ports = ready.stream.makeAsyncIterator()
+        let rawPort = try #require(await ports.next())
+        let port = try #require(NWEndpoint.Port(rawValue: rawPort))
+        let client = MacMirrorChannel(connection: NWConnection(host: "127.0.0.1", port: port, using: MacMirrorTransport.pairingParameters()))
+        let clientOpen = Task { try await client.open() }
+        let peerConnection = await accepted.next()
+        let peer = MacMirrorChannel(connection: peerConnection)
+        try await peer.accept()
+        try await clientOpen.value
+        defer { client.cancel(); peer.cancel() }
+        let receive = Task { try await client.receive() }
+        receive.cancel()
+        do { _ = try await receive.value; Issue.record("Cancelled receive succeeded") }
+        catch is CancellationError {} catch { Issue.record("Unexpected error: \(error)") }
+    }
+    @Test("Key exchange and confirmation waits expire and release both ends")
+    func pairingDeadlines() async throws {
+        let (phone, mac) = PipeChannel.pair()
+        do {
+            _ = try await MacMirrorPairingExchange.runPhone(channel: phone, identity: .init(id: UUID(), name: "Phone"), handshakeTimeout: .milliseconds(50)) { _, _ in true }
+            Issue.record("A silent peer should time out")
+        } catch {}
+        mac.cancel()
+        let (a, b) = PipeChannel.pair()
+        let phoneTask = Task {
+            try await MacMirrorPairingExchange.runPhone(channel: a, identity: .init(id: UUID(), name: "Phone"), confirmationTimeout: .milliseconds(50)) { _, _ in
+                do { try await Task.sleep(for: .seconds(10)) } catch { return false }
+                return true
+            }
+        }
+        let macTask = Task {
+            try await MacMirrorPairingExchange.runMac(channel: b, identity: .init(id: UUID(), name: "Mac"), confirmationTimeout: .milliseconds(50)) { _, _ in true }
+        }
+        do { _ = try await phoneTask.value; Issue.record("Confirmation should time out") } catch {}
+        do { _ = try await macTask.value; Issue.record("Peer should close") } catch {}
+    }
+
 }

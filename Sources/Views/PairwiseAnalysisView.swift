@@ -291,6 +291,10 @@ struct PairwiseAnalysisView: View {
                         }
                     }
                     .disabled(isExporting)
+                    #if os(macOS)
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    #endif
+                    .accessibilityIdentifier("pairwise.export")
                     .accessibilityHint("Creates a CSV and plain-text methodology summary, then opens the share sheet")
                 } footer: {
                     Text("The export contains only this metric, source pair, and selected range. When evidence is insufficient, the summary explicitly withholds an agreement conclusion.")
@@ -309,8 +313,8 @@ struct PairwiseAnalysisView: View {
 
     private var sourceA: DataSource? { model.store.source(id: sourceAID) }
     private var sourceB: DataSource? { model.store.source(id: sourceBID) }
-    private var sourceAName: String { model.store.displayName(forSource: sourceAID) }
-    private var sourceBName: String { model.store.displayName(forSource: sourceBID) }
+    private var sourceAName: String { SourceLabels.name(for: sourceAID, in: model.store.enabledSources) }
+    private var sourceBName: String { SourceLabels.name(for: sourceBID, in: model.store.enabledSources) }
     /// A removed source falls back to validated palette slots, never to a system hue that
     /// could collide with a device or with the agreement scale.
     private var sourceAColor: Color { sourceA?.color ?? DataSource.palette[0] }

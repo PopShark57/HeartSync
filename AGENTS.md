@@ -77,9 +77,16 @@ HeartSyncApp
 | `HeartSyncWatch` | watchOS application | `WatchApp/Sources`, `Shared`, selected model files, `ChartLookup` | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp`; product/module `HeartSyncWatch`; display name HeartSync |
 | `HeartSyncWatchComplications` | watchOS app extension | `WatchComplications/Sources`, selected shared/model files | Bundle ID `com.heartsync.HeartSyncChecker.watchkitapp.complications`; embedded in watch app |
 | `HeartSyncMac` | macOS 15 application | `MacApp/Sources`, `Sources/Model`, `Store`, `Analysis`, `MacSync` (less the phone-only files), `Bluetooth` (less `BluetoothManager`/`PeripheralState`), `Views` (less the transport and settings screens and `Oura/`), `DebugChartGallery` | Bundle ID `com.heartsync.HeartSyncChecker.mac`; product `HeartSync`; module `HeartSyncMac`; sandboxed |
+| `HeartSyncMacTests` | Hosted macOS unit-test bundle | `MacTests`, shared `Tests/MacMirrorTests.swift` | Imports `HeartSyncMac`; host `HeartSync.app/Contents/MacOS/HeartSync` |
+| `HeartSyncMacUITests` | macOS UI-test bundle | `MacUITests` | Native setup, navigation, export, unavailable-storage smoke tests |
 | `HeartSyncCheckerTests` | Hosted iOS unit-test bundle | All of `Tests` | Imports `@testable import HeartSyncChecker`; explicit host is `HeartSync.app/HeartSync` |
 | `HeartSyncCheckerUITests` | iOS UI-test bundle | All of `UITests` | Drives deterministic Debug-only launch scenarios; targets `HeartSyncChecker` |
 | `HeartSyncCheckerPerformanceTests` | Hosted iOS unit-test bundle | All of `PerformanceTests` | Manual physical-device release workload; explicit host is `HeartSync.app/HeartSync` |
+
+`HeartSyncMacTests` is a hosted macOS unit bundle (`MacTests` plus the shared Mac mirror tests),
+and `HeartSyncMacUITests` is the native smoke bundle (`MacUITests`). The `HeartSyncMac` scheme
+runs both; CI uses local ad-hoc signing for a runnable UI runner. Its tests cover the Mac
+composition root and journaled pairing cleanup through narrow injected actions.
 
 The `HeartSyncChecker` scheme runs the normal unit and UI bundles and embeds the watch app and its complication extension. `HeartSyncWatch` builds/runs the watch app with its extension. `HeartSyncMac` builds/runs the Mac mirror; CI builds it with warnings as errors. `HeartSyncCheckerPerformance` isolates the intentionally large device workload from PR CI, which is `.github/workflows/ios.yml` (unit, UI on an iPhone simulator, and the watch build on the iOS 18 and newest runtimes, warnings as errors; iPad is not run in CI because the owner uses only iPhone and Apple Watch). Debug and Release configurations are generated.
 
@@ -128,7 +135,9 @@ There is no protocol registry or dependency-injection container. `AppModel` cons
 
 Do not introduce a broad DI framework for a local change. Add a small constructor or configuration seam only when it is needed for testability or a real alternate implementation.
 
-Invalidation is Observation on the actual store and managers. `HealthStore.changeToken` and `removalGeneration` are the tokens external projections (the watch publisher and its chart cache) key on.
+Invalidation is Observation on the actual store and managers. `HealthStore.analysisSources` excludes battery/last-seen metadata; status-only changes do not
+advance `changeToken`. Status screens continue observing the full source metadata.
+`HealthStore.changeToken` and `removalGeneration` are the tokens external projections (the watch publisher and its chart cache) key on.
 
 `AppModel.init` accepts the store, settings, sessions, managers, and an `AppModel.TransportActions` value: the handful of calls the model makes on Bluetooth, HealthKit, and Oura, as closures. Production forwards them unchanged (`.live`); tests pass `.inert` or a recording copy, so startup order, retention, derived metrics, and refresh run without any transport.
 
@@ -334,7 +343,8 @@ screens. `MacApp/README.md` describes the protocol; the rules:
   deletes every row it did not name. Keep that order, or rows written during a snapshot are lost.
 - The phone syncs only in the foreground, browsing only when a Mac is paired, so the Local
   Network prompt appears only once someone pairs. A Mac mirrors one iPhone; pairing another
-  or unpairing deletes the copy.
+  or unpairing journals the operation in the Keychain and drains receivers before erasing the
+  copy. Startup recovers pending changes before starting sync. Failures remain retryable.
 - The Mac's screens never claim a value is live: there are no Live chips, and the sidebar
   footer and Now subtitle say when the mirror last heard from the phone.
 - `MacMirrorProtocol.version` must change with any incompatible message or batch change; both
@@ -402,6 +412,20 @@ The version-1 whole-file reading/source archives are migration inputs only. Do n
 
 There is no Core Data, SwiftData, CloudKit, shared Keychain group, or remote database. The watch
 App Group holds only the disposable complication display cache; iPhone history remains in SQLite.
+
+Saved comparison-session edits are queued, atomically persisted, then published. A failed
+save, delete or view-note leaves the committed list intact. Health and Oura aliases and
+user-confirmed source relationships persist as optional source metadata; transport upserts
+preserve those choices. Relationship edits change warnings, never source identity or readings.
+
+Derived estimates and stress-baseline reads propagate query failures. Only successfully read
+metrics reconcile estimates; failed passes keep prior baselines and leave the slot retryable.
+Watch snapshot construction publishes unavailable and discards failed cache work on any
+required query failure. Latest watch values are read through one grouped indexed request.
+
+The optional Now brief uses model-selected sentence indices and deterministic fact rendering.
+Its display state validates current facts, provenance, device counts, freshness and a bounded
+lifetime independently from the generation throttle.
 
 ## Analysis and Data-Integrity Invariants
 

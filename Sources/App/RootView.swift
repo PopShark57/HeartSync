@@ -2,6 +2,8 @@ import SwiftUI
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
+    private enum Selection: Hashable { case now, oura, compare, devices, settings }
+    @State private var selectedTab: Selection = .now
 
     var body: some View {
         switch model.startupState {
@@ -16,20 +18,20 @@ struct RootView: View {
     }
 
     private var tabs: some View {
-        TabView {
-            Tab("Now", systemImage: "waveform.path.ecg.rectangle") {
-                DashboardView()
+        TabView(selection: $selectedTab) {
+            Tab("Now", systemImage: "waveform.path.ecg.rectangle", value: Selection.now) {
+                DashboardView(openSetup: { selectedTab = .devices }, openHistory: { selectedTab = .compare })
             }
-            Tab("Oura", systemImage: "circle.circle.fill") {
+            Tab("Oura", systemImage: "circle.circle.fill", value: Selection.oura) {
                 OuraDashboardView()
             }
-            Tab("Compare", systemImage: "chart.xyaxis.line") {
+            Tab("Compare", systemImage: "chart.xyaxis.line", value: Selection.compare) {
                 CompareView()
             }
-            Tab("Devices", systemImage: "dot.radiowaves.left.and.right") {
+            Tab("Devices", systemImage: "dot.radiowaves.left.and.right", value: Selection.devices) {
                 DevicesView()
             }
-            Tab("Settings", systemImage: "gearshape") {
+            Tab("Settings", systemImage: "gearshape", value: Selection.settings) {
                 SettingsView()
             }
         }
