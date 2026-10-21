@@ -59,7 +59,10 @@ jobs:
             SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
             CODE_SIGNING_ALLOWED=NO
 
+      # Step timeouts make a hung test (for example, a network read with no deadline) fail
+      # this step in minutes, with its log, instead of spending the whole job's hour.
       - name: Test Mac orchestration and native UI
+        timeout-minutes: 20
         run: |
           set -o pipefail
           xcodebuild test \
@@ -106,9 +109,16 @@ jobs:
           print(next((d["udid"] for _, devices in runtimes for d in devices if d["name"].startswith(prefix)), ""))
           ' "$1"
           }
-          echo "HEARTSYNC_SIMULATOR_ID=$(pick iPhone)" >> "$GITHUB_ENV"
+          id="$(pick iPhone)"
+          if [ -z "$id" ]; then
+            echo "::error::No available iPhone simulator on an iOS 18 or newer runtime"
+            xcrun simctl list runtimes
+            exit 1
+          fi
+          echo "HEARTSYNC_SIMULATOR_ID=$id" >> "$GITHUB_ENV"
 
       - name: Run unit tests
+        timeout-minutes: 25
         run: |
           set -o pipefail
           xcodebuild test-without-building \

@@ -58,8 +58,7 @@ final class MacSmokeTests: XCTestCase {
         app.activate()
         app.typeKey(.escape, modifierFlags: []) // Cancel the native destination picker.
         XCTAssertTrue(save.waitForExistence(timeout: 5))
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("HeartSync-ExportSmoke-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let destination = try Self.exportDestination()
         defer { try? FileManager.default.removeItem(at: destination) }
         app.activate()
         save.click()
@@ -71,13 +70,41 @@ final class MacSmokeTests: XCTestCase {
         let filesSaved = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             (try? FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil).count) == 2
         }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [filesSaved], timeout: 10), .completed)
+        let saveResult = XCTWaiter.wait(for: [filesSaved], timeout: 10)
+        if saveResult != .completed {
+            // The whole screen, not just the app: a privacy alert from another process, a save
+            // error in the sheet, or a panel still open each explain a missing file differently.
+            let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            screenshot.name = "Export did not reach \(destination.path)"
+            screenshot.lifetime = .keepAlways
+            add(screenshot)
+        }
+        XCTAssertEqual(saveResult, .completed)
         XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "pairwise.export").firstMatch.waitForExistence(timeout: 5))
         // Save dismissed the export and its ordinary temporary-directory cleanup ran.
         // Both complete files must still exist in the selected destination afterwards.
         let saved = (try? FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil)) ?? []
         XCTAssertEqual(Set(saved.map(\.pathExtension)), ["csv", "txt"])
         for file in saved { XCTAssertGreaterThan((try? Data(contentsOf: file).count) ?? 0, 0) }
+    }
+
+    /// A fresh folder for the save panel to move the export into.
+    ///
+    /// Not this runner's temporary directory when avoidable: that sits inside the runner's
+    /// container, and since macOS 14 another app writing there raises "would like to access
+    /// data from other apps", which nobody answers on CI. `/Users/Shared` belongs to no app
+    /// (Apple DTS's suggestion for this XCUITest case); the temporary directory remains the
+    /// fallback for a runner that cannot create a folder there.
+    private static func exportDestination() throws -> URL {
+        let name = "HeartSync-ExportSmoke-\(UUID().uuidString)"
+        let shared = URL(fileURLWithPath: "/Users/Shared", isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
+        if (try? FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)) != nil {
+            return shared
+        }
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        return temporary
     }
 
 }

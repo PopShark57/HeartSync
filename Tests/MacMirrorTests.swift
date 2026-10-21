@@ -126,19 +126,29 @@ private final class PipeChannel: MacMirrorFrameChannel, @unchecked Sendable {
     }
 }
 
-/// Connections a test listener accepted, handed out in order.
+/// Connections a test listener accepted, handed out in order. Nil once closed, so a test's
+/// watchdog can release a waiter whose connection never arrives.
 @MainActor
 private final class AcceptedConnections {
     private var connections: [NWConnection] = []
-    private var waiters: [CheckedContinuation<NWConnection, Never>] = []
+    private var waiters: [CheckedContinuation<NWConnection?, Never>] = []
+    private var isClosed = false
 
     func push(_ connection: NWConnection) {
         if waiters.isEmpty { connections.append(connection) } else { waiters.removeFirst().resume(returning: connection) }
     }
 
-    func next() async -> NWConnection {
+    func next() async -> NWConnection? {
         if !connections.isEmpty { return connections.removeFirst() }
+        if isClosed { return nil }
         return await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func close() {
+        isClosed = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume(returning: nil) }
     }
 }
 
@@ -511,7 +521,7 @@ struct MacMirrorSessionTests {
         let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
 
         let receiver = Task { @MainActor in
-            let connection = await accepted.next()
+            guard let connection = await accepted.next() else { throw MacMirrorError.closed }
             let channel = MacMirrorChannel(connection: connection)
             try await channel.accept()
             try await MacMirrorReceiver(store: mac).run(channel: channel, pairing: record)
@@ -529,22 +539,36 @@ struct MacMirrorSessionTests {
         expectMirrors(mac, phone)
 
         // The listener side of the impostor's attempt must run for its handshake to fail.
+        // Both halves are bounded: a connection that wrongly becomes ready (as a resumed TLS
+        // session appeared to on macOS) leaves each side waiting for a frame that never comes,
+        // which must fail the test rather than hang the run. A side the watchdog cancels
+        // reports failure, never refusal.
         let refusal = Task { @MainActor in
-            let connection = await accepted.next()
+            guard let connection = await accepted.next() else { return false }
             let channel = MacMirrorChannel(connection: connection)
             defer { channel.cancel() }
-            do { try await channel.accept() } catch { return true }
-            return (try? await channel.receive()) == nil
+            do { try await channel.accept() } catch { return !Task.isCancelled }
+            let frame = try? await channel.receive()
+            return frame == nil && !Task.isCancelled
         }
         let impostor = MacMirrorChannel(connection: NWConnection(
             to: endpoint,
             using: MacMirrorTransport.syncParameters(key: SymmetricKey(size: .bits256), identity: record.identity)
         ))
-        await #expect(throws: MacMirrorError.self) {
+        let attempt = Task {
             try await impostor.open()
             // Some stacks report the failed handshake only at the first read.
             _ = try await impostor.receive()
         }
+        let watchdog = Task { @MainActor in
+            try await Task.sleep(for: .seconds(20))
+            attempt.cancel()
+            refusal.cancel()
+            accepted.close()
+        }
+        defer { watchdog.cancel() }
+        // A watchdog cancellation ends the attempt with `CancellationError`, which fails this.
+        await #expect(throws: MacMirrorError.self) { try await attempt.value }
         impostor.cancel()
         #expect(await refusal.value)
     }
@@ -626,7 +650,7 @@ struct MirrorInvalidationTests {
         let port = try #require(NWEndpoint.Port(rawValue: rawPort))
         let client = MacMirrorChannel(connection: NWConnection(host: "127.0.0.1", port: port, using: MacMirrorTransport.pairingParameters()))
         let clientOpen = Task { try await client.open() }
-        let peerConnection = await accepted.next()
+        let peerConnection = try #require(await accepted.next())
         let peer = MacMirrorChannel(connection: peerConnection)
         try await peer.accept()
         try await clientOpen.value

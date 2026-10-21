@@ -9,6 +9,14 @@ enum MacMirrorTransport {
     /// arrangement Apple's peer-to-peer Network.framework samples use between two devices
     /// that share a secret but no certificate. A handshake with any other key fails, so a
     /// connection that becomes ready is one from the paired device.
+    ///
+    /// Session resumption is off. A resumed TLS 1.2 session skips the PSK exchange and
+    /// reuses the master secret of an earlier connection to the same endpoint. In the macOS
+    /// test run a connection offering a different key became ready after boringssl logged
+    /// clearing its configured PSK, consistent with resuming the cached session instead of
+    /// handshaking with the key it was given. Every connection must prove the current
+    /// pairing's key; a session cached under a replaced pairing must not outlive it. One full
+    /// handshake per foreground sync costs nothing measurable.
     static func syncParameters(key: SymmetricKey, identity: String) -> NWParameters {
         let tls = NWProtocolTLS.Options()
         let keyData = key.withUnsafeBytes { DispatchData(bytes: $0) }
@@ -23,6 +31,7 @@ enum MacMirrorTransport {
         }
         sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
         sec_protocol_options_set_max_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
+        sec_protocol_options_set_tls_resumption_enabled(tls.securityProtocolOptions, false)
         let parameters = NWParameters(tls: tls, tcp: tcpOptions())
         parameters.includePeerToPeer = true
         return parameters

@@ -333,8 +333,9 @@ screens. `MacApp/README.md` describes the protocol; the rules:
   with the phone committing to its key first (`MacMirrorPairing`). Each side confirms only
   after its person does. Keep the commitment, the length-prefixed transcript, and the HMAC
   confirmations; do not shorten the code or skip a confirmation.
-- Sync connections are TLS 1.2 with the pairing's pre-shared key. Never add a plain-TCP sync
-  path or accept a hello whose pairing identity differs from the stored one.
+- Sync connections are TLS 1.2 with the pairing's pre-shared key and session resumption off
+  (on macOS a resumed session appeared to bypass the PSK check). Never add a plain-TCP sync
+  path, enable resumption, or accept a hello whose pairing identity differs from the stored one.
 - The change log exists only while a Mac is paired (`HealthStore.setMirrorChangeLogging`). Bulk
   deletes (reset, legacy migration) suspend the triggers and raise the floor past every old
   cursor (`withChangeLogSuspended`), which forces a snapshot. Any new bulk path that bypasses
