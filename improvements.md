@@ -3,6 +3,62 @@
 Newest review first. Earlier reviews and their implementation notes are retained below as
 history; their "Observed behavior" paragraphs describe the checkout they reviewed.
 
+## What is still open (checked 2026-10-21)
+
+Every numbered item, 1–72, has been implemented, removed, or superseded. Each review's
+"Left" notes were checked against `main` at commit `d99146e`. This is what remains.
+
+**Changes since the reviews below**
+
+- Watch workouts were removed in `58a91cb`: recording, the workout complication, the iPhone
+  mirrored-workout card, the watch's HealthKit entitlement, and its workout background mode.
+  Items 25, 64, and 72 no longer apply. The watch app is display only (AGENTS.md).
+- CI runs again. The `iOS validation` workflow runs on every pull request and every push to
+  `main`, and passes on `main` at `d99146e`. The iPad screenshot run was dropped in
+  `dc67d91` because the owner uses only iPhone and Apple Watch.
+- Item 65's leftover is done. `DerivedEstimates.compute` is a pure function over a
+  `HealthHistory`, which `AppModel` runs off the main actor and `StressModelTests` calls
+  directly. The reset tests that waited on it are in `ResetAndIngestTests`.
+- Item 22's guided capture came through item 33: brush a period on the metric-detail
+  chart, then **Save as session…**.
+
+**Small code follow-ups**
+
+| Item | What is left | Where |
+| --- | --- | --- |
+| 49 | The watch snapshot still runs one `latest` query per enabled source per metric. Each is an indexed `LIMIT 1`; one grouped query would replace them. | [WatchSnapshotBuilder.swift](Sources/Watch/WatchSnapshotBuilder.swift) |
+| 48 | A failed battery or last-seen write is recorded in the store's error log and leaves memory unchanged. Nothing shows it, because `updateBattery` and `markSeen` discard `mutateSource`'s result. Low risk: the next update retries. | [HealthStore.swift](Sources/Store/HealthStore.swift) |
+| 56 | Battery and last-seen still live in the observed `sources` array, so each change invalidates views that read any source. `lastSeenAt` moves in 15-second steps, and the ring's battery is read every 15 minutes, which keeps this small. | `DataSource`, `HealthStore.sources` |
+
+**Product work never finished**
+
+- **Item 23:** only Bluetooth sources can be renamed. Health and Oura sources have no
+  alias, and source relationships ("same device through another app") are shown but
+  cannot be confirmed or edited.
+
+**Needs a signed iPhone, a watch, or a ring**
+
+None of this can be checked in a simulator. The steps are in `RELEASE_CHECKLIST.md`.
+
+- Item 53: Bluetooth restoration after iOS ends the app, and HealthKit background
+  delivery, including the provisioning profile's background-delivery capability.
+- Items 21, 29, 50, 51, and 52: main-thread budgets, Time Profiler traces, and energy use
+  with the `HeartSyncCheckerPerformance` workloads.
+- Item 49: a trace of watch snapshot publication. Item 59: the export progress row and
+  Cancel, seen in the app.
+- The vendor ring's acceptance list, before the YCBT path can be called verified.
+- The on-screen, VoiceOver, Audio Graph, Dynamic Type, and Reduce Motion passes that items
+  32–41 left.
+
+**Housekeeping**
+
+- `Resources/Localizable.xcstrings` has a large uncommitted change in the working tree,
+  noted as uncommitted since item 55. It appears to be Xcode's automatic refresh, including
+  the removed workout strings. Review it and commit it, or discard it.
+
+Item 68's two interval strings ("Past N days/hours") are not open: N is always at least 2,
+so they need no plural variation.
+
 ## Current review: whole-codebase audit (2026-09-29)
 
 Reviewed `main` at commit
@@ -87,6 +143,9 @@ Suggested order:
 **Implemented:** 42–72, in three passes (the second, for 46, 47, 50, 52, 53, 66, 69, and 72, is
 described under [Second pass](#second-pass-2026-09-29); the third, for 49 and 59, under
 [Third pass](#third-pass-2026-09-29)). Where an item was done in part, the part left is named.
+The "Left" columns were updated on 2026-10-21; see
+[What is still open](#what-is-still-open-checked-2026-10-21). Items 64 and 72 were removed with
+the watch workouts in `58a91cb`.
 
 How it was checked, and what was not:
 
@@ -111,7 +170,7 @@ How it was checked, and what was not:
 | 48 | Remove, rename, pause, and source upserts write first and roll back on failure; Devices shows the failure; removal is refused before startup finishes and happens before the peripheral or credential is forgotten. | Battery/last-seen updates log a failure only. |
 | 51 | No prune, compaction, or checkpoint per HealthKit page. They run on a 15-minute timer and at background transitions under a background-task assertion. Compaction reads only the pass span plus one window, and a maintenance run takes up to five passes. Prune is two `end`-index ranges and rewrites only clamped sources. | Not measured on a device. |
 | 54 | Foreground and timer syncs go through the minimum interval and the backoff. A 429 that the client cannot absorb ends the cycle and keeps earlier collections. The deadline is lifted only by a clean cycle. A watch refresh pulls Health and republishes only. | Nothing. |
-| 55 | `.github/workflows/ios.yml` restored (unit, UI, iPad screenshots, watch build, warnings as errors, iOS 18 and newest runtimes). Both failing tests fixed and both compile warnings removed. Documents that describe CI are accurate again. | The workflow has not run. The catalog change is uncommitted, as before. |
+| 55 | `.github/workflows/ios.yml` restored (unit, UI, iPad screenshots, watch build, warnings as errors, iOS 18 and newest runtimes). Both failing tests fixed and both compile warnings removed. Documents that describe CI are accurate again. | Nothing. The workflow runs on every pull request and push and passes on `main` (checked 2026-10-21); the iPad screenshot run was later dropped (`dc67d91`). The catalog change is still uncommitted. |
 | 56 | Diagnostics are not observed and are built on export; connection state, HRV progress, and pulse-oximeter quality are published only when they change; `lastSeenAt` moves in 15-second steps; the stored-readings count is polled. | Volatile source status (battery, last seen) is still inside the observed `sources` array. |
 | 57 | Legacy compacted-median check starts with a window-boundary test. | Nothing. |
 | 58 | Retention impact and session revisit counts are SQL counts; sessions count only their own sources and metric, with a fingerprint that catches replacement. A baseline from before fingerprints is not compared. | Nothing. |
@@ -119,8 +178,8 @@ How it was checked, and what was not:
 | 61 | `HealthKitManager.dateOfBirth(from:)` uses a Gregorian calendar. | Nothing. |
 | 62 | Bluetooth write-back is queued and saved every 30 seconds and at background, with `HKDevice`, a sync identifier and version, a permission check per batch, a bounded queue, and a reported issue. | Nothing. The issue is shown under the Settings toggle. |
 | 63 | The App Group holds a per-metric projection, and timelines reload only when the projection changes. | Nothing. |
-| 64 | One `AsyncStream` per manager, applied by one main-actor task. | Not exercised on hardware. |
-| 65 | `AppModel.init` seams and `TransportActions`; refresh gated on startup; loops hold `self` weakly across sleeps; tests for 42, 43, and 54. | Derived-metric computation is still methods on `AppModel`, not a pure function over reads. Tests for 47 wait for that item. |
+| 64 | One `AsyncStream` per manager, applied by one main-actor task. | Removed: watch workouts, and `WatchWorkoutManager` with them, were removed in `58a91cb`. |
+| 65 | `AppModel.init` seams and `TransportActions`; refresh gated on startup; loops hold `self` weakly across sleeps; tests for 42, 43, and 54. | Nothing (checked 2026-10-21). `DerivedEstimates.compute` is now a pure function over a `HealthHistory`, run off the main actor; the reset tests for 47 are in `ResetAndIngestTests`. |
 | 67 | Payload dates keep milliseconds. Whole seconds are written exactly as before; both forms decode. | Nothing. |
 | 68 | The types and strings this item names, and every English plural ternary found, use `String(localized:)`; plurals are catalog variations. The tolerance summary no longer compares a localised unit with `"%"`. | Two interval-only strings (`Past N days/hours`) have no plural variation because N is at least 2. |
 | 70 | `Discrepancy` and its engine functions removed, with their four tests moved to the pairwise analysis. Documents corrected. Restore no longer syncs twice. A renamed source keeps its name across syncs. One share-sheet wrapper. | Nothing. |
@@ -153,7 +212,7 @@ How it was checked, and what was not:
 | 53 | An `AppDelegate` configures Bluetooth (central with its restoration identifier), registers one `HKObserverQuery` per type, and starts loading history at launch. Observer handlers wait up to 20 s for startup, drain through `syncAll`, and always call the completion handler. Restoration only adopts peripherals; discovery runs once at power-on. | The `RELEASE_CHECKLIST.md` background steps on a signed device. |
 | 66 | The private per-peripheral dictionaries are one `PeripheralLink` per session and one `PeripheralRecord` per device, with ring plumbing in `RingLink`; session numbers are global. Forget removes both; a radio power-off ends links, and their HRV windows, like a disconnect. Published dictionaries are unchanged so views stay finely invalidated. | Nothing. |
 | 69 | A session across days prints the end's date. RMSSD and pNN50 use adjacent normal-to-normal pairs, never across a rejected beat or a stream gap. Bias and limit intervals use a t quantile on an AR(1) effective sample size, shown in the pair screen and stated in the export. The store accepts the five-minute future skew Bluetooth does. | Nothing. |
-| 72 | Opt-in on the watch's start screen. The watch mirrors the workout and sends a versioned payload per heart-rate update; iPhone sets the mirroring handler at launch and shows it on Now beside Bluetooth heart rate. Display only: never stored, compared, exported, or written to Health. | No Live Activity (it needs an iOS widget extension) or new background mode was added, so the card is reliable only while HeartSync is running. That capability decision is the user's. |
+| 72 | Opt-in on the watch's start screen. The watch mirrors the workout and sends a versioned payload per heart-rate update; iPhone sets the mirroring handler at launch and shows it on Now beside Bluetooth heart rate. Display only: never stored, compared, exported, or written to Health. | Removed in `58a91cb` with the rest of watch workouts; the owner does not want workout recording. |
 
 #### Third pass (2026-09-29)
 
@@ -812,6 +871,8 @@ Group.
 
 ### 64. Serialise watch workout delegate events
 
+**Status (2026-10-21): removed.** Watch workouts were removed in `58a91cb`.
+
 **Observed behavior**
 
 Each `HKWorkoutSessionDelegate` and builder callback spawns its own `Task { @MainActor … }`
@@ -952,6 +1013,9 @@ stay English, as their contract requires.
 
 ### 72. Consider a live watch-versus-sensor view through workout mirroring
 
+**Status (2026-10-21): removed.** It was built in the second pass, then removed in `58a91cb`
+with the rest of watch workouts.
+
 **Design proposal.** `HKWorkoutSession` mirroring (watchOS 10 and iOS 17 onwards) can stream
 a workout's live heart rate to the paired iPhone. During a watch workout, Now could show
 Apple Watch beside a chest strap in real time, while the samples still arrive through the
@@ -975,7 +1039,7 @@ display-only rule so mirrored values never enter the store or a comparison.
 - Outcome types that refuse to read "failed" as "empty" (`HealthStoreQueryOutcome`,
   `ReadingArchive.ReadOutcome`), and startup that will not attach transports to an
   inconclusive store.
-- Pure, testable cores: `ComparisonEngine`, the GATT parsers, `WorkoutLifecycle`,
+- Pure, testable cores: `ComparisonEngine`, the GATT parsers, `WorkoutLifecycle` (since removed with watch workouts),
   `R11MRingSession`, `LiveReloadPolicy`, and `SourceRemovalConsequence`.
 - HealthKit's finite pages, anchor-after-commit rule, and backpressured observer stream.
 - Oura's per-collection isolation, merge-by-ID cache, and careful 401 handling.
@@ -2584,6 +2648,12 @@ including the native watchOS companion and complications.
 are partially complete; each section below records exactly what was deferred and why. The
 “Observed behavior” paragraphs describe the code as reviewed, before those changes.
 
+**Since then (checked 2026-10-21):** item 21's database work moved off the main actor with
+item 50; only its device budgets remain. Item 22's guided capture came through item 33's
+brushed period and **Save as session…**. Item 23's editable relationships and aliases for
+Health and Oura sources are still open. Item 25 no longer applies: watch workouts were
+removed in `58a91cb`. See [What is still open](#what-is-still-open-checked-2026-10-21).
+
 The older audit and its implementation notes are retained below as history. Its original
 “Current behavior” paragraphs describe the earlier checkout, not the app reviewed here.
 Existing SQLite storage, pairwise evidence grades, source-relationship warnings, recovery
@@ -2608,11 +2678,11 @@ Each item distinguishes observed code behavior from a product proposal or perfor
 | 18 | P1 | Key chart series by stable source ID | Observed chart identity issue | Done |
 | 19 | P1 | Carry compaction semantics into metric summaries and full-history exports | Remaining presentation/export gap | Done |
 | 20 | P1 | Qualify pairs by actual measurement timing and show gaps honestly | Analysis refinement | Done |
-| 21 | P1 | Keep large queries, analysis, and exports responsive | Code-supported performance risk; measure on device | Partial — snapshots and export moved off the render path; database work still on the main actor and no device budgets measured |
-| 22 | P2 | Add saved comparison sessions and custom date ranges | Product proposal | Partial — exact periods, saved sessions and revisit disclosure done; no guided capture screen |
+| 21 | P1 | Keep large queries, analysis, and exports responsive | Code-supported performance risk; measure on device | Partial — snapshots and export moved off the render path; database work still on the main actor and no device budgets measured. Reads later moved off main (item 50); device budgets still open |
+| 22 | P2 | Add saved comparison sessions and custom date ranges | Product proposal | Partial — exact periods, saved sessions and revisit disclosure done; no guided capture screen. Done later through item 33's Save as session |
 | 23 | P2 | Add comparison-only source selection and editable source relationships | Product proposal | Partial — comparison-only selection and same-device disclosure done; relationships remain read-only |
 | 24 | P2 | Keep range controls available in the empty Compare screen | Observed navigation dead end | Done |
-| 25 | P1 | Exercise the watch workout lifecycle with deterministic tests | Validation gap | Done (deterministic suite); physical-device recovery and save still unvalidated |
+| 25 | P1 | Exercise the watch workout lifecycle with deterministic tests | Validation gap | Done (deterministic suite); physical-device recovery and save still unvalidated. Removed with watch workouts in `58a91cb` |
 
 **P1** addresses correctness, reliability, or release confidence. **P2** improves product
 usability after those foundations.
