@@ -88,6 +88,9 @@ xcodebuild test -project HeartSyncChecker.xcodeproj -scheme HeartSyncMac \
 Navigate offers Command-1 (Now), Command-2 (Compare), Command-3 (Devices), and Command-4
 (iPhone Sync). In a pair detail, Shift-Command-E opens export. Save uses the native destination
 picker; Cancel keeps the prepared export available until the export sheet is dismissed.
+The UI smoke test checks that Save opens that picker and that cancelling it returns to the
+sheet; it does not save through the picker, which the system draws in another process. The
+exported files' contents are covered by the export unit tests.
 Launch sweeps only HeartSync export folders from before that launch, off the main actor.
 
 The App ID is `com.heartsync.HeartSyncChecker.mac` under team `7RLDYXQTNX`. It is sandboxed
