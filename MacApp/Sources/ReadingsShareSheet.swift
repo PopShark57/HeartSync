@@ -36,7 +36,7 @@ struct ReadingsShareSheet: View {
                     .keyboardShortcut(.defaultAction)
             }
             // The sheet's actions wait while the destination panel is open. That panel is drawn
-            // by another process, so this is also how the UI smoke test sees it open and close.
+            // by another process, so this is also how the UI smoke test sees that it opened.
             .disabled(saving)
         }
         .padding(20)
