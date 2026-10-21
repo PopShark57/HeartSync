@@ -12,6 +12,9 @@ enum Keychain {
         /// Kept only so upgrades can remove credentials saved by pre-OAuth releases.
         case ouraPersonalAccessToken = "oura.pat"
         case ouraOAuthCredentials = "oura.oauth.credentials"
+        /// Mac mirror pairings (`MacMirrorPairingStore`): on the phone, one per paired Mac;
+        /// on a Mac, the phone it mirrors.
+        case macMirrorPairings = "mirror.pairings"
     }
 
     private static let service = "com.heartsync.HeartSyncChecker"

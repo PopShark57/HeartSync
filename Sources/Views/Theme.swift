@@ -48,7 +48,13 @@ enum HeartSyncTheme {
         static var heartRateInk: Color { .pink }
         /// Opaque, adaptive surface for chart annotations. Backdrop-blurring materials
         /// can render as dark bands inside Swift Charts' annotation renderer.
-        static var calloutBackground: Color { Color(uiColor: .secondarySystemBackground) }
+        static var calloutBackground: Color {
+            #if canImport(UIKit)
+            Color(uiColor: .secondarySystemBackground)
+            #else
+            Color(nsColor: .controlBackgroundColor)
+            #endif
+        }
 
         /// Fill opacity of the spread band behind per-device lines.
         static let bandOpacity: Double = 0.14
@@ -91,8 +97,10 @@ private struct ChartHeightModifier: ViewModifier {
     var base: CGFloat
     /// 100 at the default text size; tracks the body text style.
     @ScaledMetric(relativeTo: .body) private var textScale: CGFloat = 100
+    #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    #endif
 
     func body(content: Content) -> some View {
         content.frame(height: height)
@@ -101,8 +109,13 @@ private struct ChartHeightModifier: ViewModifier {
     private var height: CGFloat {
         // Capped so AX5 labels still leave room for the rest of the screen.
         var value = base * min(max(textScale / 100, 1), 2.2)
+        #if os(iOS)
         if horizontalSizeClass == .regular { value *= 1.4 }
         if verticalSizeClass == .compact { value *= 1.2 }
+        #else
+        // A Mac window is as wide as an iPad's regular width.
+        value *= 1.4
+        #endif
         return value.rounded()
     }
 }
@@ -152,7 +165,11 @@ struct HeartSyncAmbientBackground: View {
     var body: some View {
         let strength = colorScheme == .dark ? 1.4 : 1.0
         ZStack {
+            #if canImport(UIKit)
             Color(.systemGroupedBackground)
+            #else
+            Color(nsColor: .windowBackgroundColor)
+            #endif
             RadialGradient(
                 colors: [HeartSyncTheme.accent.opacity(0.20 * strength), .clear],
                 center: .topLeading,
@@ -184,7 +201,7 @@ struct HeartSyncCardBackground: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
+        if #available(iOS 26.0, macOS 26.0, *) {
             shape
                 .fill(.clear)
                 .glassEffect(.regular.tint(tint.opacity(0.10)), in: shape)
@@ -243,6 +260,7 @@ extension View {
     /// because a forced bar background hides them and leaves an empty band above the content.
     @ViewBuilder
     func heartSyncChrome() -> some View {
+        #if os(iOS)
         if #available(iOS 26.0, *) {
             self.tint(HeartSyncTheme.accent)
         } else {
@@ -251,6 +269,29 @@ extension View {
                 .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
                 .toolbarBackground(.visible, for: .navigationBar)
         }
+        #else
+        self.tint(HeartSyncTheme.accent)
+        #endif
+    }
+
+    /// A pushed screen's title: inline on iOS. A Mac window has no large titles to opt out of.
+    @ViewBuilder
+    func heartSyncInlineTitle() -> some View {
+        #if os(iOS)
+        navigationBarTitleDisplayMode(.inline)
+        #else
+        self
+        #endif
+    }
+
+    /// A tab root's title, sharing the toolbar row on iOS (see `heartSyncTrailing`).
+    @ViewBuilder
+    func heartSyncTabTitle() -> some View {
+        #if os(iOS)
+        toolbarTitleDisplayMode(.inlineLarge)
+        #else
+        self
+        #endif
     }
 
     /// A List or Form over the ambient wash instead of flat grouped grey. Rows keep their
@@ -265,7 +306,7 @@ extension View {
     @ViewBuilder
     func heartSyncGlassCapsule(tint: Color, interactive: Bool = false) -> some View {
         #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
+        if #available(iOS 26.0, macOS 26.0, *) {
             glassEffect(
                 interactive ? .regular.tint(tint.opacity(0.16)).interactive() : .regular.tint(tint.opacity(0.16)),
                 in: Capsule()
@@ -288,7 +329,7 @@ extension View {
     @ViewBuilder
     func heartSyncButtonStyle(prominent: Bool = false) -> some View {
         #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
+        if #available(iOS 26.0, macOS 26.0, *) {
             if prominent {
                 buttonStyle(.glassProminent)
             } else {
@@ -317,7 +358,7 @@ struct GlassChipRow<Content: View>: View {
 
     var body: some View {
         #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
+        if #available(iOS 26.0, macOS 26.0, *) {
             GlassEffectContainer(spacing: spacing) {
                 HStack(spacing: spacing) { content }
             }
@@ -326,6 +367,18 @@ struct GlassChipRow<Content: View>: View {
         }
         #else
         HStack(spacing: spacing) { content }
+        #endif
+    }
+}
+
+extension ToolbarItemPlacement {
+    /// Where a screen's actions go: trailing on iOS, because a tab root's title owns the
+    /// leading edge there; the window toolbar's primary position on the Mac.
+    static var heartSyncTrailing: ToolbarItemPlacement {
+        #if os(iOS)
+        .topBarTrailing
+        #else
+        .primaryAction
         #endif
     }
 }

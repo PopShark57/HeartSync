@@ -47,6 +47,18 @@ jobs:
             SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Build Mac mirror
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project HeartSyncChecker.xcodeproj \
+            -scheme HeartSyncMac \
+            -configuration Debug \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/HeartSyncMac-DerivedData" \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            CODE_SIGNING_ALLOWED=NO
+
       # A warning introduced by a change fails the build; the project is warning-free.
       - name: Build app and test bundles, warnings as errors
         run: |

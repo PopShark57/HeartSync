@@ -1426,3 +1426,97 @@ final class HealthStore {
         logger.error("Persistence failed: \(error.localizedDescription, privacy: .public)")
     }
 }
+
+// MARK: - Mac mirror
+
+extension HealthStore {
+    /// Log entries kept for paired Macs beyond what they have acknowledged. About three weeks
+    /// of one 1 Hz strap; a Mac further behind than this is sent a snapshot instead.
+    static let maximumMirrorLogEntries = 2_000_000
+
+    /// Starts or stops the change log a paired Mac follows (`HealthDatabase.setChangeLogging`).
+    @discardableResult
+    func setMirrorChangeLogging(_ enabled: Bool) -> Bool {
+        guard loadState == .loaded, let database else { return false }
+        do {
+            try database.setChangeLogging(enabled)
+            return true
+        } catch {
+            record(error)
+            return false
+        }
+    }
+
+    /// Drops log entries every paired Mac has applied, and caps the rest. `acknowledged` is
+    /// the lowest cursor among paired Macs, or nil when one has never acknowledged anything.
+    @discardableResult
+    func trimMirrorChangeLog(acknowledgedThrough acknowledged: Int64?) -> Bool {
+        guard loadState == .loaded, let database else { return false }
+        do {
+            try database.trimChangeLog(acknowledgedThrough: acknowledged, maximumEntries: Self.maximumMirrorLogEntries)
+            return true
+        } catch {
+            record(error)
+            return false
+        }
+    }
+
+    /// The phone log this mirror follows and how far it has applied it (Mac only).
+    var mirrorPosition: (epoch: String, cursor: Int64)? {
+        _ = dataGeneration
+        guard loadState == .loaded, let database else { return nil }
+        return try? database.mirrorPosition()
+    }
+
+    /// Applies one batch received from the paired iPhone (Mac only).
+    ///
+    /// The Mac never validates, compacts, or prunes what it is sent: the phone has already
+    /// done all of that, and the mirror's job is to hold exactly the rows the phone holds.
+    /// The source list, when sent, replaces the Mac's.
+    func applyMirrorBatch(
+        sources newSources: [DataSource]?,
+        readings: [Reading],
+        removingReadingIDs removals: [UUID],
+        snapshot: HealthDatabase.MirrorSnapshotStep?,
+        epoch: String,
+        cursor: Int64
+    ) throws {
+        guard loadState == .loaded, let database else {
+            throw HealthStoreQueryError.notLoaded
+        }
+        do {
+            let removed = try database.applyMirror(
+                sources: newSources,
+                readings: readings,
+                removingReadingIDs: removals,
+                snapshot: snapshot,
+                epoch: epoch,
+                cursor: cursor
+            )
+            if let newSources { sources = newSources }
+            if newSources != nil || !readings.isEmpty || removed.count > 0 || snapshot != nil {
+                dataGeneration &+= 1
+            }
+            noteRemoval(removed)
+        } catch {
+            record(error)
+            throw error
+        }
+    }
+
+    /// Empties the mirror, for a Mac that has been unpaired (Mac only).
+    @discardableResult
+    func clearMirror() -> Bool {
+        guard loadState == .loaded, let database else { return false }
+        do {
+            try database.clearMirror()
+            sources = []
+            dataGeneration &+= 1
+            noteRemoval(latestEnd: .distantFuture)
+            return true
+        } catch {
+            record(error)
+            return false
+        }
+    }
+}

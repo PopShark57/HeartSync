@@ -54,7 +54,7 @@ struct ComparisonSessionsView: View {
                 }
             }
             .navigationTitle("Saved sessions")
-            .navigationBarTitleDisplayMode(.inline)
+            .heartSyncInlineTitle()
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
@@ -218,7 +218,7 @@ struct SaveComparisonSessionView: View {
                 }
             }
             .navigationTitle("Save session")
-            .navigationBarTitleDisplayMode(.inline)
+            .heartSyncInlineTitle()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

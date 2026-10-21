@@ -42,7 +42,7 @@ struct MetricSourcesView: View {
             }
         }
         .navigationTitle("Metric Sources")
-        .navigationBarTitleDisplayMode(.inline)
+        .heartSyncInlineTitle()
     }
 
     private struct Row {
@@ -154,7 +154,7 @@ struct DisclaimerView: View {
             }
         }
         .navigationTitle("Limitations")
-        .navigationBarTitleDisplayMode(.inline)
+        .heartSyncInlineTitle()
     }
 
     private func bullet(_ text: String) -> some View {

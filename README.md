@@ -159,8 +159,9 @@ leaves it under the iPhone when it cannot tell which watch took it.
 
 ## Data handling
 
-HeartSync's local history stays on your devices; the paired watch receives a display snapshot.
-There is no HeartSync account and no server. Oura authentication
+HeartSync's local history stays on your devices; the paired watch receives a display snapshot,
+and a paired Mac receives a copy over the local network, encrypted end to end (see
+[Mac mirror](#mac-mirror)). There is no HeartSync account and no server. Oura authentication
 opens `cloud.ouraring.com`; subsequent read-only requests go to `api.ouraring.com` using an
 OAuth access token stored in the device-only keychain (never synced to iCloud). No Oura
 client secret is embedded in the app. The iPhone's optional Bluetooth write-back is off by
@@ -288,18 +289,48 @@ embedded complication extension shares `group.com.heartsync.HeartSyncChecker.wat
 watch app. Both profiles must include this group; neither watch target uses HealthKit.
 See [Watch setup and validation](WatchApp/README.md) for commands and device checks.
 
+## Mac mirror
+
+**HeartSync for Mac** (macOS 15+, the `HeartSyncMac` scheme) keeps a read-only copy of the
+iPhone's history and shows it with the iPhone's own screens: Now, Compare with metric detail
+and the pair analysis, saved sessions, and the device list. It has no Bluetooth, HealthKit, or
+Oura connection of its own; everything on it came from the iPhone.
+
+- **Pairing.** On the Mac choose **iPhone Sync › Pair with iPhone…**; on the iPhone open
+  **Settings › Mac › Pair a Mac** and pick the Mac. Both show a six-digit code; confirm it on
+  both. Pairing is an X25519 exchange the code authenticates (the iPhone commits to its key
+  first, so a device in the middle matches the code one time in a million), and it leaves both
+  devices with a shared 256-bit key in their Keychains.
+- **Syncing.** While HeartSync is open on the iPhone and both are on the same network, the
+  iPhone finds the Mac over Bonjour and connects over TLS with that key. The first time it
+  sends everything; after that, only what changed, from a change log the iPhone keeps only
+  while a Mac is paired. Deletions, compaction, Oura revisions, a reset, and removed devices
+  reach the Mac too. The Mac shows when it last heard from the iPhone and never labels a value
+  live.
+- **What is not mirrored.** Oura's sleep hypnograms and daily scores (the iPhone's Oura
+  tab), live Bluetooth state, and settings. The Mac keeps its own comparison choices and saved
+  sessions.
+- **Unpairing.** On the Mac, Unpair deletes the copy. On the iPhone, Forget stops sending;
+  with no Mac left it deletes the change log.
+
+The iPhone asks for Local Network access the first time it pairs. Both apps list
+`_heartsync._tcp` and `_heartsync-pair._tcp` in `NSBonjourServices`. Sync has been tested
+over the loopback interface (real TLS) and in memory; it has not yet been run between a
+physical iPhone and a Mac. See [Mac setup and validation](MacApp/README.md).
+
 ## Tests
 
 The hosted bundle includes Swift Testing coverage for GATT/PLX admission,
 Bluetooth discovery state, transactional SQLite migration and indexed queries, retention and
 compaction provenance, archive/settings recovery, HealthKit outcomes and source relationships,
 real HRV observation intervals, pairwise grades/confidence intervals, exports, estimates, OAuth,
-Oura deletion/durability behavior, and chart selection, zoom, period, and Oura chart
-projections, plus `AppModel` startup, retention, derived metrics, and refresh over injected
+Oura deletion/durability behavior, chart selection, zoom, period, and Oura chart
+projections, Mac sync (change log, batch format, pairing, and both session halves, in memory
+and over TLS on the loopback interface), plus `AppModel` startup, retention, derived metrics, and refresh over injected
 transports. A 15-flow XCUI suite exercises deterministic recovery, empty/error,
 data-control, evidence, drill-down, chart-interaction, Oura chart, and pseudo-localization
 states. `.github/workflows/ios.yml` runs the unit bundle, the UI bundle on an iPhone
-simulator, and the watch build (there is no iPad run), with warnings as errors, on the oldest and newest simulator
+simulator, and the watch and Mac builds (there is no iPad run), with warnings as errors, on the oldest and newest simulator
 runtime a hosted runner offers.
 The separate `HeartSyncCheckerPerformance` scheme writes the full fourteen-day 1 Hz workload;
 run it on a representative physical iPhone with Instruments before release.
@@ -323,12 +354,15 @@ Sources/
   Oura/        OAuth, Cloud API v2 models/client, dashboard cache, document→reading mapping
   Analysis/    ComparisonEngine, pair export, HRVCalculator, Estimators
   Store/       SQLite-backed store, legacy/small JSON archives, keychain, settings
+  MacSync/     Mac mirror: wire format, pairing, TLS transport, both session halves
   Views/       Dashboard, Oura explorer, Compare, pair analysis, Devices, Settings
 Shared/        Display payload, WatchConnectivity, complication projection
 WatchApp/      watchOS dashboard and Compare pages, watch resources
+MacApp/        macOS mirror: app, sync listener, Now/Devices/Sync screens
 ```
 
 For UI development without physical wearables, launch a Debug build with
 `--pairwise-demo`. It uses an in-memory fixture containing agreeing, biased, noisy,
 collecting, no-overlap, and outlier examples; it does not load or save the normal archive
-and does not start any transport.
+and does not start any transport. The Mac app's equivalent is `--mirror-demo`: the chart
+gallery's month of data in an in-memory mirror, with nothing saved and no network listener.

@@ -192,7 +192,7 @@ struct SchemaMigrationTests {
         try writeVersion2Database(at: url, readings: written)
 
         let database = try HealthDatabase(url: url)
-        #expect(userVersion(at: url) == 3)
+        #expect(userVersion(at: url) == Int32(HealthDatabase.schemaVersion))
         #expect(try database.rowsAwaitingValueBackfill() == written.count)
         // Before the backfill every row is decoded from its payload, as it always was.
         #expect(Set(try database.allReadings()) == Set(written))

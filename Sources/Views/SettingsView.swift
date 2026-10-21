@@ -84,6 +84,19 @@ struct SettingsView: View {
                 .disabled(settingsUnavailable)
 
                 Section {
+                    NavigationLink {
+                        MacSyncSettingsView()
+                    } label: {
+                        LabeledContent("Mac") {
+                            Text(macSummary).foregroundStyle(.secondary)
+                        }
+                    }
+                    .accessibilityIdentifier("settings.mac")
+                } footer: {
+                    Text("Keep a copy of your history in HeartSync on a Mac on the same Wi\u{2011}Fi network.")
+                }
+
+                Section {
                     Picker("Keep readings for", selection: Binding(
                         get: { retentionSelection },
                         set: { proposeRetention($0) }
@@ -321,6 +334,15 @@ struct SettingsView: View {
         samples, the full distribution, and later corrections are lost. A longer retention \
         therefore keeps a longer history of fixed windowed medians, not every raw sample.
         """
+    }
+
+    private var macSummary: String {
+        let count = model.macMirror.pairings.count
+        switch count {
+        case 0: return String(localized: "settings.mac.none", defaultValue: "Not paired", comment: "Settings row: no Mac is paired")
+        case 1: return model.macMirror.pairings[0].peer.name
+        default: return String(localized: "settings.mac.count", defaultValue: "\(count) Macs", comment: "Settings row: how many Macs are paired")
+        }
     }
 
     private var profileSummary: String {

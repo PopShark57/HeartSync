@@ -1,7 +1,6 @@
 import Charts
 import Foundation
 import SwiftUI
-import UIKit
 
 /// Focused evidence for one metric and one canonically ordered source pair.
 ///
@@ -95,7 +94,7 @@ struct PairwiseAnalysisView: View {
             }
         }
         .navigationTitle(kind.title)
-        .navigationBarTitleDisplayMode(.inline)
+        .heartSyncInlineTitle()
         .heartSyncScreenBackground()
         .onChange(of: range) {
             selectedObservationStart = nil

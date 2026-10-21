@@ -33,10 +33,17 @@
 	<string>1</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>HeartSync uses Bluetooth to discover, connect to, and read measurements from nearby health sensors.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_heartsync._tcp</string>
+		<string>_heartsync-pair._tcp</string>
+	</array>
 	<key>NSHealthShareUsageDescription</key>
 	<string>HeartSync reads heart and related measurements from Apple Health so you can compare your devices.</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>HeartSync saves directly measured Bluetooth readings to Apple Health when you enable mirroring.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>HeartSync finds your Mac on the local network to send it a copy of your history.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>
