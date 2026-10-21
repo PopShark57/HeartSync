@@ -58,53 +58,33 @@ final class MacSmokeTests: XCTestCase {
         app.activate()
         app.typeKey(.escape, modifierFlags: []) // Cancel the native destination picker.
         XCTAssertTrue(save.waitForExistence(timeout: 5))
-        let destination = try Self.exportDestination()
-        defer { try? FileManager.default.removeItem(at: destination) }
+        // The runner is sandboxed, so it can read only its own container, and HeartSync
+        // moving files into that container is a cross-app write that macOS 14 and later guard
+        // with an "access data from other apps" prompt nobody answers on CI. So the files go
+        // to /Users/Shared, which belongs to no app and which the panel grants as the user's
+        // choice, and the outcome is read from HeartSync itself: the sheet closes only when
+        // the move succeeded and stays open with its error otherwise. The files' contents are
+        // covered by the export unit tests. Names carry a UTC timestamp, so runs never collide;
+        // a local run leaves its two small files in /Users/Shared.
         app.activate()
         save.click()
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))
         app.typeKey("g", modifierFlags: [.command, .shift])
-        app.typeText(destination.path)
+        app.typeText("/Users/Shared")
         app.typeKey(.return, modifierFlags: [])
         app.typeKey(.return, modifierFlags: [])
-        let filesSaved = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            (try? FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil).count) == 2
-        }, object: nil)
-        let saveResult = XCTWaiter.wait(for: [filesSaved], timeout: 10)
+        let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: save)
+        let saveResult = XCTWaiter.wait(for: [closed], timeout: 10)
         if saveResult != .completed {
             // The whole screen, not just the app: a privacy alert from another process, a save
-            // error in the sheet, or a panel still open each explain a missing file differently.
+            // error in the sheet, and a panel still open each mean something different.
             let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
-            screenshot.name = "Export did not reach \(destination.path)"
+            screenshot.name = "Export sheet still open after saving to /Users/Shared"
             screenshot.lifetime = .keepAlways
             add(screenshot)
         }
-        XCTAssertEqual(saveResult, .completed)
+        XCTAssertEqual(saveResult, .completed, "The export sheet closes only after a successful move")
         XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "pairwise.export").firstMatch.waitForExistence(timeout: 5))
-        // Save dismissed the export and its ordinary temporary-directory cleanup ran.
-        // Both complete files must still exist in the selected destination afterwards.
-        let saved = (try? FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil)) ?? []
-        XCTAssertEqual(Set(saved.map(\.pathExtension)), ["csv", "txt"])
-        for file in saved { XCTAssertGreaterThan((try? Data(contentsOf: file).count) ?? 0, 0) }
-    }
-
-    /// A fresh folder for the save panel to move the export into.
-    ///
-    /// Not this runner's temporary directory when avoidable: that sits inside the runner's
-    /// container, and since macOS 14 another app writing there raises "would like to access
-    /// data from other apps", which nobody answers on CI. `/Users/Shared` belongs to no app
-    /// (Apple DTS's suggestion for this XCUITest case); the temporary directory remains the
-    /// fallback for a runner that cannot create a folder there.
-    private static func exportDestination() throws -> URL {
-        let name = "HeartSync-ExportSmoke-\(UUID().uuidString)"
-        let shared = URL(fileURLWithPath: "/Users/Shared", isDirectory: true)
-            .appendingPathComponent(name, isDirectory: true)
-        if (try? FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)) != nil {
-            return shared
-        }
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(name, isDirectory: true)
-        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
-        return temporary
     }
 
 }
