@@ -48,6 +48,10 @@ final class MacSmokeTests: XCTestCase {
         XCTAssertTrue(pair.waitForExistence(timeout: 10))
         app.activate()
         pair.click()
+        // The export button, and with it the shortcut, exists only once the pair analysis has
+        // loaded its observations; a shortcut typed before then does nothing.
+        let export = app.descendants(matching: .any).matching(identifier: "pairwise.export").firstMatch
+        XCTAssertTrue(export.waitForExistence(timeout: 10))
         app.typeKey("e", modifierFlags: [.command, .shift])
         let save = app.buttons["Save…"]
         XCTAssertTrue(save.waitForExistence(timeout: 10))
@@ -84,7 +88,7 @@ final class MacSmokeTests: XCTestCase {
             add(screenshot)
         }
         XCTAssertEqual(saveResult, .completed, "The export sheet closes only after a successful move")
-        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "pairwise.export").firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(export.waitForExistence(timeout: 5))
     }
 
 }
