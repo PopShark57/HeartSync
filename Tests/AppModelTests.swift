@@ -302,10 +302,17 @@ struct AppModelDerivedMetricTests {
         model.ensureEstimateSourceExists()
         model.store.upsert(DataSource(id: "strap", displayName: "Strap", transport: .bluetooth))
         let stamp = Date.now.addingTimeInterval(-30)
-        let previous = [MetricKind.stress, .bloodPressureSystolic, .bloodPressureDiastolic, .vo2Max].map { kind in
-            Reading(sourceID: kind == .vo2Max ? "strap" : AppModel.estimateSourceID, kind: kind,
-                    value: kind == .bloodPressureSystolic ? 120 : kind == .bloodPressureDiastolic ? 80 : 42,
-                    start: stamp, provenance: .estimated, metadata: ReadingMetadata(modelledBy: ReadingMetadata.heartSyncModel))
+        // Explicit types: Xcode 16 could not type-check the nested ternaries in reasonable time.
+        let previous: [Reading] = [MetricKind.stress, .bloodPressureSystolic, .bloodPressureDiastolic, .vo2Max].map { (kind: MetricKind) -> Reading in
+            let sourceID: String = kind == .vo2Max ? "strap" : AppModel.estimateSourceID
+            let value: Double
+            switch kind {
+            case .bloodPressureSystolic: value = 120
+            case .bloodPressureDiastolic: value = 80
+            default: value = 42
+            }
+            return Reading(sourceID: sourceID, kind: kind, value: value,
+                           start: stamp, provenance: .estimated, metadata: ReadingMetadata(modelledBy: ReadingMetadata.heartSyncModel))
         }
         model.store.append(contentsOf: previous)
         model.store.injectQueryFailureForTesting()

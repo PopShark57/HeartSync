@@ -35,6 +35,9 @@ struct ReadingsShareSheet: View {
                 Button("Save…") { saving = true }
                     .keyboardShortcut(.defaultAction)
             }
+            // The sheet's actions wait while the destination panel is open. That panel is drawn
+            // by another process, so this is also how the UI smoke test sees that it opened.
+            .disabled(saving)
         }
         .padding(20)
         .frame(minWidth: 420)
