@@ -21,16 +21,8 @@ struct DashboardView: View {
     @State private var lastRetryToken = 0
     /// Bumped by the retry button so the load key changes and the query runs again.
     @State private var retryToken = 0
-    /// The on-device summary above the cards, with the facts it was written from.
-    @State private var brief: NowBriefDisplay?
-    @State private var lastBriefAttempt: Date?
-
-    private struct BriefRequest: Hashable {
-        var facts: NowBriefFacts?
-        var period: Int
-    }
-
-    private static let briefInterval: TimeInterval = 180
+    /// The on-device summary above the cards: when to ask for it, and what it chose.
+    @State private var brief = NowBriefController()
 
     /// Clock for the freshness cutoff, not for the timestamps.
     ///
@@ -89,11 +81,10 @@ struct DashboardView: View {
                         }
                     } else {
                         let facts = NowBriefFacts.build(metrics: snapshot.metrics, stressBand: stressBand, now: now)
+                        let unavailability = NowBriefGenerator.unavailability
                         ScrollView {
                             VStack(alignment: .leading, spacing: 16) {
-                                if let brief, brief.isValid(for: facts, now: now, available: NowBriefGenerator.isAvailable) {
-                                    NowBriefView(text: brief.text, generatedAt: brief.generatedAt)
-                                }
+                                NowBriefSection(controller: brief, facts: facts, now: now, unavailability: unavailability)
                                 if let issue = model.derivedHistoryIssue {
                                     Label(issue, systemImage: "exclamationmark.triangle")
                                         .font(.caption).foregroundStyle(.orange)
@@ -121,7 +112,9 @@ struct DashboardView: View {
                             .padding(.bottom, 24)
                         }
                         // Keyed by what the brief would say, not by every reading.
-                        .task(id: BriefRequest(facts: facts, period: Int(now.timeIntervalSince1970 / Self.briefInterval))) { await refreshBrief(facts) }
+                        .task(id: brief.request(facts: facts, unavailability: unavailability, now: now)) {
+                            await brief.refresh(facts, unavailability: unavailability)
+                        }
                     }
                 } else {
                     ProgressView()
@@ -161,7 +154,10 @@ struct DashboardView: View {
                         ProgressView()
                     } else {
                         Button {
-                            Task { await model.refresh() }
+                            Task {
+                                await model.refresh()
+                                brief.requestRefresh()
+                            }
                         } label: {
                             Image(systemName: "arrow.clockwise")
                         }
@@ -169,7 +165,12 @@ struct DashboardView: View {
                     }
                 }
             }
-            .refreshable { await model.refresh() }
+            .refreshable {
+                await model.refresh()
+                // A pull asks for a new brief too, from the refreshed readings and without
+                // waiting out the throttle.
+                brief.requestRefresh()
+            }
             .onReceive(tick) { now = $0 }
         }
     }
@@ -191,19 +192,6 @@ struct DashboardView: View {
     private var stressBand: StressModel.Band? {
         guard case .success(let assessment) = model.stress else { return nil }
         return assessment.band
-    }
-
-    /// Asks the on-device model for a new brief when the facts changed, no more often than
-    /// `briefInterval`. Obsolete prose loses display permission immediately.
-    private func refreshBrief(_ facts: NowBriefFacts?) async {
-        if brief?.isValid(for: facts, now: .now, available: NowBriefGenerator.isAvailable) != true { brief = nil }
-        guard let facts, NowBriefGenerator.isAvailable else { return }
-        let wait = lastBriefAttempt.map { max(1, Self.briefInterval - Date.now.timeIntervalSince($0)) } ?? 1
-        do { try await Task.sleep(for: .seconds(wait)) } catch { return }
-        guard !Task.isCancelled else { return }
-        lastBriefAttempt = .now
-        guard let text = await NowBriefGenerator.generate(facts), !Task.isCancelled else { return }
-        brief = NowBriefDisplay(text: text, facts: facts, generatedAt: .now)
     }
 
     /// What moved the current stress level most, when the latest assessment scored.

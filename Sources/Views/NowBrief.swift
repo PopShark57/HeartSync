@@ -93,6 +93,14 @@ struct NowBriefFacts: Hashable, Sendable {
         return NowBriefFacts(items: items, key: keyParts.joined(separator: ";"))
     }
 
+    /// The current sentences for `kinds`, in the facts' order, when they pass
+    /// `NowBriefCheck`; nil when none of them is among these facts.
+    func rendered(_ kinds: [MetricKind]) -> String? {
+        let sentences = items.filter { kinds.contains($0.kind) }.map(\.sentence)
+        guard !sentences.isEmpty else { return nil }
+        return NowBriefCheck.accepted(sentences.joined(separator: " "), facts: self)
+    }
+
     /// The prompt handed to the model: the facts and nothing else.
     var prompt: String {
         "Readings:\n" + lines.map { "- " + $0 }.joined(separator: "\n")
@@ -204,14 +212,21 @@ enum NowBriefCheck {
 
 }
 
-/// Generation throttling never grants permission to keep showing obsolete facts.
-struct NowBriefDisplay: Sendable {
-    static let lifetime: TimeInterval = 180
-    var text: String
-    var facts: NowBriefFacts
+/// What the model chose, and when. The text is rendered from the facts current when it is
+/// shown, never kept: a 1 Hz strap, an ageing reading, or a new device count changes the
+/// sentence at once, so a brief can never show a value the cards no longer show.
+///
+/// The selection is bounded in time independently from generation throttling: after
+/// `lifetime` it is no longer shown, whatever the model is doing.
+struct NowBriefDisplay: Hashable, Sendable {
+    static let lifetime: TimeInterval = 15 * 60
+    var kinds: [MetricKind]
     var generatedAt: Date
 
-    func isValid(for current: NowBriefFacts?, now: Date, available: Bool) -> Bool {
-        available && current == facts && now >= generatedAt && now.timeIntervalSince(generatedAt) < Self.lifetime
+    /// The brief to show for `current`, or nil.
+    func text(for current: NowBriefFacts?, now: Date, available: Bool) -> String? {
+        guard available, let current, now >= generatedAt,
+              now.timeIntervalSince(generatedAt) < Self.lifetime else { return nil }
+        return current.rendered(kinds)
     }
 }

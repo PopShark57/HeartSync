@@ -148,8 +148,9 @@ struct NowBriefTests {
     @Test("Without an SDK model or Apple Intelligence there is no brief")
     func unavailableGeneratesNothing() async throws {
         let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: nil, now: now))
-        if !NowBriefGenerator.isAvailable {
-            #expect(await NowBriefGenerator.generate(facts) == nil)
+        if let reason = NowBriefGenerator.unavailability {
+            #expect(!NowBriefGenerator.isAvailable)
+            #expect(await NowBriefGenerator.generate(facts) == .unavailable(reason))
         }
     }
     @Test("Units, roles, missing values, pressure order and ages cannot be rewritten")
@@ -163,24 +164,140 @@ struct NowBriefTests {
         ] { #expect(NowBriefCheck.accepted(draft, facts: facts) == nil) }
     }
 
-    @Test("Display permission expires independently from generation throttling")
-    func invalidatesChangedFacts() throws {
+    @Test("A selection names readings; the model's indices map to their metrics")
+    func selectionNamesKinds() throws {
         let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
-        let brief = NowBriefDisplay(text: facts.lines.joined(separator: " "), facts: facts, generatedAt: now)
-        #expect(brief.isValid(for: facts, now: now, available: true))
-        #expect(!brief.isValid(for: facts, now: now.addingTimeInterval(181), available: true))
-        #expect(!brief.isValid(for: nil, now: now, available: true))
-        #expect(!brief.isValid(for: facts, now: now, available: false))
-        var changed = metrics
-        changed[1].comparison?.sourceCount = 3
-        let differentCount = NowBriefFacts.build(metrics: changed, stressBand: .normal, now: now)
-        #expect(differentCount?.key != facts.key)
-        #expect(!brief.isValid(for: differentCount, now: now, available: true))
-        changed = metrics
-        changed[2].rows[0].provenance = .measured
-        let measured = NowBriefFacts.build(metrics: changed, stressBand: .normal, now: now)
-        #expect(measured?.key != facts.key)
-        #expect(!brief.isValid(for: measured, now: now, available: true))
+        #expect(NowBriefGenerator.selectedKinds(selection: "0, 2", facts: facts) == [.heartRate, .bloodPressureSystolic])
+        #expect(NowBriefGenerator.selectedKinds(selection: "2,0", facts: facts) == nil)
+        #expect(facts.rendered([.bodyTemperature]) == nil)
     }
 
+    @Test("A shown brief is always rendered from the current facts")
+    func rendersCurrentFacts() throws {
+        let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
+        let brief = NowBriefDisplay(kinds: [.heartRate, .bloodPressureSystolic], generatedAt: now)
+        #expect(brief.text(for: facts, now: now, available: true) == "\(facts.items[0].sentence) \(facts.items[2].sentence)")
+
+        // A strap moves heart rate between reloads: the brief says what the card says.
+        var changed = metrics
+        changed[1].headline = 86
+        let moved = try #require(NowBriefFacts.build(metrics: changed, stressBand: .normal, now: now))
+        #expect(try #require(brief.text(for: moved, now: now, available: true)).hasPrefix("Heart rate is 86 bpm now"))
+
+        // A third device and an older reading change their sentences too.
+        changed = metrics
+        changed[1].comparison?.sourceCount = 3
+        let later = now.addingTimeInterval(3_600)
+        let recounted = try #require(NowBriefFacts.build(metrics: changed, stressBand: .normal, now: later))
+        // Chosen a minute before, so the selection is inside its lifetime.
+        let renewed = NowBriefDisplay(kinds: brief.kinds, generatedAt: later.addingTimeInterval(-60))
+        let text = try #require(renewed.text(for: recounted, now: later, available: true))
+        #expect(text.contains("3 devices agree"))
+        #expect(text.contains("when last reported, 3 hours ago"))
+        #expect(!text.contains("2 hours ago"))
+    }
+
+    @Test("A selection is shown only while it is current, available, and among the facts")
+    func displayBounds() throws {
+        let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
+        let brief = NowBriefDisplay(kinds: [.heartRate], generatedAt: now)
+        #expect(brief.text(for: facts, now: now.addingTimeInterval(NowBriefDisplay.lifetime - 1), available: true) != nil)
+        #expect(brief.text(for: facts, now: now.addingTimeInterval(NowBriefDisplay.lifetime), available: true) == nil)
+        #expect(brief.text(for: facts, now: now.addingTimeInterval(-1), available: true) == nil)
+        #expect(brief.text(for: nil, now: now, available: true) == nil)
+        #expect(brief.text(for: facts, now: now, available: false) == nil)
+        // The reading it chose has left the screen.
+        let withoutHeartRate = try #require(NowBriefFacts.build(metrics: metrics.filter { $0.kind != .heartRate }, stressBand: .normal, now: now))
+        #expect(brief.text(for: withoutHeartRate, now: now, available: true) == nil)
+    }
+
+    // MARK: Scheduling
+
+    private actor Script {
+        private var outcomes: [NowBriefGenerator.Outcome]
+        private(set) var calls = 0
+        init(_ outcomes: [NowBriefGenerator.Outcome]) { self.outcomes = outcomes }
+        func next() async -> NowBriefGenerator.Outcome {
+            calls += 1
+            // Long enough for the caller's task to be cancelled while the model "runs".
+            try? await Task.sleep(for: .milliseconds(50))
+            return outcomes.isEmpty ? .noBrief : outcomes.removeFirst()
+        }
+    }
+
+    private func controller(_ script: Script) -> NowBriefController {
+        let now = now
+        return NowBriefController(generate: { _ in await script.next() }, clock: { now })
+    }
+
+    @Test("A reload that cancels the screen's task does not discard the model's answer")
+    func cancellationKeepsTheAnswer() async throws {
+        let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
+        let script = Script([.selected([.heartRate])])
+        let brief = controller(script)
+        let task = Task { await brief.refresh(facts, unavailability: nil) }
+        while !brief.isGenerating { await Task.yield() }
+        // A 1 Hz strap changes the facts and SwiftUI cancels the task mid-call.
+        task.cancel()
+        await task.value
+        #expect(brief.display?.kinds == [.heartRate])
+        #expect(!brief.isGenerating)
+        #expect(await script.calls == 1)
+    }
+
+    @Test("Unasked requests wait out the throttle; Regenerate and pull to refresh do not")
+    func throttleAndForcedRefresh() async throws {
+        let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
+        let script = Script([.selected([.heartRate]), .noBrief])
+        let brief = controller(script)
+        await brief.refresh(facts, unavailability: nil)
+        #expect(brief.delay(at: now) == NowBriefController.interval)
+        #expect(brief.delay(at: now.addingTimeInterval(60)) == NowBriefController.interval - 60)
+
+        // Facts changed within the throttle: the request waits, and a newer key cancels the wait.
+        let waiting = Task { await brief.refresh(facts, unavailability: nil) }
+        await Task.yield()
+        waiting.cancel()
+        await waiting.value
+        #expect(await script.calls == 1)
+
+        // The person asks: a new key, no wait.
+        let before = brief.request(facts: facts, unavailability: nil, now: now)
+        brief.requestRefresh()
+        #expect(brief.request(facts: facts, unavailability: nil, now: now) != before)
+        #expect(brief.delay(at: now) == 0)
+        await brief.refresh(facts, unavailability: nil)
+        #expect(await script.calls == 2)
+        // A declined request keeps the earlier selection, and says it produced none.
+        #expect(brief.display?.kinds == [.heartRate])
+        #expect(brief.lastOutcome == .noBrief)
+    }
+
+    @Test("Nothing is asked without facts or without Apple Intelligence")
+    func asksOnlyWhenPossible() async throws {
+        let facts = try #require(NowBriefFacts.build(metrics: metrics, stressBand: .normal, now: now))
+        let script = Script([.selected([.heartRate])])
+        let brief = controller(script)
+        await brief.refresh(nil, unavailability: nil)
+        await brief.refresh(facts, unavailability: .turnedOff)
+        #expect(await script.calls == 0)
+        #expect(brief.display == nil)
+    }
+
+    @Test("The status line says why there is no brief, and is silent where it cannot run")
+    func statusLine() {
+        typealias C = NowBriefController
+        #expect(C.status(unavailability: .notSupported, isGenerating: false, lastOutcome: .noBrief) == nil)
+        #expect(C.status(unavailability: .turnedOff, isGenerating: false, lastOutcome: nil) == .turnedOff)
+        #expect(C.status(unavailability: .notReady, isGenerating: false, lastOutcome: nil) == .notReady)
+        #expect(C.status(unavailability: nil, isGenerating: true, lastOutcome: .noBrief) == .selecting)
+        #expect(C.status(unavailability: nil, isGenerating: false, lastOutcome: .noBrief) == .noBrief)
+        #expect(C.status(unavailability: nil, isGenerating: false, lastOutcome: nil) == nil)
+        #expect(C.status(unavailability: nil, isGenerating: false, lastOutcome: .selected([.heartRate])) == nil)
+    }
+
+    @Test("The renewal period asks again before a steady selection expires")
+    func renewalPrecedesExpiry() {
+        #expect(NowBriefController.renewalInterval + NowBriefController.interval < NowBriefDisplay.lifetime)
+    }
 }

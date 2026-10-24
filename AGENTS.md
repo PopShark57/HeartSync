@@ -425,8 +425,10 @@ Watch snapshot construction publishes unavailable and discards failed cache work
 required query failure. Latest watch values are read through one grouped indexed request.
 
 The optional Now brief uses model-selected sentence indices and deterministic fact rendering.
-Its display state validates current facts, provenance, device counts, freshness and a bounded
-lifetime independently from the generation throttle.
+Its display state (`NowBriefDisplay`) keeps only the chosen metrics and when they were chosen;
+the text is rendered from the current facts each time it is shown, so values, provenance,
+device counts and ages are always the cards', and a bounded lifetime applies independently
+from the generation throttle.
 
 ## Analysis and Data-Integrity Invariants
 
@@ -480,7 +482,7 @@ The application is SwiftUI-first and targets iOS 18:
 - A screen that loads a snapshot per key shows "Updating for the new selection…" and dims and disables the old results while the question has changed, as Compare and metric detail do.
 - Now: only a streaming Bluetooth source can be labelled Live (`SourceChipStatus`). Sparklines draw completed-window medians only and are cached until the window closes. Motion honours Reduce Motion.
 - Now keeps each enabled device's last reading of a metric for `DashboardSnapshot.recentHorizon(for:)` (seven days; 30 for daily summaries) through one bounded `LIMIT 1` read per device (`HealthDatabase.latest(kind:sourceID:midpointIn:)`). Such a row is `isCurrent == false`, listed after the live rows, never compared, and a card with no live row says "Last reported … Not a live value." Verdicts still come from the live windows only.
-- The Now brief (`NowBriefFacts`, `NowBriefCheck`, `NowBriefGenerator`) is written on the device by Apple's language model from one sentence per card and shown only if `NowBriefCheck` accepts it: every number belongs to the reading it is said of, an estimate is called one and a measurement is not, a reading that is not live keeps its age, and no judgement word, diagnosis, or reading the facts lack appears. Three attempts, then no brief. Regenerated when the rounded facts change, at most every three minutes. Nothing leaves the device; without Apple Intelligence (or on iOS 18) there is no brief.
+- The Now brief (`NowBriefFacts`, `NowBriefCheck`, `NowBriefGenerator`) is written on the device by Apple's language model from one sentence per card and shown only if `NowBriefCheck` accepts it: every number belongs to the reading it is said of, an estimate is called one and a measurement is not, a reading that is not live keeps its age, and no judgement word, diagnosis, or reading the facts lack appears. Three attempts, then no brief. `NowBriefController` asks again when the rounded facts change (at most every three minutes) and every ten minutes; Regenerate, pull to refresh, and Refresh ask at once. A model call runs in a task of its own, so a reload that cancels the screen's task (a 1 Hz strap does, every second) never discards the answer. When there is no brief, a line says why (being selected, declined this time, Apple Intelligence off or not ready). Nothing leaves the device; without Apple Intelligence (or on iOS 18, or an ineligible device) there is no brief and no line.
 - Layout adapts to size class: `.sidebarAdaptable` tabs, an adaptive grid on Now, and a split view on Compare in regular widths.
 - Use SF Symbols, semantic system colors, monospaced digits for measurements, and existing source colors.
 - Keep empty, loading, unavailable, insufficient-evidence, and estimated states explicit. Do not hide uncertainty to make a screen look complete.
@@ -697,7 +699,9 @@ The hosted unit bundle uses Apple's Swift Testing package (`import Testing`, `@S
   old record, no contact, and live measurements reading no memory.
 - `Tests/NowBriefTests.swift`: covers the facts' order and caveats, the coarse
   key, accepted model drafts, numbers tied to their reading, estimate wording, kept ages,
-  judgement and diagnosis, readings the facts lack, and longest-name matching.
+  judgement and diagnosis, readings the facts lack, longest-name matching, rendering a
+  selection from the current facts and its lifetime, a cancelled screen task keeping the
+  model's answer, the throttle and the forced refresh, and the status line.
 - `Tests/Watch/WatchChartTests.swift`: covers chart payload compatibility and
   validation, the 1H/3H/24H/7D/30D periods and their windows, per-period evidence, empty periods,
   the long-period cache and its invalidation (only by removals that reach a period, routine
@@ -761,7 +765,7 @@ and copy or symlink the real source files into it — `Sources/Store`, `Sources/
 `Sources/Views/ComparisonEmptyReason.swift`, the other Foundation-only view projections
 (`DashboardSnapshot`, `PairwiseSnapshot`, `ChartSegmentation`, `LiveReloadPolicy`,
 `SourceRemovalConsequence`, `WindowLabel`, `ChartLookup`, `ChartViewport`,
-`MetricChartProjection`, `ReadingsExportJob`, `NowBrief`, `NowBriefGenerator`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
+`MetricChartProjection`, `ReadingsExportJob`, `NowBrief`, `NowBriefGenerator`, `NowBriefController`, `Oura/OuraSleepStage`, `Oura/OuraCategoryTimeline`,
 `Oura/OuraMovementClass`, `Oura/OuraDailyTrend`), `Shared`, plus
 `Sources/Bluetooth/GATT.swift` for `BodySensorLocation` (CoreBluetooth exists on macOS, so it needs no shim, and
 `R11MRingSession`), the Foundation-only Bluetooth files (`BluetoothDiagnostics`,
