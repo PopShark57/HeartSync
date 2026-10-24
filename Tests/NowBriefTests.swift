@@ -189,7 +189,9 @@ struct NowBriefTests {
         changed[1].comparison?.sourceCount = 3
         let later = now.addingTimeInterval(3_600)
         let recounted = try #require(NowBriefFacts.build(metrics: changed, stressBand: .normal, now: later))
-        let text = try #require(brief.text(for: recounted, now: later, available: true))
+        // Chosen a minute before, so the selection is inside its lifetime.
+        let renewed = NowBriefDisplay(kinds: brief.kinds, generatedAt: later.addingTimeInterval(-60))
+        let text = try #require(renewed.text(for: recounted, now: later, available: true))
         #expect(text.contains("3 devices agree"))
         #expect(text.contains("when last reported, 3 hours ago"))
         #expect(!text.contains("2 hours ago"))
