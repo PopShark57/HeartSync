@@ -4,34 +4,128 @@ import SwiftUI
 // The pieces of the Now screen, shared by `DashboardView` on iPhone and the Mac mirror's
 // Now screen, so both draw a reading, its age, and its verdict the same way.
 
+/// The brief above the cards, or one line saying why there is none and how to ask again.
+struct NowBriefSection: View {
+    var controller: NowBriefController
+    var facts: NowBriefFacts?
+    var now: Date
+    var unavailability: NowBriefGenerator.Unavailability?
+
+    var body: some View {
+        if let display = controller.display,
+           let text = display.text(for: facts, now: now, available: unavailability == nil) {
+            NowBriefView(
+                text: text,
+                generatedAt: display.generatedAt,
+                isRegenerating: controller.isGenerating,
+                regenerate: { controller.requestRefresh() }
+            )
+        } else if let status = NowBriefController.status(
+            unavailability: unavailability,
+            isGenerating: controller.isGenerating,
+            lastOutcome: controller.lastOutcome
+        ) {
+            NowBriefStatusView(status: status) { controller.requestRefresh() }
+        }
+    }
+}
+
 /// The on-device summary of the cards: a plain paragraph, not a card, so it reads as a
 /// subtitle rather than competing with the measurements.
 struct NowBriefView: View {
     var text: String
     var generatedAt: Date
+    var isRegenerating = false
+    var regenerate: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(text)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Label {
-                #if os(macOS)
-                Text("From the readings below, selected on this Mac by Apple Intelligence at \(generatedAt, style: .time). Not medical advice.")
-                #else
-                Text("From the readings below, selected on this iPhone by Apple Intelligence at \(generatedAt, style: .time). Not medical advice.")
-                #endif
-            } icon: {
-                Image(systemName: "sparkles")
+            VStack(alignment: .leading, spacing: 4) {
+                Text(text)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Label {
+                    #if os(macOS)
+                    Text("From the readings below, selected on this Mac by Apple Intelligence at \(generatedAt, style: .time). Not medical advice.")
+                    #else
+                    Text("From the readings below, selected on this iPhone by Apple Intelligence at \(generatedAt, style: .time). Not medical advice.")
+                    #endif
+                } icon: {
+                    Image(systemName: "sparkles")
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
             }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("now.brief")
+            if let regenerate {
+                NowBriefRegenerateButton(isRegenerating: isRegenerating, action: regenerate)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, 2)
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("now.brief")
+    }
+}
+
+/// Why there is no brief: being selected, declined this time, or Apple Intelligence off or
+/// not ready. Nothing is shown where Apple Intelligence cannot run at all.
+struct NowBriefStatusView: View {
+    var status: NowBriefController.Status
+    var retry: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                if status == .selecting {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "sparkles").accessibilityHidden(true)
+                }
+                Text(message)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("now.brief.status")
+            if status == .noBrief || status == .notReady {
+                NowBriefRegenerateButton(isRegenerating: false, action: retry)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 2)
+    }
+
+    private var message: LocalizedStringKey {
+        switch status {
+        case .selecting: return "Apple Intelligence is selecting a brief from the readings below\u{2026}"
+        case .noBrief: return "Apple Intelligence did not produce a brief this time."
+        case .turnedOff:
+            #if os(macOS)
+            return "Turn on Apple Intelligence in System Settings to see a brief of these readings here."
+            #else
+            return "Turn on Apple Intelligence in Settings to see a brief of these readings here."
+            #endif
+        case .notReady: return "Apple Intelligence is still getting ready. The brief appears once it is."
+        }
+    }
+}
+
+/// Asks for a new brief now, without waiting for the readings to change.
+private struct NowBriefRegenerateButton: View {
+    var isRegenerating: Bool
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(isRegenerating ? LocalizedStringKey("Regenerating\u{2026}") : "Regenerate brief", systemImage: "arrow.clockwise")
+        }
+        .font(.caption)
+        .buttonStyle(.borderless)
+        .disabled(isRegenerating)
+        .accessibilityHint("Asks Apple Intelligence for a new brief from the current readings.")
+        .accessibilityIdentifier("now.brief.regenerate")
     }
 }
 

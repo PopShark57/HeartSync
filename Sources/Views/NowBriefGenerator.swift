@@ -7,8 +7,9 @@ import FoundationModels
 ///
 /// Runs entirely on the device: the readings never leave it. Available on iOS 26 and later
 /// with Apple Intelligence enabled; elsewhere, and whenever the model declines, fails, or
-/// writes something `NowBriefCheck` rejects, there is simply no brief. Builds made with an SDK
-/// that has no Foundation Models (CI's Xcode 16) compile the unavailable path only.
+/// writes something `NowBriefCheck` rejects, there is no brief, and the outcome says why.
+/// Builds made with an SDK that has no Foundation Models (CI's Xcode 16) compile the
+/// unavailable path only.
 enum NowBriefGenerator {
     /// The model selects sentence indices, never medical values or prose.
     static let instructions = """
@@ -21,32 +22,67 @@ enum NowBriefGenerator {
     /// asked for again a little more freely, and after the last one there is no brief.
     static let attemptTemperatures = [0.2, 0.5, 0.8]
 
-    static var isAvailable: Bool {
-        #if canImport(FoundationModels)
-        if #available(iOS 26.0, macOS 26.0, *) {
-            return SystemLanguageModel.default.isAvailable
-        }
-        #endif
-        return false
+    /// Why there can be no brief on this device right now.
+    enum Unavailability: Hashable, Sendable {
+        /// No Foundation Models in this OS or SDK, or a device Apple Intelligence does not support.
+        case notSupported
+        /// Apple Intelligence is switched off in Settings.
+        case turnedOff
+        /// Apple Intelligence is on but its model is still downloading or preparing.
+        case notReady
     }
 
-    /// The model selects clauses; every displayed character is rendered from the facts.
-    static func render(selection: String, facts: NowBriefFacts) -> String? {
+    /// What one request produced.
+    enum Outcome: Hashable, Sendable {
+        /// The readings the model chose, by metric, in the facts' order.
+        case selected([MetricKind])
+        /// The model declined or failed, or every draft failed `NowBriefCheck`.
+        case noBrief
+        case unavailable(Unavailability)
+    }
+
+    /// Nil when the on-device model can be asked now.
+    static var unavailability: Unavailability? {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, macOS 26.0, *) {
+            switch SystemLanguageModel.default.availability {
+            case .available: return nil
+            case .unavailable(.appleIntelligenceNotEnabled): return .turnedOff
+            case .unavailable(.modelNotReady): return .notReady
+            default: return .notSupported
+            }
+        }
+        #endif
+        return .notSupported
+    }
+
+    static var isAvailable: Bool { unavailability == nil }
+
+    /// The readings a selection names, or nil when it is malformed or its rendering fails
+    /// `NowBriefCheck`.
+    static func selectedKinds(selection: String, facts: NowBriefFacts) -> [MetricKind]? {
         let tokens = selection.split(separator: ",", omittingEmptySubsequences: false)
         let indices = tokens.compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
         guard indices.count == tokens.count, (1...4).contains(indices.count),
               indices == indices.sorted(), Set(indices).count == indices.count,
               indices.allSatisfy({ facts.items.indices.contains($0) }) else { return nil }
-        return NowBriefCheck.accepted(indices.map { facts.items[$0].sentence }.joined(separator: " "), facts: facts)
+        let kinds = indices.map { facts.items[$0].kind }
+        guard facts.rendered(kinds) != nil else { return nil }
+        return kinds
     }
 
-    /// The accepted brief for `facts`, or nil.
-    static func generate(_ facts: NowBriefFacts) async -> String? {
+    /// The model selects clauses; every displayed character is rendered from the facts.
+    static func render(selection: String, facts: NowBriefFacts) -> String? {
+        selectedKinds(selection: selection, facts: facts).flatMap { facts.rendered($0) }
+    }
+
+    /// The model's selection for `facts`, or why there is none.
+    static func generate(_ facts: NowBriefFacts) async -> Outcome {
         #if canImport(FoundationModels)
         if #available(iOS 26.0, macOS 26.0, *) {
-            guard SystemLanguageModel.default.isAvailable else { return nil }
+            if let unavailability { return .unavailable(unavailability) }
             for temperature in attemptTemperatures {
-                guard !Task.isCancelled else { return nil }
+                guard !Task.isCancelled else { return .noBrief }
                 // A fresh session each time, so a rejected draft is not part of the context.
                 let session = LanguageModelSession(instructions: instructions)
                 do {
@@ -54,15 +90,16 @@ enum NowBriefGenerator {
                         to: facts.lines.enumerated().map { "\($0.offset): \($0.element)" }.joined(separator: "\n"),
                         options: GenerationOptions(temperature: temperature, maximumResponseTokens: 140)
                     )
-                    if let accepted = render(selection: response.content, facts: facts) { return accepted }
+                    if let kinds = selectedKinds(selection: response.content, facts: facts) { return .selected(kinds) }
                 } catch {
-                    // A guardrail refusal, an unsupported language, or a busy model: no brief.
-                    return nil
+                    // A guardrail refusal, an unsupported language, a rate limit, or a busy
+                    // model: no brief this time.
+                    return .noBrief
                 }
             }
-            return nil
+            return .noBrief
         }
         #endif
-        return nil
+        return .unavailable(.notSupported)
     }
 }

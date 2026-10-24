@@ -16,15 +16,7 @@ struct MacNowView: View {
     @State private var lastLoadedAt: Date?
     @State private var lastRetryToken = 0
     @State private var retryToken = 0
-    @State private var brief: NowBriefDisplay?
-    @State private var lastBriefAttempt: Date?
-
-    private struct BriefRequest: Hashable {
-        var facts: NowBriefFacts?
-        var period: Int
-    }
-
-    private static let briefInterval: TimeInterval = 180
+    @State private var brief = NowBriefController()
     private let tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     private struct LoadKey: Hashable {
@@ -61,11 +53,10 @@ struct MacNowView: View {
                         }
                     } else {
                         let facts = NowBriefFacts.build(metrics: snapshot.metrics, stressBand: nil, now: now)
+                        let unavailability = NowBriefGenerator.unavailability
                         ScrollView {
                             VStack(alignment: .leading, spacing: 16) {
-                                if let brief, brief.isValid(for: facts, now: now, available: NowBriefGenerator.isAvailable) {
-                                    NowBriefView(text: brief.text, generatedAt: brief.generatedAt)
-                                }
+                                NowBriefSection(controller: brief, facts: facts, now: now, unavailability: unavailability)
                                 LazyVGrid(
                                     columns: [GridItem(.adaptive(minimum: 320), spacing: 16, alignment: .top)],
                                     spacing: 16
@@ -77,7 +68,9 @@ struct MacNowView: View {
                             }
                             .padding(20)
                         }
-                        .task(id: BriefRequest(facts: facts, period: Int(now.timeIntervalSince1970 / Self.briefInterval))) { await refreshBrief(facts) }
+                        .task(id: brief.request(facts: facts, unavailability: unavailability, now: now)) {
+                            await brief.refresh(facts, unavailability: unavailability)
+                        }
                     }
                 } else {
                     ProgressView()
@@ -117,16 +110,5 @@ struct MacNowView: View {
             return String(localized: "From \(pairing.peer.name) · synced \(synced.formatted(.relative(presentation: .named)))")
         }
         return String(localized: "From \(pairing.peer.name)")
-    }
-
-    private func refreshBrief(_ facts: NowBriefFacts?) async {
-        if brief?.isValid(for: facts, now: .now, available: NowBriefGenerator.isAvailable) != true { brief = nil }
-        guard let facts, NowBriefGenerator.isAvailable else { return }
-        let wait = lastBriefAttempt.map { max(1, Self.briefInterval - Date.now.timeIntervalSince($0)) } ?? 1
-        do { try await Task.sleep(for: .seconds(wait)) } catch { return }
-        guard !Task.isCancelled else { return }
-        lastBriefAttempt = .now
-        guard let text = await NowBriefGenerator.generate(facts), !Task.isCancelled else { return }
-        brief = NowBriefDisplay(text: text, facts: facts, generatedAt: .now)
     }
 }
