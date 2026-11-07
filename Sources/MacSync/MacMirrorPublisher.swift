@@ -259,7 +259,7 @@ final class MacMirrorPublisher {
                     try await channel.open()
                     self.status[record.identity, default: PeerStatus()].issue = nil
                     delay = .seconds(5)
-                    try await MacMirrorSender(store: store).run(
+                    let ending = try await MacMirrorSender(store: store).run(
                         channel: channel,
                         pairing: record,
                         phoneName: self.phoneName,
@@ -274,6 +274,12 @@ final class MacMirrorPublisher {
                         waitForChange: { [weak self] in await self?.waitForChange() ?? false }
                     )
                     await channel.close(.closing)
+                    // The Mac stopped on purpose (it asked to start again, or quit); come
+                    // back as soon as it is listening rather than after the usual pause.
+                    if ending == .macClosed, self.sessions[record.identity]?.tag == tag {
+                        self.status[record.identity, default: PeerStatus()].progress = nil
+                        delay = Self.reconnectAfterMacClosed
+                    }
                 } catch {
                     channel.cancel()
                     if Task.isCancelled { break }
@@ -287,6 +293,34 @@ final class MacMirrorPublisher {
             if self?.sessions[record.identity]?.tag == tag { self?.sessions[record.identity] = nil }
         }
         sessions[record.identity] = (tag, task)
+    }
+
+    /// The pause before reconnecting to a Mac that closed an up-to-date session.
+    static let reconnectAfterMacClosed: Duration = .seconds(1)
+
+    /// Reconnects to every Mac on the network now, and restarts discovery if it failed.
+    ///
+    /// For Settings › Mac › Sync Now. A session waiting out a retry pause starts at once, and
+    /// one that looks up to date is replaced too, because a Mac that vanished without
+    /// closing the connection is not noticed until keepalive gives up on it. Reconnecting to
+    /// a Mac that is up to date costs one exchange: it resumes from its own position. A
+    /// session in the middle of sending is left to finish.
+    func syncNow() {
+        guard isActive, !pairings.isEmpty else { return }
+        guard browser != nil else {
+            retryDiscovery()
+            return
+        }
+        for record in pairings where endpoints[record.identity] != nil {
+            switch status[record.identity]?.progress {
+            case .snapshot, .catchingUp:
+                continue
+            case .connecting, .upToDate, nil:
+                sessions[record.identity]?.task.cancel()
+                sessions[record.identity] = nil
+                startSession(record)
+            }
+        }
     }
 
     private func acknowledged(_ cursor: Int64, for record: MacMirrorPairingRecord) {

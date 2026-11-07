@@ -38,6 +38,12 @@ struct MacSyncSettingsView: View {
                             Button("Forget This Mac", systemImage: "trash", role: .destructive) { forgetting = record }
                         }
                 }
+                if !mirror.pairings.isEmpty {
+                    // Reconnects at once instead of waiting out a retry, and replaces a
+                    // connection to a Mac that went away without closing it.
+                    Button("Sync Now", systemImage: "arrow.triangle.2.circlepath") { mirror.syncNow() }
+                        .accessibilityIdentifier("mac.syncNow")
+                }
                 Button("Pair a Mac", systemImage: "plus") {
                     pairing = MacMirrorPairingClient(publisher: mirror)
                 }

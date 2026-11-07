@@ -121,6 +121,8 @@ final class HealthStore {
     }
     private var unavailableBuffer: [Reading] = []
     private var bufferedIDs: Set<UUID> = []
+    /// Mirror batches applied with `publish: false` since the last `publishMirrorChanges()`.
+    @ObservationIgnored fileprivate var hasUnpublishedMirrorChanges = false
 
     /// How long readings are kept. Setting it does not by itself permit deletion: pruning
     /// waits for `confirmRetention`, so the default that a store starts with, or one read
@@ -1520,13 +1522,18 @@ extension HealthStore {
     /// The Mac never validates, compacts, or prunes what it is sent: the phone has already
     /// done all of that, and the mirror's job is to hold exactly the rows the phone holds.
     /// The source list, when sent, replaces the Mac's.
+    ///
+    /// - Parameter publish: false commits the batch without advancing `changeToken`, for a
+    ///   receiver that tells the screens once per burst (`publishMirrorChanges()`). The rows
+    ///   are committed and readable either way.
     func applyMirrorBatch(
         sources newSources: [DataSource]?,
         readings: [Reading],
         removingReadingIDs removals: [UUID],
         snapshot: HealthDatabase.MirrorSnapshotStep?,
         epoch: String,
-        cursor: Int64
+        cursor: Int64,
+        publish: Bool = true
     ) throws {
         guard loadState == .loaded, let database else {
             throw HealthStoreQueryError.notLoaded
@@ -1542,12 +1549,37 @@ extension HealthStore {
             )
             if let newSources { sources = newSources }
             if newSources != nil || !readings.isEmpty || removed.count > 0 || snapshot != nil {
-                dataGeneration &+= 1
+                if publish { dataGeneration &+= 1 } else { hasUnpublishedMirrorChanges = true }
             }
             noteRemoval(removed)
         } catch {
             record(error)
             throw error
+        }
+    }
+
+    /// Advances `changeToken` once for every batch applied unpublished since the last call,
+    /// so the screens re-read once per burst. Does nothing when there is nothing new.
+    func publishMirrorChanges() {
+        guard hasUnpublishedMirrorChanges else { return }
+        hasUnpublishedMirrorChanges = false
+        dataGeneration &+= 1
+    }
+
+    /// Forgets which phone log the mirror follows, keeping every row (Mac only).
+    ///
+    /// The phone's next session then finds no position and sends a complete copy, whose
+    /// closing batch removes any row the phone no longer has. Until it does, the screens keep
+    /// showing what is here.
+    @discardableResult
+    func forgetMirrorPosition() -> Bool {
+        guard loadState == .loaded, let database else { return false }
+        do {
+            try database.forgetMirrorPosition()
+            return true
+        } catch {
+            record(error)
+            return false
         }
     }
 

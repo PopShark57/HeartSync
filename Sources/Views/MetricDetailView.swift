@@ -173,7 +173,7 @@ struct MetricDetailView: View {
             let wait = LiveReloadPolicy.delay(
                 dataOnly: lastLoadedKey.map { key.sameSelection(as: $0) } ?? false,
                 elapsed: lastLoadedAt.map { Date.now.timeIntervalSince($0) },
-                minimumInterval: LiveReloadPolicy.minimumInterval(for: period)
+                minimumInterval: LiveReloadPolicy.minimumInterval(for: period, arrival: AppModel.historyArrival)
             )
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }
@@ -190,7 +190,11 @@ struct MetricDetailView: View {
                     hrvQuality: hrvQuality
                 )
             }
-            guard !Task.isCancelled, key == loadKey else { return }
+            guard LiveReloadPolicy.accepts(
+                stillAsked: key.sameSelection(as: loadKey),
+                loadedGeneration: key.generation,
+                shownGeneration: lastLoadedKey.flatMap { key.sameSelection(as: $0) ? $0.generation : nil }
+            ) else { return }
             snapshot = resolved
             lastLoadedKey = key
             lastLoadedAt = .now
@@ -625,7 +629,7 @@ struct MetricDetailView: View {
         let wait = LiveReloadPolicy.delay(
             dataOnly: zoomLoadedKey.map { key.sameSelection(as: $0) } ?? false,
             elapsed: zoomLoadedAt.map { Date.now.timeIntervalSince($0) },
-            minimumInterval: LiveReloadPolicy.minimumInterval(for: .fixed(key.viewport.visible))
+            minimumInterval: LiveReloadPolicy.minimumInterval(for: .fixed(key.viewport.visible), arrival: AppModel.historyArrival)
         )
         try? await Task.sleep(for: .seconds(wait))
         guard !Task.isCancelled else { return }
@@ -640,7 +644,11 @@ struct MetricDetailView: View {
                 series: series
             )
         }
-        guard !Task.isCancelled, key == zoomLoadKey else { return }
+        guard LiveReloadPolicy.accepts(
+            stillAsked: zoomLoadKey.map { key.sameSelection(as: $0) } ?? false,
+            loadedGeneration: key.generation,
+            shownGeneration: zoomLoadedKey.flatMap { key.sameSelection(as: $0) ? $0.generation : nil }
+        ) else { return }
         zoomSnapshot = resolved
         zoomLoadedKey = key
         zoomLoadedAt = .now
@@ -754,7 +762,7 @@ struct MetricDetailView: View {
         let wait = LiveReloadPolicy.delay(
             dataOnly: periodLoadedKey.map { key.sameSelection(as: $0) } ?? false,
             elapsed: periodLoadedAt.map { Date.now.timeIntervalSince($0) },
-            minimumInterval: LiveReloadPolicy.minimumInterval(for: .fixed(key.period))
+            minimumInterval: LiveReloadPolicy.minimumInterval(for: .fixed(key.period), arrival: AppModel.historyArrival)
         )
         try? await Task.sleep(for: .seconds(wait))
         guard !Task.isCancelled else { return }
@@ -763,7 +771,11 @@ struct MetricDetailView: View {
         let resolved = await HealthHistory.offMain {
             MetricPeriodEvidence(history: history, kind: kind, interval: key.period)
         }
-        guard !Task.isCancelled, key == periodLoadKey else { return }
+        guard LiveReloadPolicy.accepts(
+            stillAsked: periodLoadKey.map { key.sameSelection(as: $0) } ?? false,
+            loadedGeneration: key.generation,
+            shownGeneration: periodLoadedKey.flatMap { key.sameSelection(as: $0) ? $0.generation : nil }
+        ) else { return }
         periodEvidence = resolved
         periodLoadedKey = key
         periodLoadedAt = .now

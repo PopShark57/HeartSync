@@ -48,6 +48,33 @@ struct LiveReloadTests {
         #expect(LiveReloadPolicy.liveScreenInterval == 1)
     }
 
+    @Test("On the Mac a landed sync is never more than a few seconds from the screen")
+    func mirroredSpacingIsCapped() {
+        #expect(LiveReloadPolicy.minimumInterval(for: .rolling(.hour), arrival: .mirrored) == 2)
+        #expect(LiveReloadPolicy.minimumInterval(for: .rolling(.week), arrival: .mirrored) == LiveReloadPolicy.mirroredMaximumInterval)
+        #expect(LiveReloadPolicy.minimumInterval(for: .rolling(.month), arrival: .mirrored) == LiveReloadPolicy.mirroredMaximumInterval)
+        for range in TimeRange.allCases {
+            let mirrored = LiveReloadPolicy.minimumInterval(for: .rolling(range), arrival: .mirrored)
+            #expect(mirrored <= LiveReloadPolicy.mirroredMaximumInterval)
+            #expect(mirrored <= LiveReloadPolicy.minimumInterval(for: .rolling(range)))
+        }
+        // The phone keeps its own spacing.
+        #expect(LiveReloadPolicy.minimumInterval(for: .rolling(.month), arrival: .live) == 720)
+    }
+
+    @Test("A load overtaken only by new data is shown; one for another question, or older than what is shown, is not")
+    func overtakenLoadsAreKept() {
+        // Nothing shown yet, or something older: the finished load is the newest answer.
+        #expect(LiveReloadPolicy.accepts(stillAsked: true, loadedGeneration: 4, shownGeneration: nil))
+        #expect(LiveReloadPolicy.accepts(stillAsked: true, loadedGeneration: 4, shownGeneration: 3))
+        #expect(LiveReloadPolicy.accepts(stillAsked: true, loadedGeneration: 4, shownGeneration: 4))
+        // A newer answer to the same question is already on screen.
+        #expect(!LiveReloadPolicy.accepts(stillAsked: true, loadedGeneration: 3, shownGeneration: 4))
+        // The range, session, sources, or a retry changed: it answers something else.
+        #expect(!LiveReloadPolicy.accepts(stillAsked: false, loadedGeneration: 9, shownGeneration: nil))
+        #expect(!LiveReloadPolicy.accepts(stillAsked: false, loadedGeneration: 9, shownGeneration: 2))
+    }
+
     // MARK: - Bounded Now read
 
     private let strap = DataSource(id: "strap", displayName: "Strap", transport: .bluetooth)
