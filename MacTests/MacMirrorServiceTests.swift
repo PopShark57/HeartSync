@@ -89,6 +89,31 @@ struct MacMirrorServiceTests {
         #expect(service.pairingUnavailable)
     }
 
+    @Test("Copy Everything Again forgets the position, keeps the rows, and needs a pairing")
+    func copyEverythingAgain() async throws {
+        let storage = Storage(record("phone"))
+        let store = HealthStore(persistenceEnabled: false)
+        try store.applyMirrorBatch(
+            sources: [.init(id: "strap", displayName: "Strap", transport: .bluetooth)],
+            readings: [.init(sourceID: "strap", kind: .heartRate, value: 70, start: .now.addingTimeInterval(-60))],
+            removingReadingIDs: [], snapshot: nil, epoch: "log", cursor: 7
+        )
+        let service = MacMirrorService(macName: "Mac", actions: storage.actions)
+        await service.start(store: store)
+        #expect(service.canSyncNow)
+        #expect(service.canCopyEverythingAgain)
+        #expect(service.copyEverythingAgain())
+        #expect(store.mirrorPosition == nil)
+        #expect(store.readings.count == 1)
+        #expect(store.sources.count == 1)
+        #expect(service.fullCopyRequested)
+
+        #expect(await service.unpair())
+        #expect(!service.fullCopyRequested)
+        #expect(!service.canCopyEverythingAgain)
+        #expect(!service.copyEverythingAgain())
+    }
+
     @Test("Composition root starts once with isolated stores and services disabled")
     func compositionRoot() async {
         let model = AppModel(store: HealthStore(persistenceEnabled: false), settings: AppSettings(persistenceEnabled: false), sessions: ComparisonSessionStore(persistenceEnabled: false), runServices: false)

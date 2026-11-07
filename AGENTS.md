@@ -346,6 +346,23 @@ screens. `MacApp/README.md` describes the protocol; the rules:
   Network prompt appears only once someone pairs. A Mac mirrors one iPhone; pairing another
   or unpairing journals the operation in the Keychain and drains receivers before erasing the
   copy. Startup recovers pending changes before starting sync. Failures remain retryable.
+- Both ends always have a read pending. The phone reads through `MacMirrorInbox`, so while it
+  waits for new history it still sees the Mac close the connection or say goodbye, and
+  reconnects a second later (`MacMirrorSender.Ending.macClosed`); before, a phone with nothing
+  new to send kept a dead session and never reconnected to a Mac that had quit or slept. TCP
+  keepalive (20 s idle, three probes 5 s apart) ends a connection to a device that vanished.
+  Never read from the channel outside the inbox on the phone, and never cancel its pump.
+- The Mac commits every batch at once but advances `changeToken` once per burst
+  (`MacMirrorPublicationGate`: after 400 ms without a batch, at least every 2 s of changes or
+  5 s of snapshot, and when a session ends). Mac screens use `LiveReloadPolicy`'s `.mirrored`
+  spacing (never over 5 s; `AppModel.historyArrival`). Both exist because per-batch tokens and
+  the phone's spacing left Compare minutes behind a finished sync.
+- Sync Now (the Mac's ⌘R and toolbar, the iPhone's Settings › Mac) only reconnects: the Mac
+  restarts its listener and the phone resumes from the Mac's position. Copy Everything Again
+  (⇧⌘R, confirmed first) forgets the Mac's position and keeps its rows
+  (`HealthStore.forgetMirrorPosition`), so the next session is a snapshot whose closing batch
+  removes what the phone no longer has. It invalidates the receiver before forgetting, so a
+  batch in flight cannot write a position back. Neither sends anything new to the phone.
 - The Mac's screens never claim a value is live: there are no Live chips, and the sidebar
   footer and Now subtitle say when the mirror last heard from the phone.
 - `MacMirrorProtocol.version` must change with any incompatible message or batch change; both
@@ -456,7 +473,7 @@ Preserve these comparison rules:
 - Insufficient evidence and out-of-tolerance data can never be presented as green merely because an alert preference is disabled.
 - Bland-Altman limits use sample variance.
 - UI chart thinning is presentation-only; statistics and exports use the full paired set.
-- Compare, metric detail, the pair screen, and Now each resolve one immutable snapshot per load in `.task(id:)`, built off the main actor from a `HealthStore.history` value: `ComparisonSnapshot`, `MetricDetailSnapshot`, `PairwiseSnapshot`, and `DashboardSnapshot`. All subviews share one resolved interval, gestures change only lightweight `@State`, and late results are rejected. Reloads caused only by new data are coalesced by `LiveReloadPolicy`: once a second on Now, and at most 30 per chart bucket elsewhere. A screen that trails ingest says so with `SnapshotLagNote`. Metric detail's zoomed span (`MetricZoomSnapshot`) and chosen period (`MetricPeriodEvidence`) load the same way, each under its own key. A selection is never part of a load key, so a scrub never reads the store.
+- Compare, metric detail, the pair screen, and Now each resolve one immutable snapshot per load in `.task(id:)`, built off the main actor from a `HealthStore.history` value: `ComparisonSnapshot`, `MetricDetailSnapshot`, `PairwiseSnapshot`, and `DashboardSnapshot`. All subviews share one resolved interval, gestures change only lightweight `@State`, and late results are rejected. Reloads caused only by new data are coalesced by `LiveReloadPolicy`: once a second on Now, and at most 30 per chart bucket elsewhere. A load that only new data overtook is still shown, unless something newer already is (`LiveReloadPolicy.accepts`), so continuous changes cannot starve a slow screen. A screen that trails ingest says so with `SnapshotLagNote`. Metric detail's zoomed span (`MetricZoomSnapshot`) and chosen period (`MetricPeriodEvidence`) load the same way, each under its own key. A selection is never part of a load key, so a scrub never reads the store.
 - A saved session's `ComparisonPeriod` travels with every drill-down. Screens opened from a session show `ComparisonSessionBanner`, never the rolling range picker.
 - Zoom changes only what a chart draws. `ChartViewport` re-reads the visible span at its own bucket, never finer than the metric's comparison window. Statistics, pairs, and the per-device table keep describing the whole analysed period.
 - A period brushed on the metric-detail chart is evidence for exactly those seconds. `MetricPeriodEvidence` uses the same read and engine call as metric detail does for a saved session over them. `ChartViewport.snappedPeriod` rounds both ends to whole seconds, because the sessions archive stores ISO-8601 dates without fractions; a saved period then reopens with identical bounds.

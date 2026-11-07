@@ -106,7 +106,7 @@ struct PairwiseAnalysisView: View {
             let wait = LiveReloadPolicy.delay(
                 dataOnly: lastLoadedKey.map { key.sameSelection(as: $0) } ?? false,
                 elapsed: lastLoadedAt.map { Date.now.timeIntervalSince($0) },
-                minimumInterval: LiveReloadPolicy.minimumInterval(for: period)
+                minimumInterval: LiveReloadPolicy.minimumInterval(for: period, arrival: AppModel.historyArrival)
             )
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }
@@ -115,7 +115,11 @@ struct PairwiseAnalysisView: View {
             let resolved = await HealthHistory.offMain {
                 PairwiseSnapshot(history: history, kind: kind, sourceA: sourceA, sourceB: sourceB, period: period)
             }
-            guard !Task.isCancelled, key == loadKey else { return }
+            guard LiveReloadPolicy.accepts(
+                stillAsked: key.sameSelection(as: loadKey),
+                loadedGeneration: key.generation,
+                shownGeneration: lastLoadedKey.flatMap { key.sameSelection(as: $0) ? $0.generation : nil }
+            ) else { return }
             snapshot = resolved
             lastLoadedKey = key
             lastLoadedAt = .now

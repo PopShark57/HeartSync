@@ -37,6 +37,10 @@ final class AppModel {
     /// (the iPhone `AppModel.estimateSourceID`), so the shared cards can label them.
     static let estimateSourceID = "heartsync.estimate"
 
+    /// How new history reaches the shared screens here: in bursts from the iPhone, each
+    /// published once (`LiveReloadPolicy`).
+    nonisolated static let historyArrival: LiveReloadPolicy.Arrival = .mirrored
+
     #if DEBUG
     /// `--mirror-demo`: the chart gallery's month of data in an in-memory mirror.
     static let mirrorDemoEnabled = ProcessInfo.processInfo.arguments.contains("--mirror-demo")

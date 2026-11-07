@@ -44,10 +44,18 @@ enum MacMirrorTransport {
         return parameters
     }
 
+    /// Keepalive probes after 20 idle seconds, five seconds apart, three unanswered ending the
+    /// connection: a device that left the network or went to sleep is noticed in about 35
+    /// seconds. An up-to-date session is otherwise silent for as long as nothing changes, and
+    /// with the system's default probe spacing a vanished phone kept the Mac showing
+    /// "Connected" for over ten minutes. Both ends always have a read pending
+    /// (`MacMirrorInbox` on the phone), so the failure ends the session at once.
     private static func tcpOptions() -> NWProtocolTCP.Options {
         let tcp = NWProtocolTCP.Options()
         tcp.enableKeepalive = true
         tcp.keepaliveIdle = 20
+        tcp.keepaliveInterval = 5
+        tcp.keepaliveCount = 3
         tcp.connectionTimeout = 10
         return tcp
     }

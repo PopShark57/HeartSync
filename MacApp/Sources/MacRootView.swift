@@ -4,6 +4,7 @@ import SwiftUI
 struct MacRootView: View {
     @Environment(AppModel.self) private var model
     @State private var screen: Screen? = .now
+    @State private var confirmingFullCopy = false
 
     enum Screen: String, Hashable, CaseIterable, Identifiable {
         case now
@@ -71,10 +72,62 @@ struct MacRootView: View {
             case .devices:
                 MacDevicesView()
             case .sync:
-                MacSyncView()
+                MacSyncView { confirmingFullCopy = true }
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                SyncNowToolbarButton()
+            }
+        }
+        .confirmationDialog(
+            "Copy everything again from \(model.mirror.pairing?.peer.name ?? "the iPhone")?",
+            isPresented: $confirmingFullCopy,
+            titleVisibility: .visible
+        ) {
+            Button("Copy Everything Again") {
+                screen = .sync
+                model.mirror.copyEverythingAgain()
+            }
+        } message: {
+            Text("The iPhone sends its whole history again, and anything it no longer has is removed from this Mac. What is here stays visible until the copy finishes. A long history can take a few minutes, with HeartSync open on the iPhone.")
+        }
         .focusedSceneValue(\.heartSyncNavigate, { destination in screen = destination })
+        .focusedSceneValue(\.heartSyncRequestFullCopy, model.mirror.canCopyEverythingAgain ? { confirmingFullCopy = true } : nil)
+    }
+}
+
+/// Sync Now in the window's toolbar, or progress while the phone is sending.
+private struct SyncNowToolbarButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let mirror = model.mirror
+        if mirror.connectedPhone != nil, mirror.progress.isSending {
+            ProgressView()
+                .controlSize(.small)
+                .help("Receiving from the iPhone")
+                .accessibilityLabel("Receiving from the iPhone")
+        } else {
+            Button {
+                mirror.syncNow()
+            } label: {
+                Label("Sync Now", systemImage: "arrow.clockwise")
+            }
+            .help("Reconnects to the iPhone, which then sends anything this Mac does not have yet.")
+            .disabled(!mirror.canSyncNow)
+            .accessibilityIdentifier("mac.toolbar.syncNow")
+        }
+    }
+}
+
+private extension Optional where Wrapped == MacMirrorProgress {
+    /// A batch or snapshot is on its way, as opposed to waiting for the next change.
+    var isSending: Bool {
+        switch self {
+        case .connecting, .snapshot, .catchingUp: true
+        case .upToDate, nil: false
+        }
     }
 }
 
@@ -82,10 +135,37 @@ struct HeartSyncNavigationKey: FocusedValueKey {
     typealias Value = (MacRootView.Screen) -> Void
 }
 
+struct HeartSyncFullCopyKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
 extension FocusedValues {
     var heartSyncNavigate: HeartSyncNavigationKey.Value? {
         get { self[HeartSyncNavigationKey.self] }
         set { self[HeartSyncNavigationKey.self] = newValue }
+    }
+
+    /// Asks to confirm a complete copy from the iPhone; nil while one cannot start.
+    var heartSyncRequestFullCopy: HeartSyncFullCopyKey.Value? {
+        get { self[HeartSyncFullCopyKey.self] }
+        set { self[HeartSyncFullCopyKey.self] = newValue }
+    }
+}
+
+/// The Sync menu: Sync Now, and a complete copy (which asks first).
+struct HeartSyncSyncCommands: Commands {
+    let mirror: MacMirrorService
+    @FocusedValue(\.heartSyncRequestFullCopy) private var requestFullCopy
+
+    var body: some Commands {
+        CommandMenu("Sync") {
+            Button("Sync Now") { mirror.syncNow() }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(!mirror.canSyncNow)
+            Button("Copy Everything Again from iPhone…") { requestFullCopy?() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(requestFullCopy == nil)
+        }
     }
 }
 
@@ -117,10 +197,13 @@ private struct MirrorStatusFooter: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.caption.weight(.semibold))
-                    Text(detail(mirror))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                    // "Last synced 3 minutes ago" stays true while nothing else changes.
+                    TimelineView(.periodic(from: .now, by: 30)) { _ in
+                        Text(detail(mirror))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -166,6 +249,9 @@ private struct MirrorStatusFooter: View {
             case .upToDate, nil:
                 return String(localized: "Connected · up to date")
             }
+        }
+        if mirror.fullCopyRequested {
+            return String(localized: "A complete copy starts when HeartSync is open on the iPhone.")
         }
         if let synced = mirror.lastSyncedAt {
             return String(localized: "Last synced \(synced.formatted(.relative(presentation: .named))). Open HeartSync on the iPhone to update.")

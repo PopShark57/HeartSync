@@ -18,7 +18,10 @@ struct HeartSyncMacApp: App {
                 .frame(minWidth: 820, minHeight: 560)
         }
         .defaultSize(width: 1_180, height: 780)
-        .commands { HeartSyncNavigationCommands() }
+        .commands {
+            HeartSyncNavigationCommands()
+            HeartSyncSyncCommands(mirror: model.mirror)
+        }
 
         Settings {
             MacSettingsView()

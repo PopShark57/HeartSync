@@ -1185,11 +1185,20 @@ final class HealthDatabase {
         try transaction {
             try execute("DELETE FROM readings")
             try execute("DELETE FROM sources")
-            try execute(
-                "DELETE FROM metadata WHERE key IN (?, ?)",
-                bindings: [.text(Self.mirrorEpochKey), .text(Self.mirrorCursorKey)]
-            )
+            try deleteMirrorPosition()
         }
+    }
+
+    /// Forgets the mirror's position and keeps its rows, so the next session is a snapshot.
+    func forgetMirrorPosition() throws {
+        try transaction { try deleteMirrorPosition() }
+    }
+
+    private func deleteMirrorPosition() throws {
+        try execute(
+            "DELETE FROM metadata WHERE key IN (?, ?)",
+            bindings: [.text(Self.mirrorEpochKey), .text(Self.mirrorCursorKey)]
+        )
     }
 
     // MARK: - Metadata and counts

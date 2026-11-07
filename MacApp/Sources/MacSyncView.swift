@@ -3,6 +3,8 @@ import SwiftUI
 /// Pairing with the iPhone, and how the mirror stands.
 struct MacSyncView: View {
     @Environment(AppModel.self) private var model
+    /// Opens the window's confirmation for a complete copy.
+    var requestFullCopy: () -> Void = {}
     @State private var confirmingUnpair = false
     @State private var unpairFailed = false
 
@@ -85,16 +87,37 @@ struct MacSyncView: View {
             LabeledContent("Paired") {
                 Text(pairing.pairedAt, format: .dateTime.year().month().day())
             }
+            if mirror.fullCopyRequested, !isCopying(mirror) {
+                Label(
+                    "A complete copy starts when HeartSync is open on the iPhone, on the same network.",
+                    systemImage: "arrow.triangle.2.circlepath"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
             if let issue = mirror.issue {
                 Label(issue, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                     .font(.callout)
-                Button("Retry connection") { mirror.retryKeychain() }
-                    .disabled(mirror.isChangingPairing)
             }
+            HStack {
+                Button("Sync Now", systemImage: "arrow.clockwise") { mirror.syncNow() }
+                    .help("Reconnects to the iPhone, which then sends anything this Mac does not have yet.")
+                    .accessibilityIdentifier("mac.sync.now")
+                Button("Copy Everything Again…", systemImage: "arrow.triangle.2.circlepath", action: requestFullCopy)
+                    .help("Asks the iPhone for its whole history again, replacing this copy.")
+                    .disabled(!mirror.canCopyEverythingAgain)
+                    .accessibilityIdentifier("mac.sync.fullCopy")
+            }
+            .disabled(!mirror.canSyncNow)
             Button("Unpair…", role: .destructive) { confirmingUnpair = true }
                 .disabled(mirror.isChangingPairing)
         }
+    }
+
+    private func isCopying(_ mirror: MacMirrorService) -> Bool {
+        guard mirror.connectedPhone != nil, case .snapshot = mirror.progress else { return false }
+        return true
     }
 
     @ViewBuilder
@@ -169,6 +192,9 @@ struct MacSyncView: View {
             case .catchingUp, .connecting: return String(localized: "Connected · receiving changes")
             case .upToDate, nil: return String(localized: "Connected · up to date")
             }
+        }
+        if mirror.fullCopyRequested {
+            return String(localized: "Not connected. A complete copy starts when HeartSync is open on the iPhone.")
         }
         return String(localized: "Not connected. Open HeartSync on the iPhone, on the same network.")
     }

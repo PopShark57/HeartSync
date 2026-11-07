@@ -967,6 +967,10 @@ final class AppModel {
     /// device, so they are never mistaken for a measurement in the source list.
     static let estimateSourceID = "heartsync.estimate"
 
+    /// How new history reaches the shared screens here: collected on this phone, as often as
+    /// a reading a second (`LiveReloadPolicy`).
+    nonisolated static let historyArrival: LiveReloadPolicy.Arrival = .live
+
     #if DEBUG
     /// Launch with `--pairwise-demo` to exercise every analysis state without touching
     /// the user's archive or starting HealthKit, Bluetooth, or Oura transports.

@@ -33,6 +33,10 @@ final class MacMirrorService {
     private(set) var issue: String?
     private(set) var cleanupPending = false
     private(set) var isChangingPairing = false
+    /// The person asked for a complete copy and it has not finished yet
+    /// (`copyEverythingAgain()`). Kept across a lost connection: the position is already
+    /// forgotten, so whichever session comes next is that copy.
+    private(set) var fullCopyRequested = false
 
     @MainActor
     struct Actions {
@@ -82,6 +86,54 @@ final class MacMirrorService {
 
     func retryKeychain() {
         Task { await reloadPairing() }
+    }
+
+    // MARK: - Sync now, and a complete copy
+
+    /// Whether `syncNow()` has anything to restart.
+    var canSyncNow: Bool { pairing != nil && !isChangingPairing && !cleanupPending }
+
+    /// Whether `copyEverythingAgain()` may start: paired, and not already receiving one.
+    var canCopyEverythingAgain: Bool {
+        guard pairing != nil, !cleanupPending, !isChangingPairing, !pairingUnavailable else { return false }
+        if connectedPhone != nil, case .snapshot = progress { return false }
+        return true
+    }
+
+    /// Starts sync again from this side: ends the current connection, if any, and restarts
+    /// the listener, so the phone reconnects and sends whatever this Mac has not applied.
+    ///
+    /// The Mac cannot ask the phone for anything; the phone connects to it. What this can
+    /// do is clear a stuck connection or listener. A phone with HeartSync open notices the
+    /// closed connection and reconnects within seconds, resuming from the mirror's position.
+    func syncNow() {
+        guard !isChangingPairing, !cleanupPending else { return }
+        issue = nil
+        Task { await reloadPairing() }
+    }
+
+    /// Asks for a complete copy of the phone's history, keeping what is here until it lands.
+    ///
+    /// Forgets the mirror's position (the rows stay), then closes the connection. The phone's
+    /// next session finds no position and sends a snapshot: every row as it is now, then a
+    /// closing batch that deletes whatever the phone no longer has. For a mirror that looks
+    /// wrong, it replaces everything without first emptying the screens.
+    ///
+    /// The receiver is invalidated before the position is forgotten, so a batch already in
+    /// flight cannot write a position back (`MacMirrorReceiver.run`'s `isCurrent`).
+    @discardableResult
+    func copyEverythingAgain() -> Bool {
+        guard let store, pairing != nil, !cleanupPending, !isChangingPairing, !pairingUnavailable else { return false }
+        _ = stopSyncSession()
+        guard store.forgetMirrorPosition() else {
+            issue = String(localized: "The copy could not be restarted, because the mirror's position could not be reset. Try again.")
+            return false
+        }
+        fullCopyRequested = true
+        progress = nil
+        issue = nil
+        if syncListener == nil { startSyncListener() }
+        return true
     }
 
     // MARK: - Pairing window
@@ -232,6 +284,7 @@ final class MacMirrorService {
         defaults.removeObject(forKey: Self.lastSyncedKey)
         lastSyncedAt = nil
         progress = nil
+        fullCopyRequested = false
         let records = pending.replacement.map { [$0] } ?? []
         guard actions.save(.init(records: records)) else {
             issue = String(localized: "The copy was deleted, but the pairing change could not finish. Sync is stopped. Try again.")
@@ -398,6 +451,8 @@ final class MacMirrorService {
             issue = nil
             lastSyncedAt = date
             defaults.set(date, forKey: Self.lastSyncedKey)
+            // Only a finished snapshot is up to date without a position to resume from.
+            if fullCopyRequested, store?.mirrorPosition != nil { fullCopyRequested = false }
         }
     }
 }

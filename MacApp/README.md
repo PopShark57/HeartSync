@@ -36,7 +36,20 @@ deletes is deleted on the Mac at the next sync.
   applied in one transaction with its cursor and acknowledged before the next is sent.
   Batches are a compact binary format, LZFSE-compressed (`MacMirrorBatch.swift`).
 - **When.** The phone syncs while HeartSync is in the foreground on it, coalescing changes for
-  two seconds. Backgrounding ends the session; the Mac keeps its position.
+  two seconds. Backgrounding ends the session; the Mac keeps its position. While it has
+  nothing to send, the phone still reads the connection (`MacMirrorInbox`), so a Mac that
+  quits, sleeps, or restarts sync is noticed at once and reconnected to a second later. TCP
+  keepalive ends a connection to a device that left the network in about 35 seconds.
+- **Showing it.** The Mac commits each batch as it arrives and tells its screens once per
+  burst (`MacMirrorPublicationGate`): when batches pause for 400 ms, every 2 seconds while
+  changes keep coming, every 5 seconds during a first copy, and when the session ends. Its
+  history screens re-read at most 5 seconds after that, whatever the range.
+- **Sync Now and Copy Everything Again.** Sync Now (⌘R, the toolbar, or iPhone Sync) restarts
+  the Mac's listener and drops the connection; the phone reconnects and sends whatever the
+  Mac has not applied. Copy Everything Again (⇧⌘R, after a confirmation) forgets the Mac's
+  position but keeps its rows, so the phone's next session is a complete snapshot whose
+  closing batch removes anything the phone no longer has. The iPhone has its own Sync Now in
+  Settings › Mac, which reconnects without waiting out a retry pause.
 
 A Mac mirrors one iPhone. Pairing a different iPhone deletes the copy first; unpairing
 deletes it. A pairing change is recorded in the Keychain before the mirror is erased. If
@@ -86,7 +99,7 @@ xcodebuild test -project HeartSyncChecker.xcodeproj -scheme HeartSyncMac \
 ```
 
 Navigate offers Command-1 (Now), Command-2 (Compare), Command-3 (Devices), and Command-4
-(iPhone Sync). In a pair detail, Shift-Command-E opens export. Save uses the native destination
+(iPhone Sync). Sync offers Command-R (Sync Now) and Shift-Command-R (Copy Everything Again). In a pair detail, Shift-Command-E opens export. Save uses the native destination
 picker; Cancel keeps the prepared export available until the export sheet is dismissed.
 The UI smoke test checks the sheet's Cancel and that Save opens that picker. It neither saves
 through the picker nor cancels it: the system draws it in another process, which the UI tests
@@ -107,7 +120,11 @@ interface and a wrong key being refused, and the Mac screens in `--mirror-demo`.
 2. First sync of a real history (a month of 1 Hz). Check the progress on both devices, the
    time it takes, and that the Mac's Compare matches the iPhone's for the same period.
 3. Changes: a new reading, a HealthKit deletion, an Oura revision, a removed device, a reset.
-   Each should reach the Mac within a few seconds while the iPhone app is open.
-4. Leave the iPhone backgrounded for a day, then open it: the Mac should catch up from the
+   Each should reach the Mac within a few seconds while the iPhone app is open, and appear
+   on an open Compare (30D included) within about five seconds after that.
+4. Quit and reopen the Mac app, and put the Mac to sleep and wake it, with HeartSync open on
+   the iPhone and nothing new arriving: the iPhone should reconnect on its own within seconds
+   (or about 35 seconds after a sleep). Try Sync Now and Copy Everything Again on the Mac.
+5. Leave the iPhone backgrounded for a day, then open it: the Mac should catch up from the
    log, not with a snapshot.
-5. Unpair on each side, then pair a different iPhone: the Mac's copy is replaced.
+6. Unpair on each side, then pair a different iPhone: the Mac's copy is replaced.

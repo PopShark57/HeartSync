@@ -210,7 +210,7 @@ struct CompareView: View {
             let wait = LiveReloadPolicy.delay(
                 dataOnly: lastLoadedKey.map { key.sameSelection(as: $0) } ?? false,
                 elapsed: lastLoadedAt.map { Date.now.timeIntervalSince($0) },
-                minimumInterval: LiveReloadPolicy.minimumInterval(for: period)
+                minimumInterval: LiveReloadPolicy.minimumInterval(for: period, arrival: AppModel.historyArrival)
             )
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }
@@ -227,8 +227,13 @@ struct CompareView: View {
                     hiddenSourceIDs: hidden
                 )
             }
-            // Rejects a late result: the selection may have moved on while this ran.
-            guard !Task.isCancelled, key == loadKey else { return }
+            // Rejects a late result when the selection moved on while this ran. New data alone
+            // does not: the result still answers this question and is the newest there is.
+            guard LiveReloadPolicy.accepts(
+                stillAsked: key.sameSelection(as: loadKey),
+                loadedGeneration: key.generation,
+                shownGeneration: lastLoadedKey.flatMap { key.sameSelection(as: $0) ? $0.generation : nil }
+            ) else { return }
             snapshot = resolved
             lastLoadedKey = key
             lastLoadedAt = .now

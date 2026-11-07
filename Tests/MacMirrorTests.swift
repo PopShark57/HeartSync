@@ -574,6 +574,196 @@ struct MacMirrorSessionTests {
     }
 }
 
+// MARK: - Staying connected, publishing, and a complete copy
+
+/// Waits for `condition`, polling every few milliseconds, for at most `limit`. The limit is
+/// generous because a parallel run can keep the main actor busy for seconds at a time.
+@MainActor
+private func eventually(within limit: Duration = .seconds(60), _ condition: () -> Bool) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: limit)
+    while !condition() {
+        guard clock.now < deadline else {
+            Issue.record("The condition did not become true in time")
+            return
+        }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+}
+
+@Suite("Mac sync: idle sessions, publication, and a complete copy")
+@MainActor
+struct MacMirrorLifetimeTests {
+    /// A phone with nothing new to send: only the Mac, or cancellation, ends its wait.
+    private static let quietPhone: @MainActor @Sendable () async -> Bool = {
+        do { try await Task.sleep(for: .seconds(120)) } catch { return false }
+        return true
+    }
+
+    @Test("An up-to-date phone notices the Mac closing the connection, with or without a goodbye", .timeLimit(.minutes(1)))
+    func idlePhoneSeesTheMacClose() async throws {
+        for saysGoodbye in [false, true] {
+            let phone = phoneStore(now: minute(.now))
+            let mac = HealthStore(persistenceEnabled: false)
+            let record = pairing()
+            let (phoneEnd, macEnd) = PipeChannel.pair()
+            var macUpToDate = false
+            let receiver = Task { @MainActor in
+                try await MacMirrorReceiver(store: mac).run(channel: macEnd, pairing: record, onProgress: { progress in
+                    if case .upToDate = progress { macUpToDate = true }
+                })
+            }
+            var phoneUpToDate = false
+            let sender = Task { @MainActor in
+                try await MacMirrorSender(store: phone, batchSize: 25).run(
+                    channel: phoneEnd,
+                    pairing: record,
+                    phoneName: "iPhone",
+                    onProgress: { progress in
+                        if case .upToDate = progress { phoneUpToDate = true }
+                    },
+                    waitForChange: Self.quietPhone
+                )
+            }
+            try await eventually { macUpToDate && phoneUpToDate }
+            expectMirrors(mac, phone)
+            // The Mac stops (Sync Now, a complete copy, or quitting) while the phone waits.
+            if saysGoodbye {
+                try await macEnd.send(.json(.goodbye, MacMirrorGoodbye(reason: .closing, detail: nil)))
+            }
+            macEnd.cancel()
+            #expect(try await sender.value == .macClosed)
+            try await receiver.value
+        }
+    }
+
+    @Test("A Mac that unpairs while the phone waits ends the session with the reason", .timeLimit(.minutes(1)))
+    func idleRefusalIsAnError() async throws {
+        let phone = phoneStore(now: minute(.now))
+        let mac = HealthStore(persistenceEnabled: false)
+        let record = pairing()
+        let (phoneEnd, macEnd) = PipeChannel.pair()
+        var phoneUpToDate = false
+        let receiver = Task { @MainActor in
+            try await MacMirrorReceiver(store: mac).run(channel: macEnd, pairing: record)
+        }
+        let sender = Task { @MainActor in
+            try await MacMirrorSender(store: phone).run(
+                channel: phoneEnd, pairing: record, phoneName: "iPhone",
+                onProgress: { if case .upToDate = $0 { phoneUpToDate = true } },
+                waitForChange: Self.quietPhone
+            )
+        }
+        try await eventually { phoneUpToDate }
+        try await macEnd.send(.json(.goodbye, MacMirrorGoodbye(reason: .notPaired, detail: nil)))
+        await #expect(throws: MacMirrorError.peerEnded(.notPaired)) { try await sender.value }
+        macEnd.cancel()
+        try await receiver.value
+    }
+
+    @Test("Going to the background while up to date stops the session without an error", .timeLimit(.minutes(1)))
+    func cancelledWhileIdle() async throws {
+        let phone = phoneStore(now: minute(.now))
+        let mac = HealthStore(persistenceEnabled: false)
+        let record = pairing()
+        let (phoneEnd, macEnd) = PipeChannel.pair()
+        var phoneUpToDate = false
+        let receiver = Task { @MainActor in
+            try await MacMirrorReceiver(store: mac).run(channel: macEnd, pairing: record)
+        }
+        let sender = Task { @MainActor in
+            try await MacMirrorSender(store: phone).run(
+                channel: phoneEnd, pairing: record, phoneName: "iPhone",
+                onProgress: { if case .upToDate = $0 { phoneUpToDate = true } },
+                waitForChange: Self.quietPhone
+            )
+        }
+        try await eventually { phoneUpToDate }
+        sender.cancel()
+        #expect(try await sender.value == .stopped)
+        phoneEnd.cancel()
+        try await receiver.value
+    }
+
+    @Test("A burst of batches reaches the screens once it pauses, and at least every interval while it lasts", .timeLimit(.minutes(2)))
+    func burstsArePublishedOnce() async throws {
+        let store = HealthStore(persistenceEnabled: false)
+        let gate = MacMirrorPublicationGate(store: store, quiet: .milliseconds(50))
+        let start = store.changeToken
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        func apply(_ index: Int) throws {
+            try store.applyMirrorBatch(
+                sources: nil,
+                readings: [Reading(sourceID: "strap", kind: .heartRate, value: 60, start: base.addingTimeInterval(Double(index)))],
+                removingReadingIDs: [],
+                snapshot: nil,
+                epoch: "log",
+                cursor: Int64(index),
+                publish: false
+            )
+        }
+        for index in 0..<5 {
+            try apply(index)
+            gate.applied(interval: 2, now: base.addingTimeInterval(Double(index) * 0.1))
+        }
+        // Committed and readable at once; the screens hear of it when the burst pauses.
+        #expect(store.readings.count == 5)
+        #expect(store.changeToken == start)
+        try await eventually { store.changeToken == start + 1 }
+        try await Task.sleep(for: .milliseconds(120))
+        #expect(store.changeToken == start + 1)
+
+        // A burst that never pauses is still published once the interval has passed.
+        try apply(5)
+        gate.applied(interval: 2, now: base.addingTimeInterval(10))
+        try apply(6)
+        gate.applied(interval: 2, now: base.addingTimeInterval(12.5))
+        #expect(store.changeToken == start + 2)
+        // Nothing new: nothing to publish.
+        gate.flush()
+        store.publishMirrorChanges()
+        #expect(store.changeToken == start + 2)
+    }
+
+    @Test("A whole snapshot reaches the screens a few times, not once per batch")
+    func snapshotPublication() async throws {
+        let phone = phoneStore(now: minute(.now))
+        let mac = HealthStore(persistenceEnabled: false)
+        let before = mac.changeToken
+        // 121 rows in pages of ten: thirteen snapshot batches and a source update.
+        try await sync(phone: phone, mac: mac, record: pairing(), batchSize: 10)
+        expectMirrors(mac, phone)
+        #expect(mac.changeToken > before)
+        #expect(mac.changeToken - before <= 4)
+    }
+
+    @Test("Forgetting the position keeps every row until the next session's complete copy replaces them")
+    func completeCopyRepairsTheMirror() async throws {
+        let now = minute(.now)
+        let phone = phoneStore(now: now)
+        let mac = HealthStore(persistenceEnabled: false)
+        let record = pairing()
+        try await sync(phone: phone, mac: mac, record: record)
+        let position = try #require(mac.mirrorPosition)
+        // A row the phone never had: the kind of divergence a complete copy is for.
+        let stray = Reading(sourceID: "strap", kind: .heartRate, value: 150, start: now.addingTimeInterval(-5))
+        try mac.applyMirrorBatch(
+            sources: nil, readings: [stray], removingReadingIDs: [], snapshot: nil,
+            epoch: position.epoch, cursor: position.cursor
+        )
+
+        #expect(mac.forgetMirrorPosition())
+        #expect(mac.mirrorPosition == nil)
+        #expect(mac.readings.contains { $0.id == stray.id })
+        #expect(mac.readings.count == phone.readings.count + 1)
+
+        try await sync(phone: phone, mac: mac, record: record)
+        expectMirrors(mac, phone)
+        #expect(!mac.readings.contains { $0.id == stray.id })
+        #expect(mac.mirrorPosition?.epoch == position.epoch)
+    }
+}
+
 /// Deliberately ignores cancellation while receipt is held: a late framework callback
 /// must be harmless even when it wins a race with cancel().
 private final class HeldBatchChannel: MacMirrorFrameChannel, @unchecked Sendable {
